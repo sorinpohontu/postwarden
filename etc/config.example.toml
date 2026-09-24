@@ -1,0 +1,115 @@
+# postwarden configuration.
+# Copy to /etc/postwarden/config.toml and edit.
+# Validate with: postwarden check-config
+# Addresses below are placeholders.
+# postwarden logs to syslog (journalctl -t postwarden).
+
+# "observe" logs what each rule would do and lets mail through; "enforce" applies it.
+# Change it with install.py configure-postfix --phase, which also switches
+# Postfix's behaviour when postwarden is down.
+mode = "observe"
+
+[logging]
+level = "info"              # debug | info | warning | error; keep info in production
+
+# Trusted networks and the address extension delimiter come from Postfix
+# (mynetworks, recipient_delimiter), read when postwarden starts: restart
+# postwarden after changing them. Connections from this server itself and local
+# sendmail submissions are recognised automatically.
+
+# -----------------------------------------------------------------------------
+# Self-sent mail on port 25: refuse outside mail that claims to come from the
+# recipient's own address (envelope sender or From), a common spoofing trick.
+#
+[self_sender]
+enabled = true
+allow_senders = []          # addresses that may legitimately send to themselves
+# identity = "envelope_or_header_from"   # or "envelope" / "header_from"
+# allow_mynetworks = true                # skip the check for Postfix mynetworks clients
+
+# -----------------------------------------------------------------------------
+# Sender authentication, always on for outside mail.
+#   SPF:  the sending server's IP is allowed by the envelope sender's domain.
+#   DKIM: a valid signature in the message, signed by the sender's domain.
+# A result counts only if its domain equals the From domain exactly.
+# DNS trouble defers mail, never rejects it. Local mail, mynetworks and
+# logged-in users are exempt. Uncomment to change a default.
+#
+[sender_authentication]
+# require = "both"                  # SPF and DKIM must pass; "either" = one is enough
+# allow_local = true                # local sendmail/cron mail is exempt
+# allow_mynetworks = true           # Postfix mynetworks clients are exempt
+# null_sender = "dkim_aligned"      # with require = "both": bounces pass on DKIM alone
+
+# -----------------------------------------------------------------------------
+# Protected addresses: who may write to group addresses such as all@.
+#
+# Only the people listed below can send to a protected address, and only by
+# logging in to the mail server (port 587 or 465) and sending as themselves.
+# Everyone else is refused: outside senders, other users of the domain,
+# websites and scripts on this server.
+# ---------------------------------------------------------------------------
+# Each protected address, and who may write to it (the mailbox logins they use).
+[protection.addresses."all@example.com"]
+authorized_logins = ["manager@example.com"]
+
+[protection.addresses."board@example.com"]
+authorized_logins = ["chair@example.com"]
+
+# Protected group: "all@*" protects all@ on every domain whose mailboxes are on
+# this server. Addresses on other mail servers are not affected: users can
+# still write to all@partner.org. Here all@ of any hosted domain not listed
+# above accepts mail from nobody, so a newly added domain is never left open.
+[protection.addresses."all@*"]
+authorized_logins = []
+
+# ---------------------------------------------------------------------------
+# Resource limits. The defaults below suit most servers; uncomment to change.
+# Anything over a limit is deferred (4xx), never rejected, so no mail is lost.
+#
+# [limits]
+# message_bytes = 41943040          # keep at or above Postfix message_size_limit
+# max_recipients = 1000             # per message
+# max_headers = 1000
+# max_header_bytes = 65536
+# max_signatures = 10               # DKIM signatures checked per message
+# dns_timeout_seconds = 5           # per DNS query
+# authentication_deadline_seconds = 20   # total SPF+DKIM time per message
+# max_concurrent_messages = 32      # SPF/DKIM checks running at once
+# max_open_messages = 100           # messages being received at once; spool use <= this x message_bytes
+
+# SMTP replies sent to the sending server. The defaults below are used unless
+# you uncomment and change them. Only the wording and codes within the same
+# class can change: a rejection (5xx) cannot become a deferral (4xx) or an accept.
+# Every reply ends with "(ref <id>)"; to see why a message was refused, search
+# for it with: postwarden lookup <id>
+#
+# [responses.protected_recipient]
+# smtp_code = 550
+# enhanced_code = "5.7.1"
+# message = "Recipient address rejected: Access denied"
+#
+# [responses.self_sender]
+# smtp_code = 550
+# enhanced_code = "5.7.1"
+# message = "Sender address rejected: Access denied"
+#
+# [responses.authentication_failed]
+# smtp_code = 550
+# enhanced_code = "5.7.26"
+# message = "Message rejected: Sender domain authentication failed (SPF, DKIM)"
+#
+# [responses.invalid_from]
+# smtp_code = 550
+# enhanced_code = "5.7.1"
+# message = "Message rejected: From header does not conform to RFC 5322"
+#
+# [responses.invalid_recipient]
+# smtp_code = 550
+# enhanced_code = "5.1.3"
+# message = "Recipient address rejected: Bad address syntax"
+#
+# [responses.temporary_failure]
+# smtp_code = 451
+# enhanced_code = "4.7.1"
+# message = "Service unavailable - try again later"

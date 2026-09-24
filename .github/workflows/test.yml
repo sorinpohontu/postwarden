@@ -1,0 +1,28 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: unit tests (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:12", "debian:13"]
+    steps:
+      - name: Install Python from Debian
+        run: apt-get update && apt-get install -y --no-install-recommends python3 git ca-certificates
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        run: PYTHONPATH=src python3 -m unittest discover -s tests/unit -t tests/unit -v
+      - name: Configuration example validates
+        run: PYTHONPATH=src python3 -m postwarden --config etc/config.example.toml check-config

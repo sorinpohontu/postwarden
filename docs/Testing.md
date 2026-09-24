@@ -1,0 +1,73 @@
+# Testing
+
+## Unit tests (any host, Python 3.11+)
+
+From a git checkout; release archives do not include the tests. To run them on a server with Debian's real SPF/DKIM/DNS libraries, copy `src`, `tests` and `etc` from the checkout (`tar -czf pw-src.tgz src tests etc`), unpack them in a scratch directory and run the command below there as an unprivileged user.
+
+```sh
+PYTHONPATH=src python3 -m unittest discover -s tests/unit -t tests/unit
+```
+
+Covers address parsing and normalization, configuration validation, reply validation, reading `mynetworks`/`recipient_delimiter` from Postfix, the policy matrix (protected addresses, protected groups and transport, self-sender, visible From, SPF/DKIM combinations, null-sender rule, deadlines), the callback layer against a PyMilter stub (observe/enforce, RCPT vs end-of-message replies, local pickup accumulation, transaction isolation, size, header, recipient and open-message limits) and the installer (Postfix rendering against the local `postconf`, concurrent-edit and symlink refusal, rollback including a first install). SPF/DKIM tests use the installed `spf`, `dkim` and `dns` modules when present and stand-ins otherwise; on a host without them they do not exercise real verification. These prove policy logic only; they are not evidence about Postfix, DNS, libmilter or delivery.
+
+## Server tests
+
+Prerequisites: a Debian 12/13 host with the daemon attached (observe or enforce), `swaks` with `libnet-ssleay-perl` (needed for `--tls`/`--tlsc`; only a recommended package on Debian 12), a SASL test login `LOGIN` with password in a root-only file, an ordinary recipient `RCPT`, a throwaway protected address `PROT` listed under `[protection.addresses]` with `LOGIN` authorized, a protected group `all@*` with no logins and a hosted test domain `CLOSED` whose `all@` is not listed exactly, an external domain `EXT` (test recipients only), and a client outside `mynetworks` for the external cases. Read results from `journalctl -t postwarden -f` in a second terminal; in observe mode look for `would_reject`, in enforce mode for `reject`/`defer` and the SMTP reply itself.
+
+| # | Case | Command (sketch) | Expected (enforce) |
+| --- | --- | --- | --- |
+| 1 | Authorized group send, 587 | `swaks --server HOST:587 --tls --auth PLAIN --auth-user LOGIN --from LOGIN --to PROT` | 250; `accept` |
+| 2 | Same on 465 | `--tlsc` instead of `--tls` | 250 |
+| 3 | Wrong login | authenticate as another user, `--from` that user, `--to PROT` | `550 5.7.1` at RCPT, `reason=login_not_authorized` |
+| 4 | Sender ≠ login | `--auth-user LOGIN --from other@…` | `550`, `sender_login_mismatch` |
+| 5 | Group on port 25 (any source) | `swaks --server HOST:25 --to PROT` | `550`, `ingress_smtp25` |
+| 6 | Group via sendmail | `printf 'From: x\n\nbody' \| sendmail -f LOGIN PROT` | exit 0, then `milter-reject: END-OF-MESSAGE` and a bounce in the Postfix log |
+| 7 | Sendmail, group + ordinary recipient | as 6 with two recipients | whole message bounced (documented limitation) |
+| 8 | Ordinary + group + ordinary on one SMTP transaction | three `--to` values | only the group RCPT gets `550`; others `250`, message delivered to them |
+| 9 | Self-sender envelope, external source | from outside `mynetworks`: `--from RCPT --to RCPT` | `550`, `envelope_matches_recipient` |
+| 10 | Self-sender From header, external | `--from other@… --to RCPT --header 'From: RCPT'` | `550` at end of data, `header_from_matches_recipient` |
+| 11 | Self-sender from `mynetworks` | same as 9 from a trusted address | 250, `reason=exempt_mynetworks` |
+| 12 | External, SPF+DKIM aligned | real signed mail from a provider whose From domain matches | 250, `spf_and_dkim_aligned` |
+| 13 | External, unsigned | from outside `mynetworks` with SPF pass, no DKIM | `550`, `dkim_absent` |
+| 14 | External, DKIM only | sending host not in SPF | `550`, `spf_<result>` |
+| 15 | External, unaligned | `From:` in a subdomain of the signing domain | `550`, `spf_unaligned` or `dkim_no_aligned_pass` |
+| 16 | Provider bounce | send to a nonexistent mailbox at a DKIM-signing provider; wait for the DSN | 250, `null_sender_dkim_aligned` |
+| 17 | Invalid From | external, `--header 'From: a@x, b@y'` | `550`, rule `invalid_from` |
+| 18 | DNS failure | block UDP/TCP 53 from the host briefly, send external signed mail | `451`, `spf_temperror`/`dkim_temperror`; delivered after unblocking |
+| 19 | Daemon down (enforce) | `systemctl stop postwarden`; send anything | a 4xx from Postfix (`default_action=tempfail`) — wording depends on version and stage, e.g. `451 4.7.1 Service unavailable` (3.10, at CONNECT) or `454 4.3.0 Try again later` (3.7); mail flows after start |
+| 20 | Oversize | `--body` of 41 MiB+ | Postfix `message_size_limit` or `451` with `rule=limits` |
+| 21 | Multiple messages per connection | one `swaks` session with several transactions (`--pipe`/`--quit-after` scripts), or the source checkout's feasibility lifecycle probe | independent decisions per transaction |
+| 22 | Local cron/PHP mail | `echo test \| mail RCPT`, PHP `mail()` | delivered, `trust=local_pickup`, one `DKIM-Signature` in the delivered copy |
+| 23 | Signing after cutover | any authenticated submission | exactly one `DKIM-Signature` header in the delivered copy |
+| 24 | Alias/forward/BCC delivery | send to an alias, a forwarder and a BCC-mapped address | delivered once each, no loops |
+| 25 | Closed domain | case 1 with `--to all@CLOSED` | `550`, `no_authorized_logins`, `transport=` the local transport |
+| 26 | `all@` elsewhere | case 1 with `--to all@EXT` (a test address you control) | 250, no `protected_recipient` line; Postfix logs delivery to the external MX |
+| 27 | Per-address logins | a second listed address authorizing another login; send to it as `LOGIN` and as that login | `550 login_not_authorized` for `LOGIN`, 250 for the listed login |
+
+Keep a record of each run, outside the repository, with versions, configuration identity, expected/actual replies and sanitized log lines. Cases run from `mynetworks` cannot prove external enforcement (case 9–17 need an outside source).
+
+## Load and capacity
+
+`tests/load/milter_load.py` (checkout only, standard library) talks to a postwarden socket with the milter protocol, as Postfix does, and presents every message as untrusted port-25 mail so each one takes the SPF/DKIM path. Nothing is queued or delivered. Run it against a second daemon on a test socket, so live mail and the mail log are untouched:
+
+```sh
+install -d -o postwarden -g postwarden -m 0750 /tmp/pwload
+runuser -u postwarden -- /usr/local/sbin/postwarden run --stderr --socket unix:/tmp/pwload/policy.sock 2>/tmp/pwload/daemon.log &
+python3 tests/load/milter_load.py --socket unix:/tmp/pwload/policy.sock --messages 200 --concurrency 20
+python3 tests/load/milter_load.py --socket unix:/tmp/pwload/policy.sock --messages 20 --concurrency 10 --signatures 10 --body-kib 40960
+python3 tests/load/milter_load.py --socket unix:/tmp/pwload/policy.sock --hold 105
+kill %1
+```
+
+The tool reports throughput, latency percentiles and the replies by stage, and exits non-zero if any message took longer than `--slow-after` (default 60 s, Postfix's `content_timeout`) or failed. Messages carry syntactically valid but unverifiable `DKIM-Signature` headers for a real selector (default `gmail.com`/`20230601`), so each costs a key lookup and a full body hash; `--signatures` and `--body-kib` set the worst case. `--hold N` opens N transactions at `MAIL FROM` and keeps them open: with the default `max_open_messages = 100`, 100 get `continue` and the rest `451 4.7.1`; a new transaction succeeds after they are released.
+
+## Rollback and reinstall
+
+```sh
+python3 scripts/install.py rollback --deployment-id <postfix-deployment> --dry-run
+python3 scripts/install.py rollback --deployment-id <postfix-deployment> --apply
+# verify delivery/signing, then
+python3 scripts/install.py configure-postfix --phase observe --apply
+```
+
+Also on a test host: roll back an application upgrade (previous tree restored, daemon restarted); roll back a first install after its Postfix deployment (service disabled, unit and launcher gone, `config.toml` kept) and confirm the refusal while Postfix still references postwarden; `chmod` a managed file after a deployment and confirm rollback refuses without `--force`.

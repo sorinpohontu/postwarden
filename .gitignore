@@ -1,0 +1,30 @@
+# Metadata
+.project
+.claude
+.vscode
+
+# OS generated files
+._*
+.DS_Store
+.DS_Store?
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Local config
+
+# Keep .gitkeep files
+!/**/.gitkeep
+
+# Local project instructions (operator docs under docs/ are tracked)
+AGENTS.md
+CLAUDE.md
+
+# Local plan, acceptance records, baseline configuration and example messages
+reference/
+# Test-server gate settings
+tests/integration/feasibility/gate-env.sh
+tests/integration/postwarden-gate/
+tests/integration/feasibility/logs/
+dist/

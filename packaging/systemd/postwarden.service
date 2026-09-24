@@ -1,0 +1,33 @@
+[Unit]
+Description=Postfix policy milter (protected recipients, self-senders, SPF/DKIM)
+Documentation=file:///etc/postwarden/README.md
+After=network.target
+Before=postfix.service
+
+[Service]
+Type=simple
+User=postwarden
+Group=postwarden
+SupplementaryGroups=postfix
+ExecStartPre=/usr/local/sbin/postwarden check-config
+ExecStart=/usr/local/sbin/postwarden run
+ExecStartPost=/usr/local/sbin/postwarden wait-ready
+Restart=on-failure
+RestartSec=2s
+UMask=0007
+StateDirectory=postwarden
+StateDirectoryMode=0700
+ReadWritePaths=/var/spool/postfix/postwarden
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

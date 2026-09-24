@@ -1,0 +1,10 @@
+#!/bin/sh
+# Launcher: uses the checkout it lives in, or the installation in /etc/postwarden.
+HERE=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)
+if [ -d "$HERE/src/postwarden" ]; then
+    SRC=$HERE/src
+else
+    SRC=/etc/postwarden/src
+fi
+PYTHON=${POSTWARDEN_PYTHON:-/usr/bin/python3}
+PYTHONPATH="$SRC${PYTHONPATH:+:$PYTHONPATH}" exec "$PYTHON" -m postwarden "$@"
