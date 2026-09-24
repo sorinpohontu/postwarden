@@ -21,7 +21,7 @@ jobs:
     steps:
       - name: Install Python from Debian
         run: apt-get update && apt-get install -y --no-install-recommends python3 git ca-certificates
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Unit tests
         run: PYTHONPATH=src python3 -m unittest discover -s tests/unit -t tests/unit -v
       - name: Configuration example validates
