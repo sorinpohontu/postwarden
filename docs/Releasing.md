@@ -4,7 +4,7 @@ Releases are built by GitHub Actions from a version tag, as **drafts**. A draft 
 
 ## Steps
 
-1. On `main`, set `__version__` in `src/postwarden/__init__.py` (for example `1.0.0`).
+1. On `main`, set `__version__` in `src/postwarden/__init__.py` and `version` in `pyproject.toml` (for example `1.0.0`).
 2. In `CHANGELOG.md`, rename `## [Unreleased]` to `## [1.0.0] - YYYY-MM-DD` and add a new, empty `## [Unreleased]` above it. Remove shipped items from the README roadmap.
 3. Commit, then tag and push:
 

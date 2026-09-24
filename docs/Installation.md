@@ -2,7 +2,7 @@
 
 Two equivalent paths: the automated installer (`scripts/install.py`) and the manual steps below. Both produce the same files, permissions and services. Debian 12 and 13 with the distribution's Postfix and Python 3.
 
-Status: the manual path below has been run end to end on a stock Debian 13 system (install, observation, enforcement, rollback), and the automated installer on customised Debian 12 and 13 servers. Both are still being verified for the first release.
+Both paths were tested for 1.0.0: the manual path end to end on a stock Debian 13 system, the automated installer on that system and on customised Debian 12 and 13 servers (install, observation, enforcement, rollback).
 
 ## Requirements
 
