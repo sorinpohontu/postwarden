@@ -295,8 +295,9 @@ def run_daemon(settings: Settings) -> int:
     Milter.factory = PolicyMilter
     Milter.set_flags(0)
     Milter.set_exception_policy(Milter.TEMPFAIL)
+    addresses, groups = settings.protection.counts()
     _log.lifecycle(event="start", mode=settings.mode, socket=socket, config=settings.source,
-                   protected_addresses=len(settings.protection.addresses), mynetworks=len(settings.trust.mynetworks),
+                   protected_addresses=addresses, protected_groups=groups, mynetworks=len(settings.trust.mynetworks),
                    recipient_delimiter=settings.trust.recipient_delimiter)
     try:
         Milter.runmilter(settings.logging.identifier, socket, int(settings.limits.authentication_deadline_seconds) + 40)

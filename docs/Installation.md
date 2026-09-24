@@ -2,7 +2,7 @@
 
 Two equivalent paths: the automated installer (`scripts/install.py`) and the manual steps below. Both produce the same files, permissions and services. Debian 12 and 13 with the distribution's Postfix and Python 3.
 
-Status: an earlier version of the daemon and installer passed on Debian 12 and 13 test servers; the current version is unit-tested and is being re-verified there, and the manual path below has not yet been run end to end. Treat this guide as the procedure under test until the acceptance record says otherwise.
+Status: the manual path below has been run end to end on a stock Debian 13 system (install, observation, enforcement, rollback), and the automated installer on customised Debian 12 and 13 servers. Both are still being verified for the first release.
 
 ## Requirements
 
@@ -129,7 +129,7 @@ add_macros milter_rcpt_macros '{rcpt_mailer}'
 
 postconf -P 'smtpd/pass/milter_macro_defaults = postwarden_ingress=SMTP25'      # smtp/inet when there is no postscreen
 postconf -P 'submission/inet/milter_macro_defaults = postwarden_ingress=SUBMISSION587'
-postconf -P 'smtps/inet/milter_macro_defaults = postwarden_ingress=SUBMISSION465'
+postconf -P 'submissions/inet/milter_macro_defaults = postwarden_ingress=SUBMISSION465'  # smtps/inet on older layouts
 postconf -M 'postwarden-cleanup/unix = postwarden-cleanup unix n - y - 0 cleanup'
 postconf -P 'postwarden-cleanup/unix/milter_macro_defaults = postwarden_ingress=LOCAL_PICKUP'
 postconf -P 'pickup/unix/cleanup_service_name = postwarden-cleanup'

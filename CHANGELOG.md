@@ -29,7 +29,7 @@ First release, planned as 1.0.0: a mail filter (milter) for Postfix on Debian 12
 
 #### Logs and troubleshooting
 
-- **One log line per decision** in syslog (`journalctl -t postwarden`). Each line gives the rule, reason, trust class, recipient transport, SPF/DKIM results and the time spent on them (`auth_elapsed`). Message bodies, passwords and raw headers are never logged. The start line records the values read from Postfix.
+- **One log line per decision** in syslog (`journalctl -t postwarden`). Each line is `key=value` pairs, with values that contain spaces in double quotes, and gives the rule, reason, trust class, recipient transport, SPF/DKIM results and the time spent on them (`auth_elapsed`). Message bodies, passwords and raw headers are never logged. The start line records the values read from Postfix.
 - **Reply references.** Every reply ends with `(ref <id>)`. `postwarden lookup <id>` shows why that message was refused, from the journal or from syslog files (including rotated `.gz` files).
 
 #### Installation and updates
@@ -41,6 +41,7 @@ First release, planned as 1.0.0: a mail filter (milter) for Postfix on Debian 12
   - `rollback` undoes any deployment by its id.
 - **Safe changes.** Every command can run first as a dry run. Each change is backed up, and a change is refused if the files were edited in the meantime. A run that would change nothing records no deployment, so every deployment id can be rolled back meaningfully.
 - **Safe rollback.** Rollback refuses to overwrite files changed after the deployment unless you pass `--force`. Rolling back a first installation stops and removes the service but keeps your configuration; it is refused while any part of Postfix still uses postwarden. A failed Postfix change is undone automatically.
+- **Stock and customised layouts.** The port-465 service is recognised as `submissions` (current Postfix and Debian 13) or `smtps` (older layouts); port 25 as `smtp` or, behind postscreen, `smtpd`.
 - **Works with existing milters.** postwarden runs first in every Postfix milter chain; other milters (such as OpenDKIM) and their settings are kept.
 - **Migration from pipe filters.** `--remove-legacy` removes old `content_filter` pipe filters and the SPF policy service in the same step as enabling enforcement; the migration guide also gives the manual commands.
 - **`postwarden run --socket`** starts a second instance on a test socket, for load tests alongside the live daemon.

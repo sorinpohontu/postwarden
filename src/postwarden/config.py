@@ -63,6 +63,11 @@ class ProtectionSettings:
     remote_transports: frozenset[str] = frozenset({"smtp", "relay"})
     addresses: dict[str, frozenset[str]] = field(default_factory=dict)
 
+    def counts(self) -> tuple[int, int]:
+        """(protected addresses, protected groups)."""
+        groups = sum(1 for key in self.addresses if key.endswith("@*"))
+        return len(self.addresses) - groups, groups
+
     def lookup(self, recipient: Mailbox, transport: str | None) -> tuple[bool, frozenset[str]]:
         """(protected, authorized logins) for a recipient already stripped of its extension."""
         if recipient.lookup_key in self.addresses:

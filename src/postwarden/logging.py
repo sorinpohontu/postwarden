@@ -19,13 +19,17 @@ def _escape(value) -> str:
     text = str(value)
     if len(text) > MAX_FIELD:
         text = text[:MAX_FIELD] + "..."
+    if text and not any(ch in ' ="\\' or ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        return text
     out = []
     for ch in text:
-        if ch in (" ", "=", '"', "\\") or ord(ch) < 32 or ord(ch) == 127:
-            out.append("\\x%02x" % ord(ch) if (ord(ch) < 32 or ord(ch) == 127) else "\\" + ch)
+        if ord(ch) < 32 or ord(ch) == 127:
+            out.append("\\x%02x" % ord(ch))
+        elif ch in ('"', "\\"):
+            out.append("\\" + ch)
         else:
             out.append(ch)
-    return "".join(out)
+    return '"' + "".join(out) + '"'
 
 
 def format_event(fields: dict) -> str:

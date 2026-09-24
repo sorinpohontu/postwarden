@@ -46,7 +46,8 @@ REQUIRED_MACROS = {
     "milter_rcpt_macros": ("{rcpt_mailer}",),
 }
 LOCAL_CLEANUP = "postwarden-cleanup"
-INGRESS = {"smtpd/pass": "SMTP25", "smtp/inet": "SMTP25", "submission/inet": "SUBMISSION587", "smtps/inet": "SUBMISSION465"}
+INGRESS = {"smtpd/pass": "SMTP25", "smtp/inet": "SMTP25", "submission/inet": "SUBMISSION587",
+           "submissions/inet": "SUBMISSION465", "smtps/inet": "SUBMISSION465"}
 PHASES = ("observe", "enforce")
 CHAIN_FINDING = "postwarden missing from milter chain: "
 
@@ -249,7 +250,8 @@ def inspect(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
     if config["present"]:
         try:
             settings = load_settings(config_path)
-            config.update(valid=True, mode=settings.mode, protected_addresses=len(settings.protection.addresses),
+            addresses, groups = settings.protection.counts()
+            config.update(valid=True, mode=settings.mode, protected_addresses=addresses, protected_groups=groups,
                           remote_transports=sorted(settings.protection.remote_transports))
         except ConfigError as exc:
             config.update(valid=False, errors=exc.errors)

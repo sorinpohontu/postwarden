@@ -2,7 +2,7 @@
 
 ## Logs
 
-Events go to syslog facility `mail`, tag `postwarden`, one line per event in `key=value` form (values with spaces, `=` or control characters are backslash-escaped, fields truncated at 256 characters). Read them with `journalctl -t postwarden` or `grep postwarden /var/log/mail.log`.
+Events go to syslog facility `mail`, tag `postwarden`, one line per event in `key=value` form (logfmt style: a value containing spaces, `=`, `"` or `\` is written in double quotes, with `"` and `\` escaped by a backslash and control characters as `\xNN`; fields truncated at 256 characters). Read them with `journalctl -t postwarden` or `grep postwarden /var/log/mail.log`.
 
 Fields: `action`, `stage` (`rcpt`, `eom`, `mail`, `connect`, `abort`), `rule`, `reason`, `reply`, `cid` (connection), `mid` (message), `queue_id`, `ingress`, `trust`, `peer`, `port`, `sasl`, `sender`, `rcpt`/`rcpts`, `transport` (Postfix transport of the recipient, RCPT lines only), `rcpts` (end-of-message line: number of RCPTs in the transaction), `rejected_rcpts` / `deferred_rcpts` (on the end-of-message line, how many of them were refused at RCPT by class — in observe mode, would have been; absent when zero), `from_domain`, `spf`, `spf_domain`, `dkim` (`domain:result,...`, or `skipped` when SPF already decided), `elapsed` (seconds from MAIL FROM to the end-of-message decision, including receiving the message), `auth_elapsed` (seconds spent on SPF/DKIM, including waiting for a verification slot; only when authentication ran; bounded by `limits.authentication_deadline_seconds` plus at most one DNS timeout or verification in progress).
 
@@ -12,7 +12,7 @@ Fields: `action`, `stage` (`rcpt`, `eom`, `mail`, `connect`, `abort`), `rule`, `
 | `reject` / `defer` | reply sent (enforce mode) |
 | `would_reject` / `would_defer` | observe mode; the reply that enforce mode would send |
 | `pending_eom` | protected-address violation on the local sendmail path, decided at end of message |
-| `event=start` / `event=stop` | daemon lifecycle; the start line gives mode, socket, configuration path, number of protected addresses and the `mynetworks` entry count and `recipient_delimiter` read from Postfix; always logged, whatever `logging.level` is |
+| `event=start` / `event=stop` | daemon lifecycle; the start line gives mode, socket, configuration path, numbers of protected addresses and protected groups, and the `mynetworks` entry count and `recipient_delimiter` read from Postfix; always logged, whatever `logging.level` is |
 
 Reasons by rule:
 

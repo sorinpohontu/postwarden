@@ -401,8 +401,15 @@ class LocalPickup(unittest.TestCase):
 
 class LogFormatting(unittest.TestCase):
     def test_fields_are_escaped_and_bounded(self):
-        line = format_event({"rule": "x", "detail": 'a b="c"\n', "none": None, "long": "y" * 300})
-        self.assertEqual(line, 'rule=x detail=a\\ b\\=\\"c\\"\\x0a long=' + "y" * 256 + "...")
+        line = format_event({"rule": "x", "detail": 'a b="c"\n', "none": None, "long": "y" * 300,
+                             "path": "a\\b", "empty": ""})
+        self.assertEqual(line, 'rule=x detail="a b=\\"c\\"\\x0a" long=' + "y" * 256 + '... path="a\\\\b" empty=""')
+
+    def test_reply_is_quoted_and_readable(self):
+        line = format_event({"action": "reject", "reply": "550 5.7.1 Recipient address rejected: Access denied (ref 0123456789ab)",
+                             "mid": "0123456789ab"})
+        self.assertEqual(line, 'action=reject reply="550 5.7.1 Recipient address rejected: Access denied (ref 0123456789ab)" '
+                               'mid=0123456789ab')
 
 
 if __name__ == "__main__":

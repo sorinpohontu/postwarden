@@ -48,8 +48,7 @@ def _with_postfix(settings: Settings, *, required: bool) -> tuple[Settings | Non
 
 
 def _protection_summary(settings: Settings) -> str:
-    groups = sum(1 for key in settings.protection.addresses if key.endswith("@*"))
-    addresses = len(settings.protection.addresses) - groups
+    addresses, groups = settings.protection.counts()
     parts = [f"{addresses} protected address{'' if addresses == 1 else 'es'}"]
     if groups:
         parts.append(f"{groups} protected group{'' if groups == 1 else 's'}")

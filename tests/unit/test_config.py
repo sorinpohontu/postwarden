@@ -99,6 +99,9 @@ class Validation(unittest.TestCase):
         self.assertIn("'*@example.com': a protected group is written <local>@*", joined)
         self.assertIn("protection.on_hosted_domains: unknown key", joined)
 
+    def test_counts_separate_addresses_and_groups(self):
+        self.assertEqual(example_settings().protection.counts(), (2, 1))
+
     def test_addresses_are_full_mailboxes_and_unique(self):
         joined = "\n".join(self.errors(
             '\n[protection.addresses."ceo@example.com"]\nauthorized_logins = ["a@example.com"]\n'

@@ -192,6 +192,13 @@ cleanup   unix  n       -       n       -       0       cleanup
         self.assertEqual(sp("postwarden-cleanup/unix", "milter_macro_defaults"), "postwarden_ingress=LOCAL_PICKUP,other_flag=YES")
         self.assertEqual(deployment.chain_gaps(staging), [])
 
+    def test_port_465_service_named_submissions_is_marked(self):
+        self.MASTER = self.MASTER.replace("smtps     inet", "submissions inet")
+        staging = self.render("")
+        sp = lambda svc, p: deployment.service_param(svc, p, staging)
+        self.assertEqual(sp("submissions/inet", "milter_macro_defaults"), "postwarden_ingress=SUBMISSION465")
+        self.assertEqual(sp("submissions/inet", "smtpd_milters"), "$postwarden_milter")
+
     def test_minimal_mail_macro_list_gets_sasl_macros(self):
         staging = self.render("milter_mail_macros = i\nmilter_rcpt_macros = i\nmilter_connect_macros = j\n")
         mail = deployment.postconf("milter_mail_macros", staging).split()
