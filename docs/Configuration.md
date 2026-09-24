@@ -1,111 +1,134 @@
 # Configuration
 
-One file: `/etc/postwarden/config.toml`, root-owned, group `postwarden`, mode 0640. Validate with `postwarden check-config`; print the effective values with `postwarden show-config`. Unknown keys, wrong types and inconsistent values are errors, and every problem is reported at once. Changes take effect after `systemctl restart postwarden`. Run `check-config` first: the restart stops the running daemon before the unit's `ExecStartPre` validates the file, so a broken file leaves the daemon stopped until it is fixed and restarted.
+All settings are in one file, `/etc/postwarden/config.toml` (owner `root`, group `postwarden`, mode `0640`). The commented example `etc/config.example.toml` lists every setting with its default.
 
-A complete commented example is `etc/config.example.toml`.
+```sh
+postwarden check-config          # reports every problem at once
+postwarden show-config           # prints the settings in effect
+systemctl restart postwarden     # applies changes
+```
+
+Unknown keys, wrong types and inconsistent values are errors. Run `check-config` before restarting: a restart with a broken file leaves postwarden stopped (see [Operations](Operations.md#changing-the-configuration)).
 
 ## Top level
 
-| Key | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `schema_version` | integer | `1` | Optional; must be `1` when present |
-| `mode` | `"observe"` \| `"enforce"` | `"observe"` | Observe logs `would_reject`/`would_defer` and lets mail continue; enforce returns the configured replies. Change it with `install.py configure-postfix --phase`, which switches Postfix's milter failure action at the same time |
+| Key              | Default     | Meaning                                                                                      |
+| ---------------- | ----------- | -------------------------------------------------------------------------------------------- |
+| `schema_version` | `1`         | optional; must be `1` when present                                                           |
+| `mode`           | `"observe"` | `"observe"` logs what would be refused and lets mail continue; `"enforce"` sends the replies |
 
-Fixed, not configurable: the milter socket `unix:/var/spool/postfix/postwarden/policy.sock` (Postfix refers to it as `unix:postwarden/policy.sock`), and logging to syslog, facility `mail`, tag `postwarden`. For foreground debugging, `postwarden run --stderr` logs to standard error.
+Change `mode` with `python3 scripts/install.py configure-postfix --phase observe|enforce`, which also switches Postfix's failure action to match.
+
+These are fixed, not configurable:
+
+- the socket `unix:/var/spool/postfix/postwarden/policy.sock` (in Postfix: `unix:postwarden/policy.sock`);
+- logging to syslog, facility `mail`, tag `postwarden`. For debugging in the foreground, `postwarden run --stderr` logs to standard error.
 
 ## `[logging]`
 
-| Key | Default | Values |
-| --- | --- | --- |
-| `level` | `"info"` | `debug`, `info`, `warning`, `error`. `debug` adds per-connection and per-allow events |
+| Key     | Default  | Values                                                                                |
+| ------- | -------- | ------------------------------------------------------------------------------------- |
+| `level` | `"info"` | `debug`, `info`, `warning`, `error`; `debug` adds per-connection and per-allow events |
 
 ## Settings read from Postfix
 
-postwarden reads two values from the Postfix configuration when it starts (`postconf -xh mynetworks recipient_delimiter`), so they are never copied by hand:
+postwarden reads two Postfix settings when it starts (`postconf -xh mynetworks recipient_delimiter`), so they are never copied by hand:
 
-| Postfix parameter | Used for |
-| --- | --- |
-| `mynetworks` | the `mynetworks` trust class. Literal addresses, CIDR networks, pattern files (`/path`) and `cidr:` tables are supported; negation (`!`), hostnames and other map types stop the daemon with an error naming the entry |
-| `recipient_delimiter` | protected-address lookup only, so `all+tag@` matches `all@`. A protected address written with a tag is refused at start |
+| Postfix parameter     | Used for                                                                                                                                                                                               |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `mynetworks`          | the `mynetworks` trust class. Addresses, CIDR networks, pattern files (`/path`) and `cidr:` tables work; negation (`!`), host names and other map types stop the daemon with an error naming the entry |
+| `recipient_delimiter` | protected-address lookup, so `all+tag@` matches `all@`. A protected address written with a tag is refused at start                                                                                     |
 
-After changing either in Postfix, restart postwarden (`systemctl restart postwarden`). `check-config` and `show-config` show the values in use; `install.py inspect` reports entries postwarden cannot read.
+After changing either in Postfix, restart postwarden. `check-config` and `show-config` show the values in use; `install.py inspect` reports entries postwarden cannot read.
 
 ## Trust classes
 
-Trust is derived from the Postfix-supplied ingress marker and addresses only:
+The trust class comes only from what Postfix reports: the ingress marker it sets per service and the client address. Message headers are never trusted.
 
-| Class | When | Exempt from |
-| --- | --- | --- |
-| `local_pickup` | marker `LOCAL_PICKUP`, set by Postfix on the `postwarden-cleanup` service that local `sendmail` uses | external authentication (unless `allow_local = false`), self-sender |
-| `authenticated_submission` | marker `SUBMISSION587` on port 587 or `SUBMISSION465` on port 465, SASL login present | external authentication, self-sender (port not 25) |
-| `local_smtp` | marker `SMTP25`, client on loopback or using the server address it connected to (`{daemon_addr}`): a process on this server | external authentication (unless `allow_local = false`), self-sender |
-| `mynetworks` | client in Postfix `mynetworks` | external authentication (unless `sender_authentication.allow_mynetworks = false`), self-sender |
-| `untrusted` | anything else, including unknown markers | nothing |
+| Class                      | When                                                                                        | Exempt from                         |
+| -------------------------- | ------------------------------------------------------------------------------------------- | ----------------------------------- |
+| `local_pickup`             | local `sendmail` (marker `LOCAL_PICKUP`, set on the `postwarden-cleanup` service)           | sender authentication¹, self-sender |
+| `authenticated_submission` | port 587 (`SUBMISSION587`) or 465 (`SUBMISSION465`) with a login                            | sender authentication, self-sender  |
+| `local_smtp`               | port 25 (`SMTP25`) from loopback or from the server's own address: a process on this server | sender authentication¹, self-sender |
+| `mynetworks`               | client in Postfix `mynetworks`                                                              | sender authentication², self-sender |
+| `untrusted`                | anything else, including unknown markers                                                    | nothing                             |
 
-No class exempts protected recipients.
+¹ unless `sender_authentication.allow_local = false`. ² unless `sender_authentication.allow_mynetworks = false`.
+
+No class is exempt from the protected-address rule.
 
 ## `[self_sender]`
 
-Applies to connections on port 25 only.
+Refuses mail on port 25 whose sender equals a recipient.
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `enabled` | `true` | |
-| `identity` | `"envelope_or_header_from"` | Also `envelope` or `header_from` |
-| `allow_mynetworks` | `true` | Exempt `mynetworks` and same-server (`local_smtp`) clients |
-| `allow_senders` | `[]` | Addresses exempt from this rule only (compared case-insensitively) |
+| Key                | Default                     | Meaning                                                     |
+| ------------------ | --------------------------- | ----------------------------------------------------------- |
+| `enabled`          | `true`                      | turns the rule on or off                                    |
+| `identity`         | `"envelope_or_header_from"` | what is compared: also `"envelope"` or `"header_from"`      |
+| `allow_mynetworks` | `true`                      | exempts `mynetworks` and same-server (`local_smtp`) clients |
+| `allow_senders`    | `[]`                        | addresses exempt from this rule only (case-insensitive)     |
 
-Envelope matches are rejected at `RCPT TO`; a visible-From match is rejected at end of message and affects the whole message. An allow-listed envelope sender does not hide a prohibited From address.
+- An envelope match is refused at `RCPT TO`, for that recipient only.
+- A `From` match is refused at end of message, for the whole message.
+- An exempt envelope sender does not hide a refused `From` address.
 
 ## `[sender_authentication]`
 
-Checks that outside mail really comes from the domain in its visible `From` address. The check is always on; it cannot be switched off. Local mail, `mynetworks` clients and logged-in users (587/465) are exempt.
+Checks that outside mail really comes from the domain in its visible `From` address. It is always on. Local mail, `mynetworks` clients and logged-in users (587/465) are exempt.
 
 Two independent mechanisms are checked:
 
-- **SPF** asks whether the sending server's IP address is permitted by the SPF record of the envelope sender's domain (`MAIL FROM`; the HELO name for bounces). It **passes and aligns** when the result is `pass` and that domain equals the `From` domain.
-- **DKIM** verifies a cryptographic signature in the message against the public key published by the signing domain (`d=`). It **passes and aligns** when a signature verifies, covers the whole body (no `l=` tag) and its `d=` equals the `From` domain.
+- **SPF** asks whether the sending server's IP address is permitted by the SPF record of the envelope sender's domain (the HELO name for bounces). It **passes and aligns** when the result is `pass` and that domain equals the `From` domain.
+- **DKIM** verifies a signature in the message against the public key published by the signing domain (`d=`). It **passes and aligns** when a signature verifies, covers the whole body (no `l=` tag) and its `d=` equals the `From` domain.
 
-Alignment is always exact: `bounce.example.com` does not align with `example.com`. A signature that is merely present counts for nothing. DNS or verifier trouble (`temperror`, timeouts) always defers the message, never rejects it. There is no DMARC policy lookup: the domain's `_dmarc` record is not consulted.
+Rules that always apply:
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `require` | `"both"` | `"both"`: SPF **and** DKIM must pass and align. `"either"`: one aligned pass of SPF **or** DKIM is enough |
-| `allow_local` | `true` | `false`: local sendmail and same-server SMTP mail must pass SPF/DKIM and carry a valid `From`, like outside mail |
-| `allow_mynetworks` | `true` | `false`: `mynetworks` clients must pass SPF/DKIM, like outside mail. Other rules keep treating them as trusted |
-| `null_sender` | `"dkim_aligned"` | With `require = "both"`, for bounces (`MAIL FROM:<>`): `"dkim_aligned"` needs an aligned DKIM pass only; `"both"` applies the full rule. Ignored with `"either"` |
+- Domains must match exactly: `bounce.example.com` does not align with `example.com`.
+- A signature that is merely present counts for nothing.
+- DNS or verifier trouble (`temperror`, timeouts) defers the message; it never rejects it.
+- No DMARC policy is looked up: the domain's `_dmarc` record is not consulted.
+- The message must have exactly one valid `From` header with one address; otherwise it is refused (`invalid_from`) before any DNS lookup.
 
-`require = "both"` is the stricter choice and the default. It refuses unsigned mail, and forwarded mail, because the forwarding server is not in the original domain's SPF record. `require = "either"` accepts both of those, at the cost of trusting a single mechanism.
+| Key                | Default          | Meaning                                                                                                                                                     |
+| ------------------ | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `require`          | `"both"`         | `"both"`: SPF **and** DKIM must pass and align. `"either"`: one of them is enough                                                                           |
+| `allow_local`      | `true`           | `false`: local `sendmail` and same-server SMTP mail are checked like outside mail                                                                           |
+| `allow_mynetworks` | `true`           | `false`: `mynetworks` clients are checked like outside mail; other rules still trust them                                                                   |
+| `null_sender`      | `"dkim_aligned"` | bounces (`MAIL FROM:<>`) with `require = "both"`: `"dkim_aligned"` needs only an aligned DKIM pass, `"both"` applies the full rule. Ignored with `"either"` |
 
-Mail that must authenticate carries exactly one syntactically valid `From` with one mailbox; otherwise it is rejected with the `invalid_from` reply before any DNS work.
+**Choosing `require`.** `"both"` is the stricter default. It refuses unsigned mail, and forwarded mail, because the forwarding server is not in the original domain's SPF record. `"either"` accepts both, at the cost of trusting a single mechanism.
 
-SPF is checked first. When its result already decides the outcome, DKIM is not verified and the log shows `dkim=skipped`: with `"both"`, a definitive SPF failure (anything but `pass` or `temperror`, or a pass for another domain) rejects at once; with `"either"`, an aligned SPF pass accepts at once. An SPF `temperror` never decides.
+**SPF first.** When the SPF result already decides, DKIM is not checked and the log shows `dkim=skipped`:
 
-With `require = "both"`:
+- with `"both"`, a definitive SPF failure (anything but `pass` or `temperror`, or a pass for another domain) rejects at once;
+- with `"either"`, an aligned SPF pass accepts at once;
+- an SPF `temperror` never decides.
 
-| SPF (envelope domain, or HELO for `<>`) | DKIM (best aligned signature) | Result |
-| --- | --- | --- |
-| pass, aligned | pass, aligned, no `l=` | allow (`spf_and_dkim_aligned`) |
-| none/neutral/softfail/fail/permerror, or unaligned pass | not checked | reject (`spf_<result>`, `spf_unaligned`) |
-| pass, aligned, or temperror | absent, failed, unaligned, or only `l=` signatures | reject (`dkim_absent`, `dkim_no_aligned_pass`) |
-| temperror | pass or temperror | defer (`spf_temperror`) |
-| pass, aligned | temperror | defer (`dkim_temperror`) |
+### Decisions with `require = "both"`
 
-With `require = "either"`:
+| SPF (envelope domain, or HELO for `<>`)                     | DKIM (best signature)                              | Result                                         |
+| ----------------------------------------------------------- | -------------------------------------------------- | ---------------------------------------------- |
+| pass, aligned                                               | pass, aligned, no `l=`                             | accept (`spf_and_dkim_aligned`)                |
+| none, neutral, softfail, fail, permerror, or unaligned pass | not checked                                        | reject (`spf_<result>`, `spf_unaligned`)       |
+| pass aligned, or temperror                                  | absent, failed, unaligned, or only `l=` signatures | reject (`dkim_absent`, `dkim_no_aligned_pass`) |
+| temperror                                                   | pass or temperror                                  | defer (`spf_temperror`)                        |
+| pass, aligned                                               | temperror                                          | defer (`dkim_temperror`)                       |
 
-| SPF | DKIM | Result |
-| --- | --- | --- |
-| pass, aligned | not checked | allow (`spf_aligned`) |
-| anything else | pass, aligned, no `l=` | allow (`dkim_aligned`) |
-| temperror | no aligned pass | defer (`spf_temperror`) |
-| no aligned pass | temperror, no aligned pass | defer (`dkim_temperror`) |
+### Decisions with `require = "either"`
+
+| SPF                           | DKIM                          | Result                     |
+| ----------------------------- | ----------------------------- | -------------------------- |
+| pass, aligned                 | not checked                   | accept (`spf_aligned`)     |
+| anything else                 | pass, aligned, no `l=`        | accept (`dkim_aligned`)    |
+| temperror                     | no aligned pass               | defer (`spf_temperror`)    |
+| no aligned pass               | temperror, no aligned pass    | defer (`dkim_temperror`)   |
 | no aligned pass, no temperror | no aligned pass, no temperror | reject (`no_aligned_pass`) |
 
-Up to `limits.max_signatures` signatures are evaluated; a good one is not cancelled by bad ones. If the time budget or signature limit stops evaluation before a decisive pass, the message is deferred (`evaluation_incomplete`).
+Up to `limits.max_signatures` signatures are checked; one good signature is not cancelled by bad ones. If the time budget or the signature limit stops the check before a deciding pass, the message is deferred (`evaluation_incomplete`).
 
 ## `[protection]`
 
-A **protected address** (`all@example.com`) accepts mail only from its listed logins. A **protected group** (`all@*`) does the same for that local part on every domain this server hosts. Postfix still expands the groups; postwarden only decides who may address them.
+A **protected address** accepts mail only from its listed logins. A **protected group**, written `<local>@*`, does the same for that local part on every domain this server delivers. Group members stay in your Postfix alias maps; postwarden only decides who may send to the address.
 
 ```toml
 [protection.addresses."all@example.com"]
@@ -121,53 +144,82 @@ authorized_logins = ["assistant@example.net"]
 authorized_logins = []
 ```
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `addresses."<address>".authorized_logins` | `[]` | Logins exactly as Postfix reports `{auth_authen}` that may write to that address. An empty list closes it |
-| `remote_transports` | `["smtp", "relay"]` | Postfix transports that deliver to other servers; see below. Usually left out |
+| Key                                       | Default             | Meaning                                                                                                          |
+| ----------------------------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `addresses."<address>".authorized_logins` | `[]`                | logins, exactly as Postfix reports them (`{auth_authen}`), that may send to the address. An empty list closes it |
+| `remote_transports`                       | `["smtp", "relay"]` | Postfix transports that deliver to other servers; see below. Usually left out                                    |
 
-An address is written without the recipient delimiter tag and matched case-insensitively. In a protected group, `*` as the whole domain (`all@*`) stands for every domain this server delivers; no other `*` form exists.
+Addresses are written without a recipient delimiter tag and matched case-insensitively. In a group, `*` must be the whole domain; no other `*` form exists.
 
-Which recipients are protected, after the recipient delimiter tag is removed:
+Which recipients are protected (after the tag is removed):
 
-| Recipient | Protected | Who may write |
-| --- | --- | --- |
-| A protected address | yes, wherever it is delivered | its `authorized_logins` |
-| In a protected group (`<local>@*`), domain delivered here | yes | the group's logins (none in the example, so the address is closed until listed as a protected address) |
-| In a protected group, domain elsewhere (`remote_transports`) | no | not restricted |
-| Anything else | no | not restricted |
+| Recipient                                                    | Protected                     | Who may send                                                                        |
+| ------------------------------------------------------------ | ----------------------------- | ----------------------------------------------------------------------------------- |
+| a protected address                                          | yes, wherever it is delivered | its `authorized_logins`                                                             |
+| in a protected group, domain delivered here                  | yes                           | the group's logins (in the example: nobody, until the address is listed on its own) |
+| in a protected group, domain elsewhere (`remote_transports`) | no                            | anyone                                                                              |
+| anything else                                                | no                            | anyone                                                                              |
 
-Without a protected group, only the protected addresses are.
+### When sending to a protected address is allowed
 
-Why `remote_transports`: the protected group `all@*` must protect `all@` on the domains this server hosts, but not `all@` at other organisations that your users write to. Postfix tells postwarden where each recipient goes: the `{rcpt_mailer}` macro holds the transport the address resolves to, for example `dovecot`, `virtual`, `lmtp` or `local` for local delivery. A transport not in the list counts as delivered here. Local `sendmail` submissions carry no transport, so they count as delivered here; they can never reach a protected address anyway. The default fits a stock Postfix, where external mail leaves through `smtp` or `relay`. `install.py inspect` reports when Postfix's `default_transport` or `relay_transport` is missing from the list; add any other relaying transport from `transport_maps` yourself. Each RCPT log line shows the transport as `transport=`. A missing name is safe but visible: `all@` at another organisation through that transport is refused.
+All of these must hold:
 
-A protected address is allowed only when all of: submission marker, its matching port (587 or 465), TLS, a SASL login listed for that address, envelope sender byte-equal to the login. Otherwise `550 5.7.1` at `RCPT TO` on SMTP; on the local sendmail path the message is rejected at end of message and Postfix bounces the entire message, including other recipients. An unknown ingress marker on a protected address defers.
+- the message arrives on port 587 or 465, with the matching submission marker;
+- the connection uses TLS;
+- the login is listed for that address;
+- the envelope sender is exactly the login.
+
+Otherwise:
+
+- over SMTP, the recipient is refused with `550 5.7.1` at `RCPT TO`;
+- from local `sendmail`, the message is refused at end of message, and Postfix bounces the whole message, including its other recipients;
+- with an unknown ingress marker, the recipient is deferred.
+
+### `remote_transports`
+
+The group `all@*` must protect `all@` on the domains this server hosts, but not `all@` at other organisations your users write to. Postfix tells postwarden where each recipient goes: the `{rcpt_mailer}` macro is the transport the address resolves to, for example `dovecot`, `virtual`, `lmtp` or `local` for local delivery.
+
+- A transport **not** in the list counts as delivered here.
+- Local `sendmail` submissions carry no transport, so they count as delivered here (they can never reach a protected address anyway).
+- The default fits a stock Postfix, where outgoing mail leaves through `smtp` or `relay`.
+- `install.py inspect` reports when Postfix's `default_transport` or `relay_transport` is missing from the list. Add any other relaying transport from `transport_maps` yourself.
+- Each `rcpt` log line shows the transport as `transport=`. A missing name is safe but visible: `all@` at another organisation through that transport is refused.
 
 ## `[limits]`
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `message_bytes` | 41943040 | Larger messages are deferred with `temporary_failure` |
-| `max_signatures` | 10 | DKIM signatures evaluated per message |
-| `max_headers` | 1000 | |
-| `max_header_bytes` | 65536 | |
-| `max_recipients` | 1000 | Further recipients are deferred |
-| `dns_timeout_seconds` | 5 | Per DNS query |
-| `authentication_deadline_seconds` | 20 | Total SPF+DKIM budget per message; must be ≥ `dns_timeout_seconds`. It bounds DNS waits and discards results that arrive late (deferred as incomplete); a DKIM signature check already running is not interrupted. Keep Postfix `content_timeout` (60 s in `postwarden_milter`) above it |
-| `max_concurrent_messages` | 32 | Concurrent SPF/DKIM evaluations; others wait within the deadline, then defer |
-| `max_open_messages` | 100 | Messages being received at once; above it `MAIL FROM` is deferred (local `sendmail` at end of message). Spool use stays below this × `message_bytes` |
+| Key                               | Default    | Meaning                                                                                                                                                                                                                                                            |
+| --------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `message_bytes`                   | `41943040` | larger messages are deferred                                                                                                                                                                                                                                       |
+| `max_signatures`                  | `10`       | DKIM signatures checked per message                                                                                                                                                                                                                                |
+| `max_headers`                     | `1000`     | header fields per message                                                                                                                                                                                                                                          |
+| `max_header_bytes`                | `65536`    | total header size                                                                                                                                                                                                                                                  |
+| `max_recipients`                  | `1000`     | further recipients are deferred                                                                                                                                                                                                                                    |
+| `dns_timeout_seconds`             | `5`        | per DNS query                                                                                                                                                                                                                                                      |
+| `authentication_deadline_seconds` | `20`       | total SPF and DKIM time per message; at least `dns_timeout_seconds`. Results that arrive later are discarded and the message is deferred; a DKIM check already running is not interrupted. Keep Postfix's `content_timeout` (60 s in `postwarden_milter`) above it |
+| `max_concurrent_messages`         | `32`       | SPF/DKIM checks running at once; others wait within the deadline, then are deferred                                                                                                                                                                                |
+| `max_open_messages`               | `100`      | messages being received at once; above it `MAIL FROM` is deferred (local `sendmail`: at end of message). Spool use stays below this × `message_bytes`                                                                                                              |
+
+Every limit defers, so senders retry and nothing is lost. Postfix's own `message_size_limit` (about 10 MB by default) usually refuses large mail before postwarden sees it.
 
 ## `[responses.<rule>]`
 
-Rules: `protected_recipient`, `self_sender`, `authentication_failed`, `invalid_from`, `invalid_recipient` (rejections, codes 550 or 554) and `temporary_failure` (deferral, codes 450/451/452). Each has `smtp_code`, `enhanced_code` (`class.subject.detail`, class matching the code) and `message` (printable ASCII, whole reply ≤ 510 bytes including the reference suffix). Wording changes never change the reject/defer class.
+Each reply can be reworded, but its class cannot change: a rejection stays a rejection and a deferral stays a deferral.
 
-The daemon appends ` (ref <mid>)` to every reply it sends. `mid` is the message id on the matching log line, so a remote administrator can quote the reference and you can find the exact `rule` and `reason` with `postwarden lookup <ref>`. The default texts are deliberately terse: standard enhanced codes and Postfix-style wording tell an administrator which class of problem occurred, without spelling out the policy to someone probing it.
+| Key             | Meaning                                                                      |
+| --------------- | ---------------------------------------------------------------------------- |
+| `smtp_code`     | `550` or `554` for rejections; `450`, `451` or `452` for `temporary_failure` |
+| `enhanced_code` | `class.subject.detail`, with the class matching the code                     |
+| `message`       | printable ASCII; the whole reply, including the reference, at most 510 bytes |
 
-| Key | Default reply |
-| --- | --- |
-| `protected_recipient` | `550 5.7.1 Recipient address rejected: Access denied` |
-| `self_sender` | `550 5.7.1 Sender address rejected: Access denied` |
-| `authentication_failed` | `550 5.7.26 Message rejected: Sender domain authentication failed (SPF, DKIM)` — RFC 7372 "multiple authentication checks failed" |
-| `invalid_from` | `550 5.7.1 Message rejected: From header does not conform to RFC 5322` |
-| `invalid_recipient` | `550 5.1.3 Recipient address rejected: Bad address syntax` |
-| `temporary_failure` | `451 4.7.1 Service unavailable - try again later` — the same text Postfix uses when the milter is unreachable, so an outage and an internal temporary failure look alike from outside |
+postwarden adds ` (ref <mid>)` to every reply. `<mid>` is the message id in the log, so an administrator elsewhere can quote the reference and you can find the exact rule and reason with `postwarden lookup <ref>`. The default texts are deliberately short: the standard codes tell an administrator what kind of problem occurred without spelling out the policy to someone probing it.
+
+| Rule                    | Default reply                                                                  |
+| ----------------------- | ------------------------------------------------------------------------------ |
+| `protected_recipient`   | `550 5.7.1 Recipient address rejected: Access denied`                          |
+| `self_sender`           | `550 5.7.1 Sender address rejected: Access denied`                             |
+| `authentication_failed` | `550 5.7.26 Message rejected: Sender domain authentication failed (SPF, DKIM)` |
+| `invalid_from`          | `550 5.7.1 Message rejected: From header does not conform to RFC 5322`         |
+| `invalid_recipient`     | `550 5.1.3 Recipient address rejected: Bad address syntax`                     |
+| `temporary_failure`     | `451 4.7.1 Service unavailable - try again later`                              |
+
+`5.7.26` is the RFC 7372 code for "multiple authentication checks failed". `temporary_failure` uses the same text as Postfix when the milter is unreachable, so an outage and an internal temporary failure look alike from outside.

@@ -16,11 +16,11 @@ Refused mail gets an SMTP error before Postfix takes responsibility for it, so n
 
 Each protected address has a list of **authorized logins**; only those users can send to it.
 
-| How the message arrives | Sending to a protected address |
-| --- | --- |
+| How the message arrives                   | Sending to a protected address                                                   |
+| ----------------------------------------- | -------------------------------------------------------------------------------- |
 | Port 587 (STARTTLS) or 465 (implicit TLS) | Allowed only for an authorized login whose envelope sender is exactly that login |
-| Port 25 | Refused, even from trusted networks (`mynetworks`) |
-| Local `sendmail` | Refused; authorized users send through 587 or 465 |
+| Port 25                                   | Refused, even from trusted networks (`mynetworks`)                               |
+| Local `sendmail`                          | Refused; authorized users send through 587 or 465                                |
 
 A **protected group**, written `all@*`, protects `all@` on every domain whose mailboxes are on this server. A newly hosted domain's `all@` is therefore closed until you list it as a protected address. `all@` at other organisations is not affected.
 
@@ -123,13 +123,13 @@ It prints every postwarden line for that message: the rule, the exact reason, th
 
 ## Documentation
 
-| Document | Contents |
-| --- | --- |
-| [Installation](docs/Installation.md) | automated and manual installation, verification, rollback |
-| [Configuration](docs/Configuration.md) | every setting, the SPF/DKIM decision tables, replies |
-| [Operations](docs/Operations.md) | logs, reason codes, updates, troubleshooting |
-| [Migration](docs/Migration.md) | replacing pipe-based content filters and an SPF policy service |
-| [Changelog](CHANGELOG.md) | changes per release |
+| Document                               | Contents                                                       |
+| -------------------------------------- | -------------------------------------------------------------- |
+| [Installation](docs/Installation.md)   | automated and manual installation, verification, rollback      |
+| [Configuration](docs/Configuration.md) | every setting, the SPF/DKIM decision tables, replies           |
+| [Operations](docs/Operations.md)       | logs, reason codes, updates, troubleshooting                   |
+| [Migration](docs/Migration.md)         | replacing pipe-based content filters and an SPF policy service |
+| [Changelog](CHANGELOG.md)              | changes per release                                            |
 
 ## Development
 

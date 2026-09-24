@@ -1,44 +1,69 @@
 # Migration from pipe-based content filters
 
-For sites that currently implement sender/recipient policy with `content_filter` pipe transports (a script that reads the message and reinjects it with `sendmail`) and a separate SPF policy daemon. A fresh installation without such components only needs [Installation.md](Installation.md).
+This guide is for servers that enforce sender and recipient policy with `content_filter` pipe services (a script that reads each message and reinjects it with `sendmail`) and a separate SPF policy service. A server without them only needs [Installation](Installation.md).
 
-## Before
+The migration has three phases:
 
-Typical existing configuration:
+1. **Observe:** postwarden runs alongside the old filters and only logs.
+2. **Cutover:** enforcement is switched on and the old filters are detached, in one step.
+3. **Retire:** the old services are removed once no queued mail needs them.
 
-- `master.cf` SMTP services with `-o content_filter=<pipe-service>` and `-o receive_override_options=no_address_mappings`.
-- Pipe services running the filter script as an unprivileged user; success reinjects through `sendmail`, which runs the message through pickup and cleanup a second time (so `non_smtpd_milters` such as OpenDKIM run twice and the delivered copy carries two signatures).
-- `check_policy_service unix:private/policyd-spf` in `smtpd_recipient_restrictions` and a `policyd-spf` service.
+## Before you start
 
-The first and third items are the **legacy components**: what `configure-postfix --remove-legacy` removes. It leaves service definitions alone, and it skips any component that is already absent, so it is safe to use on a host that has only some of them.
+A typical existing setup has:
 
-Inventory with `python3 scripts/install.py inspect` (shows content filters and the `policyd-spf` service) and `postconf -n | grep -E 'policy|milter'`.
+- SMTP services in `master.cf` with `-o content_filter=<pipe-service>` and `-o receive_override_options=no_address_mappings`;
+- pipe services that run the filter script and reinject accepted mail through `sendmail`. That mail passes pickup and cleanup a second time, so milters such as OpenDKIM run twice and the delivered copy carries two signatures;
+- `check_policy_service unix:private/policyd-spf` in `smtpd_recipient_restrictions`, and a `policyd-spf` service.
 
-## Phase 1 — observe alongside the legacy components
+The content filter settings and the policy call are the **legacy components** that `configure-postfix --remove-legacy` removes. It leaves the service definitions alone and skips any component that is already absent, so it is safe on a server that has only some of them.
 
-`install --apply` and `configure-postfix --phase observe --apply` add the milter without touching the legacy components. Both policies run: the pipe filters still reject what they reject (after the milter has already seen and logged the message), the SPF policy service still rejects at `RCPT` before the milter sees that recipient (so the milter's view of those is inconclusive), and every message is logged twice by the milter — once from SMTP and once as `ingress=LOCAL_PICKUP` after reinjection. Compare `would_reject` lines with the pipe filters' decisions for at least one full business cycle.
+List what you have:
 
-## Phase 2 — cutover
+```sh
+python3 scripts/install.py inspect            # content filters and the policyd-spf service
+postconf -n | grep -E 'policy|milter'
+```
+
+## Phase 1: observe alongside the old filters
+
+Install postwarden and attach it in observe mode, as in [Installation](Installation.md#automated-installation) steps 1–4. The legacy components are not touched, and both policies run:
+
+- the pipe filters still refuse what they refuse, after postwarden has seen and logged the message;
+- the SPF policy service still refuses at `RCPT` before postwarden sees that recipient, so postwarden's view of those messages is incomplete;
+- postwarden logs every message twice: once from SMTP and once as `ingress=LOCAL_PICKUP` after reinjection.
+
+Compare postwarden's `would_reject` lines with the filters' decisions for at least one full business cycle.
+
+## Phase 2: cutover
 
 ```sh
 python3 scripts/install.py configure-postfix --phase enforce --remove-legacy --dry-run
 python3 scripts/install.py configure-postfix --phase enforce --remove-legacy --apply
 ```
 
-Enforcement and removal must happen together: `--phase enforce` without `--remove-legacy` is refused while content filters remain, because reinjected copies of authorized group mail would be refused on the pickup path and bounce.
+Enforcement and removal must happen together. `--phase enforce` without `--remove-legacy` is refused while content filters remain: reinjected copies of authorized group mail would be refused on the `sendmail` path and bounce.
 
-In one operation this sets `mode = "enforce"`, restarts the daemon, switches the milter's `default_action` to `tempfail`, removes `content_filter` and `receive_override_options` from the SMTP services, removes the `policyd-spf` policy call, validates and reloads Postfix. It does **not** delete the pipe or `policyd-spf` service definitions.
+In one step this:
 
-Immediately verify:
+- sets `mode = "enforce"` and restarts postwarden;
+- switches the milter's `default_action` to `tempfail`;
+- removes `content_filter` and `receive_override_options` from the SMTP services;
+- removes the `policyd-spf` call from `smtpd_recipient_restrictions`;
+- validates and reloads Postfix.
 
-- The queue: messages accepted before the cutover keep their content filter and still drain through the old pipe services (see Phase 3 for listing them).
-- One authenticated submission: delivered with exactly one `DKIM-Signature`.
-- Aliases, forwarders and BCC maps: address mappings are active again on the SMTP services (they were disabled by `no_address_mappings`); check for duplicates or loops.
-- A protected-recipient rejection on 25 and an authorized send on 587.
+It does **not** delete the pipe or `policyd-spf` service definitions. The remaining restrictions keep their order, but `postconf` writes the list on one line, so comment lines from a multi-line layout stay behind. A `{ }`-grouped restriction list is refused; edit it by hand.
+
+Check right away:
+
+- **The queue:** messages accepted before the cutover keep their content filter and still drain through the old pipe services (see Phase 3).
+- **One authenticated submission:** delivered with exactly one `DKIM-Signature`.
+- **Aliases, forwarders and BCC maps:** address mappings are active again on the SMTP services (`no_address_mappings` disabled them); look for duplicates or loops.
+- **Policy:** a refused protected recipient on port 25, and an authorized send on 587.
 
 ### Manual cutover
 
-The same change without the installer, in one sitting (list the services that carry a filter with `postconf -P | grep content_filter`; the example uses the usual `smtpd/pass` or `smtp/inet`, `submission/inet` and `smtps/inet`):
+The same change without the installer, in one sitting. List the services that carry a filter with `postconf -P | grep content_filter`; the example uses `smtpd/pass`, `submission/inet` and `smtps/inet`, so replace them with yours (for example `smtp/inet` or `submissions/inet`).
 
 ```sh
 cp -p /etc/postfix/main.cf /etc/postfix/master.cf /etc/postwarden/config.toml /root/    # copies for undo
@@ -56,11 +81,13 @@ postconf -e 'postwarden_milter = { unix:postwarden/policy.sock, default_action=t
 postfix check && postfix reload
 ```
 
-The restrictions edit expects a comma-separated list; for a list separated only by spaces, edit it by hand. `postconf -PX` rewrites `master.cf` in its own layout, so comment lines between services may move; review the file afterwards. To undo, copy the three files back from `/root/`, then `postfix reload` and `systemctl restart postwarden`.
+- The restrictions edit expects a comma-separated list; edit a list separated only by spaces by hand.
+- `postconf -PX` rewrites `master.cf` in its own layout, so comment lines between services may move; review the file afterwards.
+- To undo, copy the three files back from `/root/`, then run `postfix reload` and `systemctl restart postwarden`.
 
-## Phase 3 — retire the old services
+## Phase 3: retire the old services
 
-A queued message records the content filter it was accepted with. List the messages that still carry one; retire the services once this prints nothing (deferred mail can take up to `maximal_queue_lifetime`, 5 days by default):
+A queued message keeps the content filter it was accepted with. This lists the messages that still have one; retire the services once it prints nothing. Deferred mail can take up to `maximal_queue_lifetime` (5 days by default).
 
 ```sh
 postqueue -j | grep -o '"queue_id": *"[^"]*"' | cut -d'"' -f4 | while read -r id; do
@@ -68,21 +95,21 @@ postqueue -j | grep -o '"queue_id": *"[^"]*"' | cut -d'"' -f4 | while read -r id
 done
 ```
 
-Then remove the service definitions, using the names from your `master.cf` (`python3 scripts/install.py inspect` listed them before the cutover; `<pipe-service>` is each filter service):
+Then remove the service definitions, using the names from your `master.cf` (`inspect` listed them before the cutover):
 
 ```sh
 postconf -MX '<pipe-service>/unix'            # once per filter service
 postconf -MX 'policyd-spf/unix'               # if you used the SPF policy service
 postconf -X policyd-spf_time_limit            # if set
 postfix check && postfix reload
-apt-get remove postfix-policyd-spf-python     # keep python3-spf: the milter needs it
+apt-get remove postfix-policyd-spf-python     # keep python3-spf: postwarden needs it
 ```
 
-Keep the filter scripts and old configuration in your backups; `rollback --deployment-id <enforce-id>` restores the pre-cutover `main.cf`/`master.cf` and `config.toml`, and reinstating the package restores the SPF policy daemon if you retired it.
+Keep the filter scripts and the old configuration in your backups. `rollback --deployment-id <enforce-id>` restores the `main.cf`, `master.cf` and `config.toml` from before the cutover; reinstalling the package brings back the SPF policy service if you removed it.
 
-## Behavior differences to communicate
+## What changes for users
 
-- Rejections happen during SMTP (`550` at `RCPT TO` or after `DATA`) instead of after acceptance; senders see the reason immediately.
-- A prohibited recipient no longer blocks the other recipients of the same SMTP transaction.
-- Local `sendmail`/PHP `mail()` cannot address a protected group; such messages bounce entirely, including other recipients.
-- SPF alone no longer decides: by default external mail needs SPF and DKIM aligned with the From domain (`require = "either"` accepts one of them), except null-sender bounces (aligned DKIM only).
+- Refusals happen during SMTP (`550` at `RCPT TO` or after `DATA`) instead of after acceptance, so senders see them immediately.
+- A refused recipient no longer blocks the other recipients of the same message.
+- Local `sendmail` and PHP `mail()` cannot send to a protected address; such messages bounce entirely, including their other recipients.
+- SPF alone no longer decides. By default outside mail needs both SPF and DKIM matching the `From` domain (`require = "either"` accepts one of them); bounces need only a matching DKIM signature.
