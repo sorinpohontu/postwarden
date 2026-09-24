@@ -85,4 +85,4 @@ Keep the filter scripts and old configuration in your backups; `rollback --deplo
 - Rejections happen during SMTP (`550` at `RCPT TO` or after `DATA`) instead of after acceptance; senders see the reason immediately.
 - A prohibited recipient no longer blocks the other recipients of the same SMTP transaction.
 - Local `sendmail`/PHP `mail()` cannot address a protected group; such messages bounce entirely, including other recipients.
-- SPF alone no longer decides: external mail needs SPF and DKIM aligned with the From domain, except null-sender bounces (aligned DKIM only).
+- SPF alone no longer decides: by default external mail needs SPF and DKIM aligned with the From domain (`require = "either"` accepts one of them), except null-sender bounces (aligned DKIM only).

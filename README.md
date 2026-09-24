@@ -143,7 +143,7 @@ The tests, the server test matrix (`docs/Testing.md`) and the release procedure 
 
 ## Roadmap
 
-Planned work, without dates. Items move to the [changelog](CHANGELOG.md) when released.
+Planned for future releases; no dates are set.
 
 - **1.1: sending limits.** Rolling hourly and daily caps on messages and recipients per login, local sender and trusted relay, plus a host-wide cap for local mail, to contain compromised accounts and hacked scripts. Over the limit, mail is deferred, not lost.
 

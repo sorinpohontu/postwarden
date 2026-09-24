@@ -2,8 +2,6 @@
 
 Two equivalent paths: the automated installer (`scripts/install.py`) and the manual steps below. Both produce the same files, permissions and services. Debian 12 and 13 with the distribution's Postfix and Python 3.
 
-Both paths were tested for 1.0.0: the manual path end to end on a stock Debian 13 system, the automated installer on that system and on customised Debian 12 and 13 servers (install, observation, enforcement, rollback).
-
 ## Requirements
 
 - Debian 12 (bookworm) or 13 (trixie), Postfix 3.7 or newer, systemd.
@@ -13,7 +11,8 @@ Both paths were tested for 1.0.0: the manual path end to end on a stock Debian 1
 
 ## Automated path
 
-Get a release archive `postwarden-<version>.tar.gz` with its `.sha256` from the project's releases, or build one from a checkout (`python3 scripts/build-release.py` writes both to `dist/`). The archive contains only what is installed, plus `MANIFEST.sha256`; the tests and the build script stay in the checkout.
+Download a release archive `postwarden-<version>.tar.gz` and its `.sha256` from the project's releases.
+The archive contains only what is installed, plus `MANIFEST.sha256`, a checksum of every file in it.
 
 Unpack it anywhere outside `/etc/postwarden` and run the installer from there; `install --apply` copies the application into `/etc/postwarden/`, where it lives next to `config.toml`:
 
@@ -46,7 +45,7 @@ sudo python3 scripts/install.py configure-postfix --phase enforce --apply
 
 `inspect` and every `--dry-run` change nothing. `--apply` needs root, takes a lock, records a backup under `/var/backups/postwarden/<deployment-id>/` and refuses to run if `config.toml`, `main.cf`, `master.cf` or the installed files changed between inspection and application. It manages regular files only and refuses if any of them is a symlink. Re-running an identical `install --apply` is a no-op except for reporting.
 
-Upgrades: unpack the new candidate elsewhere (for example `/root/postwarden-new`) and run `python3 scripts/install.py install --apply` from there; the installer archives the previous `/etc/postwarden` tree into the deployment backup, copies the new files in and restarts the daemon. `config.toml` is never overwritten unless `--import-config` is given.
+Upgrades: unpack the new release archive elsewhere (for example `/root/postwarden-new`) and run `python3 scripts/install.py install --apply` from there; the installer archives the previous `/etc/postwarden` tree into the deployment backup, copies the new files in and restarts the daemon. `config.toml` is never overwritten unless `--import-config` is given.
 
 `/etc/postwarden` holds only the release content and `config.toml`. Anything else found there is moved, not deleted, to `/var/backups/postwarden/<time>-unmanaged/`, and the whole tree is reset to root ownership (`config.toml` stays `root:postwarden`). A user who owns the directory or any file in it could replace the code the daemon and the installer run, so `inspect` reports non-root ownership as a finding. Put site notes and backups elsewhere.
 
