@@ -84,6 +84,14 @@ class EnforcementWithLegacyFilters(unittest.TestCase):
         self.assertEqual(deployment.enforcement_blockers("observe", self.REPORT, False, False), [])
         self.assertEqual(deployment.enforcement_blockers("enforce", self.CLEAN, False, False), [])
 
+    def test_macro_finding_goes_on_to_the_repair(self):
+        report = {**self.CLEAN, "daemon_active": True, "socket_present": True, "config": {"valid": True, "mode": "observe"},
+                  "findings": [deployment.MACRO_FINDING + "milter_mail_macros lacks {auth_authen}; run configure-postfix to repair",
+                               deployment.CHAIN_FINDING + "smtpd_milters; run configure-postfix to repair"]}
+        with mock.patch.object(deployment, "stage_postfix", return_value=(Path("/nonexistent"), [], "")) as stage:
+            deployment.configure_postfix("observe", report, apply=False, log=lambda m: None)
+        stage.assert_called_once()
+
     def test_configure_refuses_before_touching_anything(self):
         report = {**self.REPORT, "daemon_active": True, "socket_present": True}
         with mock.patch.object(deployment, "stage_postfix") as stage, self.assertRaises(DeploymentError) as ctx:
@@ -119,6 +127,21 @@ class InstallationRootHygiene(unittest.TestCase):
     def test_missing_root_is_clean(self):
         self.assertEqual(deployment.unmanaged_entries(self.root / "absent"), [])
         self.assertEqual(deployment.foreign_owned(self.root / "absent"), [])
+        self.assertEqual(deployment.writable_by_others(self.root / "absent"), [])
+
+    def test_group_or_world_writable_paths_are_found_and_repaired(self):
+        os.chmod(self.root, 0o777)
+        os.chmod(self.root / "src", 0o775)
+        (self.root / "bin" / "postwarden").write_text("#!/bin/sh\n")
+        os.chmod(self.root / "bin" / "postwarden", 0o777)
+        os.chmod(self.root / "config.toml", 0o660)
+        self.assertEqual(deployment.writable_by_others(self.root),
+                         [self.root, self.root / "bin" / "postwarden", self.root / "config.toml", self.root / "src"])
+        deployment.normalize_modes(self.root)
+        mode = lambda p: p.stat().st_mode & 0o777
+        self.assertEqual((mode(self.root), mode(self.root / "src"), mode(self.root / "bin" / "postwarden"),
+                          mode(self.root / "README.md")), (0o755, 0o755, 0o755, 0o644))
+        self.assertEqual(mode(self.root / "config.toml"), 0o660)
 
 
 class RemoteTransportFinding(unittest.TestCase):
@@ -387,6 +410,28 @@ class ConfigImport(_Sandbox):
             with mock.patch.object(deployment, "_has_state", return_value=False):
                 steps = {s.description.split(" ")[0]: s.needed for s in deployment.plan_install(candidate, report).steps}
                 self.assertTrue(steps["create"] and steps["validate"])
+
+
+class WritableRoot(_Sandbox):
+    def test_writable_root_is_secured_even_when_content_is_unchanged(self):
+        candidate = self.tmp / "candidate"
+        (candidate / "src").mkdir(parents=True)
+        (deployment.ROOT / "src").mkdir()
+        report = {"packages": {n: "1" for n in deployment.RUNTIME_PACKAGES}, "service_user": True,
+                  "daemon_active": True, "socket_present": True}
+        with mock.patch.object(deployment, "tree_digest", return_value="same"), \
+             mock.patch.object(deployment, "foreign_owned", return_value=[]), \
+             mock.patch.object(deployment, "unmanaged_entries", return_value=[]), \
+             mock.patch.object(deployment, "_has_state", return_value=True):
+            secure = lambda: next(s.needed for s in deployment.plan_install(candidate, report).steps
+                                  if s.description.startswith("secure"))
+            os.chmod(deployment.ROOT, 0o755)
+            self.assertFalse(secure())
+            os.chmod(deployment.ROOT, 0o777)
+            self.assertTrue(secure())
+            os.chmod(deployment.ROOT, 0o755)
+            os.chmod(deployment.ROOT / "src", 0o775)
+            self.assertTrue(secure())
 
 
 class ManagedFiles(_Sandbox):

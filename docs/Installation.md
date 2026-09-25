@@ -71,13 +71,14 @@ If your SMTP services pass mail through content filters that reinject it with `s
 
 ### How the installer works
 
-- `inspect` and every `--dry-run` change nothing.
+- `inspect` and every `--dry-run` change nothing. `--apply` and `--dry-run` cannot be combined.
+- `install.py --config FILE inspect` checks another configuration file. `install` and `configure-postfix` always use `/etc/postwarden/config.toml`; to install another file, use `install --import-config FILE`.
 - `--apply` needs root and takes a lock. It backs up everything it changes under `/var/backups/postwarden/<deployment-id>/` and prints the **deployment id**.
-- It refuses if `config.toml`, `main.cf`, `master.cf` or the installed files changed between the dry run and the apply, and if any of them is a symlink.
+- Each `--apply` makes its own plan; it does not reuse an earlier dry run. It refuses if `config.toml`, `main.cf`, `master.cf` or the installed files change while it runs, and if any of them is a symlink.
 - A run that would change nothing records no deployment.
 - `configure-postfix` edits Postfix through `postconf`, which rewrites `master.cf` in its own layout, so comment lines between services may move. The dry run shows the diff.
 
-`/etc/postwarden` holds only the release and `config.toml`. Anything else found there is moved (not deleted) to `/var/backups/postwarden/<time>-unmanaged/`, and the directory is reset to root ownership (`config.toml` stays `root:postwarden`). A user who could write there could replace the code postwarden runs, so `inspect` reports other owners. Keep notes and backups elsewhere.
+`/etc/postwarden` holds only the release and `config.toml`. Anything else found there is moved (not deleted) to `/var/backups/postwarden/<time>-unmanaged/`, and the directory is reset to root ownership without group or other write permission (`config.toml` stays `root:postwarden`, mode `0640`). A user who could write there could replace the code postwarden runs, so `inspect` reports other owners and writable paths, and `install --apply` repairs them even when the release itself is unchanged. Keep notes and backups elsewhere.
 
 ### Upgrades
 

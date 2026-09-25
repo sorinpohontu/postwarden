@@ -85,7 +85,7 @@ Rules that always apply:
 
 - Domains must match exactly: `bounce.example.com` does not align with `example.com`.
 - A signature that is merely present counts for nothing.
-- DNS or verifier trouble (`temperror`, timeouts) defers the message; it never rejects it.
+- DNS or verifier trouble (`temperror`, timeouts) on its own defers the message instead of rejecting it. A definitive failure of the other mechanism still rejects, for example SPF `temperror` with no DKIM signature (see the tables below).
 - No DMARC policy is looked up: the domain's `_dmarc` record is not consulted.
 - The message must have exactly one valid `From` header with one address; otherwise it is refused (`invalid_from`) before any DNS lookup.
 

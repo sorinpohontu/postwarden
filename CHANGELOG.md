@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-09-25
+
+### Fixed
+
+- **Installation directory permissions.** `install --apply` now also removes group and other write permission in `/etc/postwarden`, including the directory itself, and repairs it even when the release is unchanged. `inspect` reports writable paths.
+- **Macro repair.** `configure-postfix` now repairs missing Postfix macros, as `inspect` recommends, instead of refusing because of that finding.
+- **`--apply` with `--dry-run`** is refused; before, `--apply` won.
+- **`install.py --config`** applies to `inspect` only. `install`, `configure-postfix` and `rollback` refuse it, since they always use `/etc/postwarden/config.toml`; use `install --import-config` to install another file.
+- **Documentation.** Clearer structure and terms; corrected the installer's dry-run guarantee, which recipients a refusal affects, and the load-test commands.
+
 ## [1.0.0] - 2026-09-24
 
 First release: a mail filter (milter) for Postfix on Debian 12 and 13.

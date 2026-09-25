@@ -50,6 +50,7 @@ INGRESS = {"smtpd/pass": "SMTP25", "smtp/inet": "SMTP25", "submission/inet": "SU
            "submissions/inet": "SUBMISSION465", "smtps/inet": "SUBMISSION465"}
 PHASES = ("observe", "enforce")
 CHAIN_FINDING = "postwarden missing from milter chain: "
+MACRO_FINDING = "Postfix does not send macros postwarden needs: "
 
 
 class DeploymentError(Exception):
@@ -243,6 +244,7 @@ def inspect(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
     report["socket_dir"] = str(SOCKET_DIR) if SOCKET_DIR.is_dir() else None
     report["socket_present"] = (SOCKET_DIR / "policy.sock").exists()
     report["root_foreign_owned"] = [str(p) for p in foreign_owned(ROOT)]
+    report["root_writable"] = [str(p) for p in writable_by_others(ROOT)]
     report["root_unmanaged"] = [p.name for p in unmanaged_entries(ROOT)]
     report["managed_symlinks"] = [str(p) for p in managed_files() if p.is_symlink()]
 
@@ -302,6 +304,26 @@ def foreign_owned(root: Path) -> list[Path]:
     return [p for p in paths if p.lstat().st_uid != 0]
 
 
+def writable_by_others(root: Path) -> list[Path]:
+    """Paths in the installation root (itself included) that group or others can write; they could replace the code."""
+    if not root.is_dir():
+        return []
+    paths = [root] + sorted(root.rglob("*"))
+    return [p for p in paths if not p.is_symlink() and p.lstat().st_mode & 0o022]
+
+
+def normalize_modes(root: Path) -> None:
+    """Release modes under the installation root: directories and executables 0755, other files 0644; config.toml untouched."""
+    os.chmod(root, 0o755)
+    for path in root.rglob("*"):
+        if path.is_symlink() or path.name == "config.toml":
+            continue
+        if path.is_dir() or path.parent.name in ("bin", "scripts") or path.suffix == ".sh":
+            os.chmod(path, 0o755)
+        else:
+            os.chmod(path, 0o644)
+
+
 def tree_digest(root: Path, metadata: bool = False) -> str:
     """Content digest of the application tree; with metadata, also each file's mode and ownership."""
     digest = hashlib.sha256()
@@ -344,6 +366,10 @@ def _findings(report: dict) -> list[str]:
     foreign = report.get("root_foreign_owned") or []
     if foreign:
         findings.append(f"{len(foreign)} path(s) in {ROOT} not owned by root (first: {foreign[0]}); run install --apply")
+    writable = report.get("root_writable") or []
+    if writable:
+        findings.append(f"{len(writable)} path(s) in {ROOT} writable by group or others (first: {writable[0]}); "
+                        "run install --apply")
     if report.get("managed_symlinks"):
         findings.append(", ".join(report["managed_symlinks"]) + " is a symlink; postwarden manages regular files only")
     config = report["config"]
@@ -360,7 +386,7 @@ def _findings(report: dict) -> list[str]:
     if postfix and postfix.get("attached") and postfix.get("chain_gaps"):
         findings.append(CHAIN_FINDING + ", ".join(postfix["chain_gaps"]) + "; run configure-postfix to repair")
     if postfix and postfix.get("attached") and postfix.get("macro_gaps"):
-        findings.append("Postfix does not send macros postwarden needs: " + "; ".join(postfix["macro_gaps"])
+        findings.append(MACRO_FINDING + "; ".join(postfix["macro_gaps"])
                         + "; run configure-postfix to repair")
     if postfix and postfix.get("postfix_settings_error"):
         findings.append(postfix["postfix_settings_error"] + "; postwarden will not start")
@@ -540,6 +566,7 @@ def plan_install(candidate: Path, report: dict, config_import: Path | None = Non
 
     unmanaged = [] if in_place else unmanaged_entries(ROOT)
     foreign = foreign_owned(ROOT)
+    writable = writable_by_others(ROOT)
 
     def secure_root():
         if unmanaged:
@@ -550,16 +577,18 @@ def plan_install(candidate: Path, report: dict, config_import: Path | None = Non
             for path in unmanaged:
                 shutil.move(str(path), str(parking / path.name))
         os.chown(ROOT, 0, 0)
-        os.chmod(ROOT, 0o755)
         config = Path(DEFAULT_CONFIG_PATH)
         for path in ROOT.rglob("*"):
             if path == config:
                 shutil.chown(path, "root", SERVICE_USER)
             else:
                 os.lchown(path, 0, 0)
+        normalize_modes(ROOT)
+        if config.is_file() and not config.is_symlink():
+            os.chmod(config, 0o640)
     names = ", ".join(p.name for p in unmanaged)
-    plan.add(f"secure {ROOT}: root ownership" + (f"; move unmanaged entries to {BACKUPS}/<time>-unmanaged: {names}" if unmanaged else ""),
-             secure_root, needed=bool(unmanaged or foreign))
+    plan.add(f"secure {ROOT}: root ownership, no group/other write" + (f"; move unmanaged entries to {BACKUPS}/<time>-unmanaged: {names}" if unmanaged else ""),
+             secure_root, needed=bool(unmanaged or foreign or writable))
 
     def copy_app():
         for name in APP_FILES:
@@ -574,13 +603,7 @@ def plan_install(candidate: Path, report: dict, config_import: Path | None = Non
                 shutil.copytree(source, target, ignore=shutil.ignore_patterns(*NOT_INSTALLED))
             else:
                 shutil.copy2(source, target)
-        for path in ROOT.rglob("*"):
-            if path.is_dir():
-                os.chmod(path, 0o755)
-            elif path.parent.name in ("bin", "scripts") or path.suffix == ".sh":
-                os.chmod(path, 0o755)
-            elif path.name != "config.toml":
-                os.chmod(path, 0o644)
+        normalize_modes(ROOT)
     same = in_place or ((ROOT / "src").exists() and tree_digest(candidate) == tree_digest(ROOT))
     plan.add(f"copy application {version} into {ROOT}" + (" (already in place)" if in_place else ""), copy_app, needed=not same)
 
@@ -832,7 +855,7 @@ def configure_postfix(phase: str, report: dict, apply: bool, log: Callable[[str]
     config = report["config"]
     if not config.get("valid"):
         raise DeploymentError("configuration is invalid; fix it before attaching to Postfix")
-    blocking = [f for f in report["findings"] if not f.startswith(CHAIN_FINDING)]
+    blocking = [f for f in report["findings"] if not f.startswith((CHAIN_FINDING, MACRO_FINDING))]
     if blocking:
         raise DeploymentError("unresolved findings from inspect:\n  " + "\n  ".join(blocking))
     refuse_symlinks()

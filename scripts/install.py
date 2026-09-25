@@ -50,9 +50,16 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     return 1 if report["findings"] else 0
 
 
+def only_inspect_takes_config(args: argparse.Namespace) -> None:
+    if os.path.abspath(args.config) != os.path.abspath(DEFAULT_CONFIG_PATH):
+        hint = "; use install --import-config FILE to install another file" if args.command == "install" else ""
+        sys.exit(f"--config applies to inspect only; {args.command} always uses {DEFAULT_CONFIG_PATH}{hint}")
+
+
 def cmd_install(args: argparse.Namespace) -> int:
+    only_inspect_takes_config(args)
     require_root(args)
-    report = deployment.inspect(args.config)
+    report = deployment.inspect(DEFAULT_CONFIG_PATH)
     blocking = [f for f in report["findings"] if f.startswith(("unsupported", "configuration missing", "configuration invalid"))]
     if blocking and not (args.import_config and any(f.startswith("configuration") for f in blocking) and len(blocking) == 1):
         for finding in blocking:
@@ -80,8 +87,9 @@ def cmd_install(args: argparse.Namespace) -> int:
 
 
 def cmd_configure_postfix(args: argparse.Namespace) -> int:
+    only_inspect_takes_config(args)
     require_root(args)
-    report = deployment.inspect(args.config)
+    report = deployment.inspect(DEFAULT_CONFIG_PATH)
     try:
         backup = deployment.configure_postfix(args.phase, report, args.apply, log, args.remove_legacy, args.keep_legacy)
     except deployment.DeploymentError as exc:
@@ -95,6 +103,7 @@ def cmd_configure_postfix(args: argparse.Namespace) -> int:
 
 
 def cmd_rollback(args: argparse.Namespace) -> int:
+    only_inspect_takes_config(args)
     require_root(args)
     try:
         deployment.rollback(args.deployment_id, args.apply, log, force=args.force)
@@ -108,26 +117,28 @@ def cmd_rollback(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=f"postwarden installer {__version__}")
-    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help=f"active configuration (default {DEFAULT_CONFIG_PATH})")
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH,
+                        help=f"configuration to inspect (inspect only; default {DEFAULT_CONFIG_PATH})")
     sub = parser.add_subparsers(dest="command")
     p = sub.add_parser("inspect", help="report host state without changing anything (default)")
     p.add_argument("--json", action="store_true")
+    def mode_flags(p):
+        group = p.add_mutually_exclusive_group()
+        group.add_argument("--apply", action="store_true", help="perform the changes; otherwise dry-run")
+        group.add_argument("--dry-run", action="store_true", help="(default) show the plan only")
     p = sub.add_parser("install", help="install packages, release, user, unit and start the daemon")
-    p.add_argument("--apply", action="store_true", help="perform the changes; otherwise dry-run")
-    p.add_argument("--dry-run", action="store_true", help="(default) show the plan only")
+    mode_flags(p)
     p.add_argument("--import-config", metavar="FILE", help=f"copy FILE to {DEFAULT_CONFIG_PATH} before validation")
     p = sub.add_parser("configure-postfix", help="attach the daemon to Postfix for the given phase")
     p.add_argument("--phase", choices=deployment.PHASES, required=True)
-    p.add_argument("--apply", action="store_true")
-    p.add_argument("--dry-run", action="store_true")
+    mode_flags(p)
     p.add_argument("--remove-legacy", action="store_true",
                    help="enforce phase only: drop pipe content filters and the policyd-spf call")
     p.add_argument("--keep-legacy", action="store_true",
                    help="enforce while SMTP content filters remain (reinjected mail to protected recipients bounces)")
     p = sub.add_parser("rollback", help="restore the files recorded for a deployment id")
     p.add_argument("--deployment-id", required=True)
-    p.add_argument("--apply", action="store_true")
-    p.add_argument("--dry-run", action="store_true")
+    mode_flags(p)
     p.add_argument("--force", action="store_true", help="overwrite files changed since the deployment")
     args = parser.parse_args(argv)
     if args.command is None:

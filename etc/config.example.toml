@@ -32,7 +32,7 @@ allow_senders = []          # addresses that may legitimately send to themselves
 #   SPF:  the sending server's IP is allowed by the envelope sender's domain.
 #   DKIM: a valid signature in the message, signed by the sender's domain.
 # A result counts only if its domain equals the From domain exactly.
-# DNS trouble defers mail, never rejects it. Local mail, mynetworks and
+# DNS trouble alone defers mail instead of rejecting it. Local mail, mynetworks and
 # logged-in users are exempt. Uncomment to change a default.
 #
 [sender_authentication]

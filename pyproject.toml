@@ -1,6 +1,6 @@
 [project]
 name = "postwarden"
-version = "1.0.0"
+version = "1.0.1"
 description = "Postfix milter for protected recipients, self-senders and SPF/DKIM sender authentication"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }

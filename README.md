@@ -6,9 +6,14 @@ A Postfix mail filter (milter) that decides, while a message is still being rece
 - refuses outside mail that uses the recipient's own address as the sender (**self-sender** mail);
 - requires outside mail to prove it comes from the domain in its `From` address, using **SPF and DKIM**.
 
-Refused mail gets an SMTP error before Postfix takes responsibility for it, so nothing is accepted and bounced later.
+Mail arriving over SMTP is refused with an SMTP error before Postfix takes responsibility for it, so the sender learns at once.
+Mail submitted with local `sendmail` is checked after submission; if it is refused, it bounces to the sender.
 
-**Status: 1.0.0, the first release.** Tested on Debian 12 (Postfix 3.7) and Debian 13 (Postfix 3.10), on customised servers and on a stock installation: automated and manual installation, observe and enforce modes, rollback, migration from pipe-based content filters, DNS failure, load, and alias, forwarder and BCC delivery. See the [changelog](CHANGELOG.md) for what 1.0.0 contains and the [roadmap](#roadmap) for what comes next.
+**Status: 1.0.1, a maintenance release of 1.0.0, the first release.**
+
+Tested on Debian 12 (Postfix 3.7) and Debian 13 (Postfix 3.10), on customised servers and on a stock installation: automated and manual installation, observe and enforce modes, rollback, migration from pipe-based content filters, DNS failure, load, and alias, forwarder and BCC delivery.
+
+See the [changelog](CHANGELOG.md) for what each release contains and the [roadmap](#roadmap) for what comes next.
 
 ## What it checks
 
@@ -28,7 +33,8 @@ Group members stay in your Postfix alias maps; postwarden only decides who may s
 
 ### Self-sender mail
 
-On port 25, a message is refused when its envelope sender or visible `From` address equals a recipient, for example `me@example.com` sending to `me@example.com`. Clients in Postfix's `mynetworks`, the server itself and listed sender addresses are exempt.
+On port 25, a message is refused when its envelope sender or visible `From` address equals a recipient, for example `me@example.com` sending to `me@example.com`.
+Clients in Postfix's `mynetworks`, the server itself and listed sender addresses are exempt.
 
 ### Sender authentication (SPF and DKIM)
 
@@ -41,7 +47,7 @@ By default **both** must pass. With `require = "either"` in `[sender_authenticat
 
 - Domains must match exactly: `bounce.example.com` does not match `example.com`.
 - A signature that is merely present counts for nothing; it must verify.
-- DNS or verifier trouble defers mail (`451`), it never rejects it.
+- DNS or verifier trouble on its own defers mail (`451`) instead of rejecting it; a definitive failure of the other check still rejects.
 - DMARC policies are not looked up.
 - Bounces (`MAIL FROM:<>`) pass on a matching DKIM signature alone, because their SPF identity is the sending host's name; `null_sender = "both"` applies the full rule.
 
@@ -57,16 +63,16 @@ In **observe** mode postwarden only logs what it would do and every message cont
 - Debian's own packages `python3 python3-milter python3-spf python3-dkim python3-dnspython` (Python 3.11 or 3.13). Nothing is installed with pip.
 - An outgoing DKIM signer such as OpenDKIM, if you sign mail; postwarden only verifies.
 
-No hosting control panel or mailbox database is needed.
+No hosting control panel or mailbox database is required.
 
 ## Installation
 
 Download `postwarden-<version>.tar.gz` and its `.sha256` from the project's [releases](https://github.com/sorinpohontu/postwarden/releases), then, as root:
 
 ```sh
-sha256sum -c postwarden-1.0.0.tar.gz.sha256
-mkdir /root/postwarden-1.0.0 && tar -xzf postwarden-1.0.0.tar.gz -C /root/postwarden-1.0.0
-cd /root/postwarden-1.0.0
+sha256sum -c postwarden-1.0.1.tar.gz.sha256
+mkdir /root/postwarden-1.0.1 && tar -xzf postwarden-1.0.1.tar.gz -C /root/postwarden-1.0.1
+cd /root/postwarden-1.0.1
 python3 scripts/install.py inspect                      # read-only report
 mkdir -p /etc/postwarden
 cp etc/config.example.toml /etc/postwarden/config.toml  # then list your protected addresses
@@ -84,9 +90,11 @@ Later, `configure-postfix --phase enforce --apply` switches postwarden and Postf
 
 ## Configuration
 
-All settings are in one file, `/etc/postwarden/config.toml`; every command uses it by default. The commented example [etc/config.example.toml](etc/config.example.toml) lists every setting.
+All settings are in one file, `/etc/postwarden/config.toml`; every command uses it by default.
+The commented example [etc/config.example.toml](etc/config.example.toml) lists every setting.
 
-You set the protected addresses and their logins, self-sender exceptions and, optionally, whether SPF and DKIM must both pass, exemptions, resource limits, the log level and the wording of replies. A rejection can never be configured into a deferral or an acceptance. Trusted networks (`mynetworks`) and the recipient delimiter are read from Postfix at start, never copied by hand.
+You set the protected addresses and their logins, self-sender exceptions and, optionally, whether SPF and DKIM must both pass, exemptions, resource limits, the log level and the wording of replies.
+A rejection can never be configured into a deferral or an acceptance. Trusted networks (`mynetworks`) and the recipient delimiter are read from Postfix at start, never copied by hand.
 
 ```sh
 postwarden check-config    # reports every problem at once, with the values read from Postfix
@@ -117,7 +125,8 @@ postwarden lookup 3f9c2a7b41d0 --since -30d
 postwarden lookup 3f9c2a7b41d0 --file '/var/log/mail.log*'  # syslog files, including rotated .gz
 ```
 
-It prints every postwarden line for that message: the rule, the exact reason, the trust class and the SPF/DKIM results. It exits 1 when nothing matches. Reading the journal needs root or the `adm` or `systemd-journal` group.
+It prints every postwarden line for that message: the rule, the exact reason, the trust class and the SPF/DKIM results. It exits 1 when nothing matches.
+Reading the journal needs root or the `adm` or `systemd-journal` group.
 
 [Operations](docs/Operations.md) lists every reason code and common tasks: updates, rollback, and what happens when the daemon is down.
 
@@ -143,9 +152,8 @@ The tests, the server test matrix (`docs/Testing.md`) and the release procedure 
 
 ## Roadmap
 
-Planned for future releases; no dates are set.
-
-- **1.1: sending limits.** Rolling hourly and daily caps on messages and recipients per login, local sender and trusted relay, plus a host-wide cap for local mail, to contain compromised accounts and hacked scripts. Over the limit, mail is deferred, not lost.
+- **1.1: sending limits.** Rolling hourly and daily caps on messages and recipients per login, local sender and trusted relay, plus a host-wide cap for local mail, to contain compromised accounts and hacked scripts.
+Over the limit, mail will be deferred, not lost.
 
 ## License
 

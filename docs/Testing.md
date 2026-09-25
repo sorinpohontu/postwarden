@@ -48,18 +48,27 @@ Keep a record of each run, outside the repository, with versions, configuration 
 
 ## Load and capacity
 
-`tests/load/milter_load.py` (checkout only, standard library) talks to a postwarden socket with the milter protocol, as Postfix does, and presents every message as untrusted port-25 mail so each one takes the SPF/DKIM path. Nothing is queued or delivered. Run it against a second daemon on a test socket, so live mail and the mail log are untouched:
+`tests/load/milter_load.py` (checkout only, standard library) talks to a postwarden socket with the milter protocol, as Postfix does, and presents every message as untrusted port-25 mail from `192.0.2.0/24` with a `gmail.com` sender, so SPF fails (softfail). Nothing is queued or delivered. Run it against a second daemon on a test socket, so live mail and the mail log are untouched:
 
 ```sh
 install -d -o postwarden -g postwarden -m 0750 /tmp/pwload
 runuser -u postwarden -- /usr/local/sbin/postwarden run --stderr --socket unix:/tmp/pwload/policy.sock 2>/tmp/pwload/daemon.log &
 python3 tests/load/milter_load.py --socket unix:/tmp/pwload/policy.sock --messages 200 --concurrency 20
-python3 tests/load/milter_load.py --socket unix:/tmp/pwload/policy.sock --messages 20 --concurrency 10 --signatures 10 --body-kib 40960
+python3 tests/load/milter_load.py --socket unix:/tmp/pwload/policy.sock --messages 20 --concurrency 10 --signatures 10 --body-kib 40000
 python3 tests/load/milter_load.py --socket unix:/tmp/pwload/policy.sock --hold 105
 kill %1
 ```
 
-The tool reports throughput, latency percentiles and the replies by stage, and exits non-zero if any message took longer than `--slow-after` (default 60 s, Postfix's `content_timeout`) or failed. Messages carry syntactically valid but unverifiable `DKIM-Signature` headers for a real selector (default `gmail.com`/`20230601`), so each costs a key lookup and a full body hash; `--signatures` and `--body-kib` set the worst case. `--hold N` opens N transactions at `MAIL FROM` and keeps them open: with the default `max_open_messages = 100`, 100 get `continue` and the rest `451 4.7.1`; a new transaction succeeds after they are released.
+The tool reports throughput, latency percentiles and the replies by stage, and exits non-zero if any message took longer than `--slow-after` (default 60 s, Postfix's `content_timeout`) or failed. Messages carry syntactically valid but unverifiable `DKIM-Signature` headers for a real selector (default `gmail.com`/`20230601`).
+
+Which path a run measures depends on the daemon's configuration; check the `reason=` and `dkim=` fields in its log:
+
+| Daemon setting                                                                                      | Path measured                                                | Expected log                                                                                              |
+| --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| default `require = "both"`                                                                          | SPF only: the SPF failure decides and DKIM is skipped        | `reason=spf_softfail dkim=skipped`                                                                        |
+| `require = "either"` (a copy of the configuration passed with `postwarden --config <copy> run ...`) | SPF, then a DKIM key lookup and full body hash per signature | `reason=no_aligned_pass dkim=gmail.com:fail,...`, or `evaluation_incomplete` when the deadline is reached |
+
+Keep the body plus headers below `limits.message_bytes` (40960 KiB by default): `--body-kib 40960` alone exceeds it and every message is deferred as `message_bytes` before any SPF/DKIM work. The signatures are negative fixtures (random `b=`/`bh=`); they measure lookup and hashing cost, not verification of a valid signature. `--hold N` opens N transactions at `MAIL FROM` and keeps them open: with the default `max_open_messages = 100`, 100 get `continue` and the rest `451 4.7.1`; a new transaction succeeds after they are released.
 
 ## Rollback and reinstall
 

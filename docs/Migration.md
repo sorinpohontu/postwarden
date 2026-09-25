@@ -110,6 +110,6 @@ Keep the filter scripts and the old configuration in your backups. `rollback --d
 ## What changes for users
 
 - Refusals happen during SMTP (`550` at `RCPT TO` or after `DATA`) instead of after acceptance, so senders see them immediately.
-- A refused recipient no longer blocks the other recipients of the same message.
+- A recipient refused at `RCPT TO` (a protected address, or the envelope sender equal to that recipient) no longer blocks the other recipients. Refusals decided at end of message (a self-sent `From` address, sender authentication) still apply to the whole message.
 - Local `sendmail` and PHP `mail()` cannot send to a protected address; such messages bounce entirely, including their other recipients.
 - SPF alone no longer decides. By default outside mail needs both SPF and DKIM matching the `From` domain (`require = "either"` accepts one of them); bounces need only a matching DKIM signature.

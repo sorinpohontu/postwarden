@@ -1,3 +1,4 @@
+import io
 import os
 import shutil
 import socket
@@ -6,6 +7,7 @@ import threading
 import time
 import dataclasses
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from postwarden.__main__ import main, socket_address
@@ -172,3 +174,36 @@ class RunSocketOption(unittest.TestCase):
         status, settings = self.run_with("--socket", "/tmp/x.sock")
         self.assertEqual(status, 1)
         self.assertIsNone(settings)
+
+
+class InstallerArguments(unittest.TestCase):
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("install_cli", Path(__file__).resolve().parents[2] / "scripts" / "install.py")
+        self.cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.cli)
+
+    def test_apply_and_dry_run_are_exclusive(self):
+        for command in (["install"], ["configure-postfix", "--phase", "observe"], ["rollback", "--deployment-id", "x"]):
+            with self.subTest(command=command[0]), mock.patch.object(self.cli.deployment, "inspect") as inspect, \
+                 mock.patch("sys.stderr", new=io.StringIO()) as err, self.assertRaises(SystemExit) as ctx:
+                self.cli.main(command + ["--apply", "--dry-run"])
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertIn("not allowed with argument", err.getvalue())
+            inspect.assert_not_called()
+
+    def test_config_only_for_inspect(self):
+        for command in (["install"], ["configure-postfix", "--phase", "enforce"], ["rollback", "--deployment-id", "x"]):
+            with self.subTest(command=command[0]), mock.patch.object(self.cli.deployment, "inspect") as inspect, \
+                 self.assertRaises(SystemExit) as ctx:
+                self.cli.main(["--config", "/tmp/other.toml"] + command)
+            self.assertIn("--config applies to inspect only", str(ctx.exception.code))
+            inspect.assert_not_called()
+        report = {"candidate_version": "x", "debian": {"id": "debian", "version_id": "13", "codename": "trixie"},
+                  "python": "3.13", "supported": True, "packages": {}, "installed_release": None, "unit_installed": False,
+                  "daemon_active": False, "socket_present": False, "config": {"path": "/tmp/other.toml", "present": False},
+                  "postfix": None, "findings": []}
+        with mock.patch.object(self.cli.deployment, "inspect", return_value=report) as inspect, \
+             mock.patch("sys.stdout", new=io.StringIO()):
+            self.assertEqual(self.cli.main(["--config", "/tmp/other.toml", "inspect"]), 0)
+        inspect.assert_called_once_with("/tmp/other.toml")
