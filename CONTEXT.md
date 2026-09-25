@@ -147,6 +147,13 @@ submission, the envelope sender for local mail, the client IP for `mynetworks`
 relays without a login, plus one **host-wide local cap** over all local mail.
 Untrusted inbound mail has no limit key.
 
+### Window state file (planned, 1.1)
+
+`/var/lib/postwarden/limits.json`: the daemon's own snapshot of its
+sending-limit windows, written every minute and on stop, loaded at start, so
+restarts and reboots do not reset the limits (ADR-0021). Counts never come
+from logs.
+
 ### Open message
 
 A transaction between `MAIL FROM` and end of message, holding a capture and spool

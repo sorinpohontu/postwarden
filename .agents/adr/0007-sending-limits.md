@@ -1,6 +1,6 @@
 # ADR-0007: Per-sender sending limits in postwarden (planned for 1.1)
 
-- Status: Accepted
+- Status: Accepted; state across restarts amended by ADR-0021
 - Date: 2026-09-22
 
 ## Context
