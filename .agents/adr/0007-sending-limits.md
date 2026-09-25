@@ -34,13 +34,21 @@ internal application relaying from a fixed address.
   below the message count and already stops floods of single-recipient
   messages. A message to 100 recipients and 100 messages to one recipient each
   both count 100.
-- **Defaults (enabled):** per key 100 recipients per hour and 500 per day;
-  host-wide local cap 1000 per hour and 5000 per day.
+- **Defaults:** per key 100 recipients per hour and 500 per day; host-wide
+  local cap 1000 per hour and 5000 per day.
+- **Own mode:** `[sending_limits] mode = "observe" | "enforce" | "off"`,
+  default `observe`, so an upgrade to 1.1 on an enforcing host only logs
+  `would_defer` until the operator has set multipliers and chosen `enforce`.
+  The global `mode = "observe"` still wins. In `observe`, counts follow what
+  enforcement would have committed: recipients that would have been deferred
+  are not counted. `off` neither counts nor logs.
 - **Exceptions are multipliers** that scale both per-key defaults:
   - per account: the limit key itself (SASL login, or envelope sender of
     local mail), e.g. `"marketing@example.com" = 10`;
   - per domain: the domain of that key, exact match only (no subdomains),
-    e.g. `"example.com" = 2`;
+    e.g. `"example.com" = 2`. A login without a domain (such as `john`) takes
+    the domain of its envelope sender for this lookup; its account key stays
+    the login;
   - per relay: an IP address or CIDR for `mynetworks` relays without a login,
     e.g. `"192.0.2.10" = 5`; domain multipliers do not apply to relays.
   - The most specific match wins and factors are never combined: account over
@@ -70,8 +78,14 @@ internal application relaying from a fixed address.
 - **Action:** over the limit → temporary failure. SMTP: `451` at RCPT from the
   first recipient over the limit; earlier recipients of the same message
   proceed. Local pickup: accumulated and returned at
-  end of message, like other non-SMTP decisions; the resulting queue behavior
-  must be verified on both Debian releases before release. New reply key
+  end of message, like other non-SMTP decisions. Verified on Debian 12 and
+  13 (2026-09-25): Postfix keeps the original file in `maildrop`, `pickup`
+  retries it every 60 s with a fresh `cleanup` pass, no backoff, no bounce
+  and no queue lifetime, so the message is delivered once the window allows.
+  Every retry is a full decision and one log line. `inspect` reports the
+  number and oldest age of files in `maildrop`, with a finding above a
+  threshold; the operations guide explains how to list and remove held local
+  mail. New reply key
   `sending_limit`, default `451 4.7.1 Sending limit exceeded - try again later`,
   with the usual `(ref <mid>)`. Observe mode logs `would_defer`.
 - **Logging:** each refusal is an `info` decision (`rule=sending_limit`,
@@ -122,6 +136,14 @@ per_day = 500
   other: anvil does not see logins, local mail or `mynetworks` relays;
   postwarden does not see refused recipients. The warning makes a Postfix
   limit that silently caps a multiplier visible.
+- For a login without a domain, the domain multiplier follows the envelope
+  sender, which the client chooses. Where Postfix does not enforce sender
+  ownership (`reject_sender_login_mismatch` with `smtpd_sender_login_maps`), a
+  stolen short login can pick a sender domain with a larger multiplier.
+- A flood of local mail held in `maildrop` is re-checked every minute: a
+  script that drops 10,000 messages causes 10,000 decisions and log lines per
+  minute until its windows allow them. Accepted for complete logs; the
+  operator removes the backlog.
 - Options not taken:
   - memcached: restart-proof, but a network hop per recipient, a new
     dependency and an undefined failure mode, for a cross-host need that does
@@ -146,5 +168,9 @@ per_day = 500
     does not stop a stolen login used from many addresses;
   - letting the installer set Postfix rate limits: postwarden would own
     unrelated Postfix policy;
+  - limits on and enforced right after upgrade; limits off unless configured;
+  - skipping the domain level for logins without a domain;
+  - logging only the first deferral per key and window;
+  - a postwarden command that removes held local mail;
   - absolute per-key overrides; multiplying domain and account factors; an
     "unlimited" value; whole-number-only factors; relays without overrides.

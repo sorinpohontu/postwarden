@@ -101,7 +101,9 @@ is on. None bypass protected recipients.
 ### Mode
 
 `observe` logs the decision that would be taken and lets the message continue;
-`enforce` returns the configured SMTP reply. One global daemon setting.
+`enforce` returns the configured SMTP reply. One global daemon setting; from
+1.1 sending limits also have their own mode (`observe`, `enforce`, `off`,
+default `observe`), and a global `observe` overrides it (ADR-0007).
 
 ### Phase
 
