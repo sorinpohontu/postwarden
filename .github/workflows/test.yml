@@ -3,7 +3,9 @@ name: test
 on:
   push:
     branches: [main]
+    paths-ignore: ["**.md", ".agents/**", "LICENSE"]
   pull_request:
+    paths-ignore: ["**.md", ".agents/**", "LICENSE"]
   workflow_call:
 
 permissions:
