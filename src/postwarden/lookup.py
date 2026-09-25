@@ -53,7 +53,15 @@ def file_lines(pattern: str) -> Iterator[str]:
             yield from (line for line in fh if "postwarden" in line)
 
 
-def lookup(ref: str, *, since: str, files: str | None) -> list[str]:
+def log_files(files: str | None) -> str | None:
+    """The file pattern to search, or None for the journal."""
     if files is None and shutil.which("journalctl"):
+        return None
+    return files or MAIL_LOGS
+
+
+def lookup(ref: str, *, since: str, files: str | None) -> list[str]:
+    pattern = log_files(files)
+    if pattern is None:
         return list(matching(journal_lines(since), ref))
-    return list(matching(file_lines(files or MAIL_LOGS), ref))
+    return list(matching(file_lines(pattern), ref))

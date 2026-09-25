@@ -124,8 +124,28 @@ class Lookup(unittest.TestCase):
         path = os.path.join(tmp, "mail.log")
         with open(path, "w") as fh:
             fh.writelines(self.LINES)
-        with mock.patch("sys.stderr"):
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
             self.assertEqual(main(["lookup", "bbbbbbbbbbbb", "--file", path]), 1)
+        self.assertIn(f"searched {path})", err.getvalue())
+        self.assertNotIn("journal", err.getvalue())
+
+    def test_not_found_in_journal_names_the_journal_and_its_permissions(self):
+        from postwarden import lookup as mod
+        fake = mock.Mock(stdout=iter(self.LINES), stderr=mock.Mock(read=lambda: ""), wait=lambda: 0)
+        with mock.patch.object(mod.shutil, "which", return_value="/bin/journalctl"), \
+             mock.patch.object(mod.subprocess, "Popen", return_value=fake), \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(main(["lookup", "bbbbbbbbbbbb"]), 1)
+        self.assertIn("searched the journal since -7d", err.getvalue())
+        self.assertIn("systemd-journal", err.getvalue())
+
+    def test_without_journalctl_the_mail_logs_are_named(self):
+        from postwarden import lookup as mod
+        with mock.patch.object(mod.shutil, "which", return_value=None), \
+             mock.patch.object(mod, "file_lines", return_value=iter(self.LINES)), \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(main(["lookup", "bbbbbbbbbbbb"]), 1)
+        self.assertIn(f"searched {mod.MAIL_LOGS})", err.getvalue())
 
 
 class CheckConfigSummary(unittest.TestCase):

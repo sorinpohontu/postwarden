@@ -134,7 +134,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_lookup(args: argparse.Namespace) -> int:
-    from .lookup import LookupFailed, lookup, normalize_ref
+    from .lookup import LookupFailed, log_files, lookup, normalize_ref
     try:
         ref = normalize_ref(args.ref)
         lines = lookup(ref, since=args.since, files=args.file)
@@ -142,8 +142,10 @@ def cmd_lookup(args: argparse.Namespace) -> int:
         print(exc, file=sys.stderr)
         return 2
     if not lines:
-        print(f"no postwarden log line with mid={ref} (searched {args.file or 'the journal since ' + args.since}; "
-              "reading the journal may need root or the adm group)", file=sys.stderr)
+        pattern = log_files(args.file)
+        searched = (f"the journal since {args.since}; reading it may need root or the adm or systemd-journal group"
+                    if pattern is None else pattern)
+        print(f"no postwarden log line with mid={ref} (searched {searched})", file=sys.stderr)
         return 1
     print("\n".join(lines))
     return 0

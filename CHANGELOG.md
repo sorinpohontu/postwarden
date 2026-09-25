@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`lookup` message when nothing matches.** It names what was searched (the journal, the `--file` pattern, or `/var/log/mail.log*` when `journalctl` is missing) and mentions journal permissions only when the journal was read.
+
 ## [1.0.1] - 2026-09-25
 
 ### Fixed
