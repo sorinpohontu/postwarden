@@ -1,4 +1,4 @@
-# ADR-0022: `lookup` and `stats` read postwarden's journal entries by trusted unit
+# ADR-0021: `lookup` and `stats` read postwarden's journal entries by trusted unit
 
 - Status: Accepted
 - Date: 2026-09-25

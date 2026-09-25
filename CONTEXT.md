@@ -134,8 +134,7 @@ the precise rule and reason that the terse public reply leaves out.
 
 ### Sending limit (planned, 1.1)
 
-A rolling-hour and rolling-day cap on messages and on recipients per
-**limit key**, enforced by the `sending_limit` rule with a temporary failure
+A rolling-hour and rolling-day cap on recipients per **limit key**, enforced by the `sending_limit` rule with a temporary failure
 (ADR-0007). Protects against compromised logins and hacked scripts; not a
 per-message recipient cap (`limits.max_recipients`) and not Postfix's per-IP
 `anvil` limits.
@@ -147,11 +146,18 @@ submission, the envelope sender for local mail, the client IP for `mynetworks`
 relays without a login, plus one **host-wide local cap** over all local mail.
 Untrusted inbound mail has no limit key.
 
+### Limit multiplier (planned, 1.1)
+
+A positive factor that scales both default sending limits for one
+account (limit key), one domain (exact match) or one relay IP/CIDR. The most
+specific match wins; factors are never combined and there is no "unlimited"
+(ADR-0007). Not an absolute limit.
+
 ### Window state file (planned, 1.1)
 
 `/var/lib/postwarden/limits.json`: the daemon's own snapshot of its
 sending-limit windows, written every minute and on stop, loaded at start, so
-restarts and reboots do not reset the limits (ADR-0021). Counts never come
+restarts and reboots do not reset the limits (ADR-0007). Counts never come
 from logs.
 
 ### Open message

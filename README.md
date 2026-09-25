@@ -152,8 +152,8 @@ The tests, the server test matrix (`docs/Testing.md`) and the release procedure 
 
 ## Roadmap
 
-- **1.1: sending limits.** Rolling hourly and daily caps on messages and recipients per login, local sender and trusted relay, plus a host-wide cap for local mail, to contain compromised accounts and hacked scripts.
-Over the limit, mail will be deferred, not lost.
+- **1.1: sending limits.** Rolling hourly and daily caps on recipients (default 100 per hour, 500 per day) per login, local sender and trusted relay, plus a host-wide cap for local mail, to contain compromised accounts and hacked scripts.
+One set of defaults, with a multiplier for a busier domain, account or relay (for example `example.com = 2`, `marketing@example.com = 10`). Over the limit, mail will be deferred, not lost.
 - **1.1: `postwarden simulate`.** Check what postwarden would decide for a message file and given connection details (port, login, client address) before changing the live configuration; nothing is sent.
 - **1.1: `postwarden stats`.** Totals of accepted, refused and deferred mail per rule and reason for a period, counted from the log.
 
