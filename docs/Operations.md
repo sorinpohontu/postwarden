@@ -117,7 +117,7 @@ Counts are kept in `/var/lib/postwarden/limits.json` (owner `postwarden`, mode `
 
 - **A legitimate sender needs more:** add a multiplier in `[sending_limits.multipliers]`, run `postwarden check-config`, then `systemctl restart postwarden`.
 - **A compromised account:** change its password; the limit only slows it down.
-- **Local mail over a limit** waits in Postfix's `maildrop` directory and is retried every minute, without a lifetime or bounce, until the limits allow it; every retry is logged. Count it with `find /var/spool/postfix/maildrop -type f | wc -l`, read one with `postcat /var/spool/postfix/maildrop/<file>`, and delete unwanted files with `rm`; the rest go through once the window allows.
+- **Local mail over a limit** waits in Postfix's `maildrop` directory (`install.py inspect` warns at 100 files or a file older than an hour) and is retried every minute, without a lifetime or bounce, until the limits allow it; every retry is logged. Count it with `find /var/spool/postfix/maildrop -type f | wc -l`, read one with `postcat /var/spool/postfix/maildrop/<file>`, and delete unwanted files with `rm`; the rest go through once the window allows.
 
 ## When postwarden is down
 

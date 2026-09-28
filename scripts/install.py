@@ -37,7 +37,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     if report.get("root_unmanaged"):
         print(f"  not part of the release (install --apply moves them to the backup directory): {', '.join(report['root_unmanaged'])}")
     config = report["config"]
-    print(f"config {config['path']}: " + ("missing" if not config["present"] else ("valid, mode=" + config["mode"] if config["valid"] else "INVALID")))
+    print(f"config {config['path']}: " + ("missing" if not config["present"] else (f"valid, mode={config['mode']}, sending_limits={config['sending_limits']}" if config["valid"] else "INVALID")))
     if report["postfix"]:
         pf = report["postfix"]
         print(f"postfix {pf['version']}: queue={pf['queue_directory']} delimiter={pf['recipient_delimiter']!r} attached={pf['attached']}")
@@ -45,6 +45,14 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         print(f"  services: " + ", ".join(f"{k}={'yes' if v else 'no'}" for k, v in pf["services"].items()))
         if pf["content_filters"]:
             print(f"  content filters: {pf['content_filters']}")
+        if pf.get("rate_limits"):
+            print(f"  rate limits: {pf['rate_limits']}")
+        backlog = pf["maildrop"]
+        if "error" not in backlog:
+            age = f", oldest {backlog['oldest_seconds']}s" if backlog["oldest_seconds"] is not None else ""
+            print(f"  maildrop: {backlog['files']} file(s){age}")
+    for warning in report.get("warnings", []):
+        print(f"~ {warning}")
     for finding in report["findings"]:
         print(f"! {finding}")
     return 1 if report["findings"] else 0

@@ -49,6 +49,8 @@ LOCAL_CLEANUP = "postwarden-cleanup"
 INGRESS = {"smtpd/pass": "SMTP25", "smtp/inet": "SMTP25", "submission/inet": "SUBMISSION587",
            "submissions/inet": "SUBMISSION465", "smtps/inet": "SUBMISSION465"}
 PHASES = ("observe", "enforce")
+MAILDROP_FILES = 100
+MAILDROP_AGE = 3600
 CHAIN_FINDING = "postwarden missing from milter chain: "
 MACRO_FINDING = "Postfix does not send macros postwarden needs: "
 
@@ -222,6 +224,18 @@ def master_services(config_dir: Path | None = None) -> dict[str, str]:
     return services
 
 
+def maildrop_backlog(queue_directory: str, now: float | None = None) -> dict:
+    """Files waiting in maildrop and the age of the oldest; local mail that postwarden deferred stays there."""
+    path = Path(queue_directory) / "maildrop"
+    now = time.time() if now is None else now
+    try:
+        entries = [e for e in os.scandir(path) if e.is_file(follow_symlinks=False)]
+        oldest = min((e.stat(follow_symlinks=False).st_mtime for e in entries), default=None)
+    except OSError as exc:
+        return {"path": str(path), "error": exc.strerror or str(exc)}
+    return {"path": str(path), "files": len(entries), "oldest_seconds": None if oldest is None else max(0, int(now - oldest))}
+
+
 def service_active(unit: str) -> bool:
     return run(["systemctl", "is-active", "--quiet", unit], check=False).returncode == 0
 
@@ -249,12 +263,14 @@ def inspect(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
     report["managed_symlinks"] = [str(p) for p in managed_files() if p.is_symlink()]
 
     config: dict = {"path": config_path, "present": Path(config_path).exists()}
+    settings = None
     if config["present"]:
         try:
             settings = load_settings(config_path)
             addresses, groups = settings.protection.counts()
             config.update(valid=True, mode=settings.mode, protected_addresses=addresses, protected_groups=groups,
-                          remote_transports=sorted(settings.protection.remote_transports))
+                          remote_transports=sorted(settings.protection.remote_transports),
+                          sending_limits=settings.sending_limits.mode)
         except ConfigError as exc:
             config.update(valid=False, errors=exc.errors)
     report["config"] = config
@@ -280,12 +296,37 @@ def inspect(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
             "main_cf_sha256": sha256(POSTFIX_DIR / "main.cf"),
             "master_cf_sha256": sha256(POSTFIX_DIR / "master.cf"),
         }
+        postfix["maildrop"] = maildrop_backlog(postfix["queue_directory"])
         report["postfix"] = postfix
         report["findings"] = _findings(report)
+        report["warnings"] = _warnings(report, settings)
     else:
         report["postfix"] = None
         report["findings"] = ["postconf not found: Postfix is not installed"]
+        report["warnings"] = []
     return report
+
+
+def _warnings(report: dict, settings) -> list[str]:
+    """Operational notices that never block an installer step."""
+    from .postfix import PostfixError, describe_rate_limits, rate_limit_warnings, read_rate_limits
+    warnings = []
+    postfix = report["postfix"]
+    try:
+        limits = read_rate_limits()
+        postfix["rate_limits"] = describe_rate_limits(limits)
+        if settings is not None:
+            warnings += rate_limit_warnings(limits, settings.sending_limits)
+    except PostfixError as exc:
+        postfix["rate_limits"] = None
+        warnings.append(f"Postfix rate limits not read: {exc}")
+    backlog = postfix["maildrop"]
+    if "error" in backlog:
+        warnings.append(f"{backlog['path']} not readable ({backlog['error']}); run inspect as root to see held local mail")
+    elif backlog["files"] >= MAILDROP_FILES or (backlog["oldest_seconds"] or 0) >= MAILDROP_AGE:
+        warnings.append(f"{backlog['files']} file(s) waiting in {backlog['path']}, oldest {backlog['oldest_seconds']}s: "
+                        "local mail held by a sending limit or a stopped pickup; see Operations, Sending limits")
+    return warnings
 
 
 def unmanaged_entries(root: Path) -> list[Path]:

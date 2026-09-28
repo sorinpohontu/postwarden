@@ -72,6 +72,7 @@ If your SMTP services pass mail through content filters that reinject it with `s
 ### How the installer works
 
 - `inspect` and every `--dry-run` change nothing. `--apply` and `--dry-run` cannot be combined.
+- `inspect` marks problems that block installation with `!` and exits 1. Lines marked `~` are warnings that block nothing: Postfix rate limits below the sending limits, and local mail waiting in `maildrop` (100 files or more, or a file older than an hour). It also prints Postfix's rate limits and the number of files in `maildrop`.
 - `install.py --config FILE inspect` checks another configuration file. `install` and `configure-postfix` always use `/etc/postwarden/config.toml`; to install another file, use `install --import-config FILE`.
 - `--apply` needs root and takes a lock. It backs up everything it changes under `/var/backups/postwarden/<deployment-id>/` and prints the **deployment id**.
 - Each `--apply` makes its own plan; it does not reuse an earlier dry run. It refuses if `config.toml`, `main.cf`, `master.cf` or the installed files change while it runs, and if any of them is a symlink.

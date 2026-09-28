@@ -606,3 +606,49 @@ class NoOpRuns(_Sandbox):
             self.assertIsNone(deployment.configure_postfix("enforce", report, apply=True, log=logged.append))
         self.assertIn("nothing to change; no deployment recorded", logged)
         self.assertFalse(deployment.BACKUPS.exists() and any(deployment.BACKUPS.iterdir()))
+
+
+class HeldLocalMail(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.queue = directory.name
+        os.mkdir(os.path.join(self.queue, "maildrop"))
+
+    def drop(self, name, age, now=1_800_000_000):
+        path = os.path.join(self.queue, "maildrop", name)
+        Path(path).write_text("x")
+        os.utime(path, (now - age, now - age))
+
+    def report(self, now=1_800_000_000):
+        backlog = deployment.maildrop_backlog(self.queue, now)
+        report = {"postfix": {"maildrop": backlog}}
+        with mock.patch("postwarden.postfix.read_rate_limits", side_effect=deployment_postfix_error()):
+            return backlog, deployment._warnings(report, None)[1:]
+
+    def test_empty_maildrop_is_quiet(self):
+        backlog, warnings = self.report()
+        self.assertEqual((backlog["files"], backlog["oldest_seconds"], warnings), (0, None, []))
+
+    def test_old_file_is_reported(self):
+        self.drop("A1", 30)
+        self.assertEqual(self.report()[1], [])
+        self.drop("B2", 3600)
+        backlog, warnings = self.report()
+        self.assertEqual((backlog["files"], backlog["oldest_seconds"]), (2, 3600))
+        self.assertTrue(warnings[0].startswith("2 file(s) waiting in "))
+
+    def test_many_files_are_reported(self):
+        for n in range(100):
+            self.drop(f"F{n}", 5)
+        self.assertEqual(len(self.report()[1]), 1)
+
+    def test_unreadable_maildrop_is_reported_not_fatal(self):
+        backlog = deployment.maildrop_backlog(os.path.join(self.queue, "missing"))
+        self.assertIn("error", backlog)
+
+
+def deployment_postfix_error():
+    from postwarden.postfix import PostfixError
+    return PostfixError("postconf not found")

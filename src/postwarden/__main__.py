@@ -70,6 +70,16 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     print(f"{args.config}: OK (schema {settings.schema_version}, mode {settings.mode}, "
           f"sending limits {settings.sending_limits.mode}, "
           f"{_protection_summary(settings)}; {note})")
+    if note.startswith("from Postfix"):
+        from .postfix import PostfixError, describe_rate_limits, rate_limit_warnings, read_rate_limits
+        try:
+            limits = read_rate_limits()
+        except PostfixError as exc:
+            print(f"Postfix rate limits not read: {exc}")
+            return 0
+        print(f"Postfix rate limits: {describe_rate_limits(limits)}")
+        for warning in rate_limit_warnings(limits, settings.sending_limits):
+            print(f"warning: {warning}")
     return 0
 
 
