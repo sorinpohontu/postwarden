@@ -14,8 +14,7 @@ from . import limitstate
 from .logging import EventLogger
 from .message import MessageCapture
 from .policy import (Action, ConnectionFacts, Decision, RecipientState, TransactionState, TrustClass,
-                     classify_trust, combine, evaluate_authentication, evaluate_recipient,
-                     evaluate_self_sender_header, evaluate_visible_from, requires_authentication,
+                     classify_trust, combine, evaluate_authentication, evaluate_message, evaluate_recipient,
                      spf_decides)
 from .quota import KEY_STORE_FULL, LimitKey, QuotaStore, Reservation, limit_key
 
@@ -266,8 +265,8 @@ class PolicyMilter(Milter.Base):
                 fields[key] = sent
             if hypothetical:
                 fields[f"would_{key}"] = hypothetical
-        decisions: list[Decision | None] = list(self.state.deferred_rejections)
         if capture is None:
+            decisions: list[Decision | None] = list(self.state.deferred_rejections)
             final = self._final(decisions)
             fields["elapsed"] = f"{time.monotonic() - self.started:.3f}"
             rc = self._apply(final, "eom", **fields)
@@ -276,24 +275,13 @@ class PolicyMilter(Milter.Base):
             return rc
 
         headers_complete = capture.over_limit not in ("max_headers", "max_header_bytes")
-        header_from = None
-        if headers_complete:
-            from_values = [v.decode("utf-8", "surrogateescape") for v in capture.header_values(b"From")]
-            header_from, from_decision = evaluate_visible_from(_settings, self.trust, from_values)
-            decisions.append(from_decision)
+        from_values = ([v.decode("utf-8", "surrogateescape") for v in capture.header_values(b"From")]
+                       if headers_complete else None)
+        decisions, header_from = evaluate_message(_settings, self.facts, self.trust, self.state, from_values,
+                                                  capture.over_limit,
+                                                  lambda sender_from: self._authenticate(capture, sender_from, fields))
         if header_from is not None:
-            decisions.append(evaluate_self_sender_header(_settings, self.facts, self.trust, header_from,
-                                                         self.state.accepted_recipients()))
             fields["from_domain"] = header_from.domain
-
-        if capture.over_limit:
-            decisions.append(Decision(Action.DEFER, "limits", capture.over_limit, _settings.reply("temporary_failure")))
-        elif (requires_authentication(_settings, self.trust) and header_from is not None
-              and not any(d is not None and d.action is Action.REJECT for d in decisions)):
-            decisions.append(self._authenticate(capture, header_from, fields))
-
-        if not any(d is not None for d in decisions):
-            decisions.append(Decision.allow("trust", f"exempt_{self.trust.value}"))
         final = self._final(decisions)
         fields["elapsed"] = f"{time.monotonic() - self.started:.3f}"
         rc = self._apply(final, "eom", **fields)

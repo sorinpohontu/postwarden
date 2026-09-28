@@ -42,6 +42,24 @@ def build_parser() -> argparse.ArgumentParser:
     stats.add_argument("--json", action="store_true", help="machine-readable output")
     stats.add_argument("--config", default=argparse.SUPPRESS,
                        help="configuration whose sending limits are shown next to each sender")
+    sim = sub.add_parser("simulate", help="show what postwarden would decide for given connection facts and message; "
+                                          "nothing is sent")
+    sim.add_argument("message", nargs="?", help="message file (.eml); without it only the RCPT stage is evaluated")
+    sim.add_argument("--ingress", required=True, choices=("25", "587", "465", "local"),
+                     help="port the message arrives on, or local for sendmail")
+    sim.add_argument("--from", dest="sender", required=True, metavar="SENDER", help="envelope sender; <> for a bounce")
+    sim.add_argument("--to", dest="recipients", action="append", required=True, metavar="RCPT",
+                     help="envelope recipient (repeat for more)")
+    sim.add_argument("--login", help="SASL login (587/465)")
+    sim.add_argument("--peer", help="client IP address; required for 25, 587 and 465 (local: 127.0.0.1)")
+    sim.add_argument("--helo", default="", help="HELO name (SPF for bounces)")
+    sim.add_argument("--no-tls", action="store_true", help="the submission connection is not encrypted")
+    sim.add_argument("--spf", choices=("pass", "fail", "none", "temperror"),
+                     help="use this SPF result for the From domain instead of DNS")
+    sim.add_argument("--dkim", choices=("pass", "fail", "none", "temperror"),
+                     help="use this DKIM result for the From domain instead of DNS")
+    sim.add_argument("--transport", help="Postfix transport of the recipients (default: locally delivered)")
+    sim.add_argument("--config", default=argparse.SUPPRESS, help="configuration file to evaluate, e.g. a candidate")
     wait = sub.add_parser("wait-ready", help="wait until the configured milter socket accepts connections")
     wait.add_argument("--timeout", type=float, default=15.0, help="seconds to wait (default: 15)")
     return parser
@@ -219,6 +237,49 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_simulate(args: argparse.Namespace) -> int:
+    from .simulate import Facts, render, simulate, valid_peer
+    if args.ingress != "local" and not args.peer:
+        print(f"--peer is required for --ingress {args.ingress}: it decides mynetworks and same-host trust",
+              file=sys.stderr)
+        return 2
+    if args.peer and not valid_peer(args.peer):
+        print(f"--peer {args.peer}: not an IP address", file=sys.stderr)
+        return 2
+    try:
+        settings = load_settings(args.config)
+    except ConfigError as exc:
+        print(f"{args.config}: {len(exc.errors)} problem(s)", file=sys.stderr)
+        for error in exc.errors:
+            print(f"  {error}", file=sys.stderr)
+        return 2
+    resolved, note = _with_postfix(settings, required=False)
+    if resolved is None:
+        print(f"{args.config}: {note}", file=sys.stderr)
+        return 2
+    message = None
+    if args.message:
+        try:
+            with open(args.message, "rb") as fh:
+                message = fh.read(resolved.limits.message_bytes + 1)
+        except OSError as exc:
+            print(f"{args.message}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
+    facts = Facts(ingress=args.ingress, sender=args.sender, recipients=tuple(args.recipients), login=args.login,
+                  peer=args.peer, helo=args.helo, tls=not args.no_tls, spf=args.spf, dkim=args.dkim,
+                  transport=args.transport)
+    try:
+        outcome = simulate(resolved, facts, message)
+    except ImportError as exc:
+        print(f"SPF/DKIM from DNS needs the Debian packages python3-spf, python3-dkim and python3-dnspython ({exc}); "
+              "or give --spf and --dkim", file=sys.stderr)
+        return 2
+    print("\n".join(render(resolved, facts, outcome, args.message)))
+    if note.startswith("Postfix settings not read"):
+        print(f"note: {note}; mynetworks and recipient_delimiter are empty", file=sys.stderr)
+    return outcome.exit_code
+
+
 def socket_address(spec: str) -> tuple[int, object]:
     """Translate a libmilter socket spec (unix:PATH, inet:PORT[@HOST], inet6:PORT[@HOST]) into a connect target."""
     kind, _, rest = spec.partition(":")
@@ -256,7 +317,8 @@ def cmd_wait_ready(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     handler = {"check-config": cmd_check_config, "show-config": cmd_show_config, "run": cmd_run,
-               "lookup": cmd_lookup, "stats": cmd_stats, "wait-ready": cmd_wait_ready}[args.command]
+               "lookup": cmd_lookup, "stats": cmd_stats, "simulate": cmd_simulate,
+               "wait-ready": cmd_wait_ready}[args.command]
     return handler(args)
 
 

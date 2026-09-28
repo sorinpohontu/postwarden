@@ -4,16 +4,17 @@ Day-to-day commands, the log format, and what to do when something goes wrong.
 
 ## Commands
 
-| Command                                           | What it does                                                                 |
-| ------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `systemctl status postwarden`                     | service state                                                                |
-| `postwarden check-config`                         | validates `/etc/postwarden/config.toml` and shows what it read from Postfix  |
-| `postwarden show-config`                          | prints the settings in effect                                                |
-| `systemctl restart postwarden`                    | applies configuration changes                                                |
-| `postwarden wait-ready`                           | exits 0 once the socket accepts connections (default timeout 15 s)           |
-| `postwarden lookup <ref>`                         | prints the log lines for a reply reference                                   |
-| `postwarden stats`                                | totals, refusals and top senders for the last 24 hours, counted from the log |
-| `ls -l /var/spool/postfix/postwarden/policy.sock` | the socket Postfix connects to (`srwxrwx--- postwarden postfix`)             |
+| Command                                           | What it does                                                                           |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `systemctl status postwarden`                     | service state                                                                          |
+| `postwarden check-config`                         | validates `/etc/postwarden/config.toml` and shows what it read from Postfix            |
+| `postwarden show-config`                          | prints the settings in effect                                                          |
+| `systemctl restart postwarden`                    | applies configuration changes                                                          |
+| `postwarden wait-ready`                           | exits 0 once the socket accepts connections (default timeout 15 s)                     |
+| `postwarden lookup <ref>`                         | prints the log lines for a reply reference                                             |
+| `postwarden simulate …`                           | shows what postwarden would decide for given facts and a message file; nothing is sent |
+| `postwarden stats`                                | totals, refusals and top senders for the last 24 hours, counted from the log           |
+| `ls -l /var/spool/postfix/postwarden/policy.sock` | the socket Postfix connects to (`srwxrwx--- postwarden postfix`)                       |
 
 ## Changing the configuration
 
@@ -94,6 +95,30 @@ Message bodies, passwords and raw headers are never logged; only envelope addres
 ### Log level
 
 `logging.level` is `debug`, `info`, `warning` or `error`. Decisions are logged at `info`, so keep `info` in production; at `warning` or above no accept, reject or defer is logged. Start and stop lines are always logged.
+
+## Simulating a decision
+
+`postwarden simulate` evaluates the facts of one message against a configuration, with the same policy code the daemon runs. Nothing is sent, delivered or counted, and the running daemon keeps its configuration until restarted, so it is the way to try a candidate file:
+
+```sh
+postwarden --config /tmp/candidate.toml simulate message.eml --ingress 587 --peer 192.0.2.10 \
+    --login demo@example.com --from demo@example.com --to all@example.com --to carol@example.net
+```
+
+| Option            | Meaning                                                                                                                           |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `MESSAGE.eml`     | optional message file. Without it only the RCPT stage runs, and the end of message shows as not evaluated                         |
+| `--ingress`       | `25`, `587`, `465` or `local` (sendmail)                                                                                          |
+| `--from`, `--to`  | envelope sender (`<>` for a bounce) and recipients; repeat `--to`                                                                 |
+| `--login`         | SASL login, for 587/465                                                                                                           |
+| `--peer`          | client address; required for 25, 587 and 465, since it decides `mynetworks` and same-host trust. `local` uses `127.0.0.1`         |
+| `--helo`          | HELO name, used by SPF for bounces                                                                                                |
+| `--no-tls`        | the submission connection is not encrypted (587/465 are assumed to use TLS)                                                       |
+| `--spf`, `--dkim` | `pass`, `fail`, `none` or `temperror`: the aligned result for the `From` domain, instead of a DNS check. Each can be forced alone |
+| `--transport`     | Postfix transport of the recipients; without it every recipient counts as locally delivered                                       |
+| `--config`        | the configuration to evaluate (before or after `simulate`)                                                                        |
+
+The output shows the trust class, the sending-limit key with its multiplier and limits (no current counts, no quota verdict), one line per recipient, and the end-of-message outcome with its rule, reason and reply. SPF and DKIM come from live DNS unless forced; a DNS failure shows as `temperror`, and live checks need the Debian SPF and DKIM packages. Exit status: 0 everything allowed, 1 a recipient or the message would be refused, 2 a usage or configuration error, 3 RCPT stage only (no message file).
 
 ## Investigating a refusal
 

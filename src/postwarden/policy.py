@@ -4,6 +4,7 @@ from __future__ import annotations
 import ipaddress
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Callable
 
 from .addresses import AddressError, Mailbox, parse_from_header
 from .config import Settings
@@ -328,6 +329,28 @@ def evaluate_recipient(settings: Settings, facts: ConnectionFacts, trust: TrustC
     final = combine(decisions)
     state.recipients.append(RecipientState(recipient, final))
     return final
+
+
+def evaluate_message(settings: Settings, facts: ConnectionFacts, trust: TrustClass, state: TransactionState,
+                     from_values: list[str] | None, over_limit: str | None,
+                     authenticate: Callable[[Mailbox], Decision]) -> tuple[list[Decision | None], Mailbox | None]:
+    """End-of-message rules after the RCPT stage. `from_values` is None when the headers were cut off by a limit;
+    `authenticate` runs SPF/DKIM for the visible From only when a rule still needs it."""
+    decisions: list[Decision | None] = list(state.deferred_rejections)
+    header_from = None
+    if from_values is not None:
+        header_from, from_decision = evaluate_visible_from(settings, trust, from_values)
+        decisions.append(from_decision)
+    if header_from is not None:
+        decisions.append(evaluate_self_sender_header(settings, facts, trust, header_from, state.accepted_recipients()))
+    if over_limit:
+        decisions.append(Decision(Action.DEFER, "limits", over_limit, settings.reply("temporary_failure")))
+    elif (requires_authentication(settings, trust) and header_from is not None
+          and not any(d is not None and d.action is Action.REJECT for d in decisions)):
+        decisions.append(authenticate(header_from))
+    if not any(d is not None for d in decisions):
+        decisions.append(Decision.allow("trust", f"exempt_{trust.value}"))
+    return decisions, header_from
 
 
 def combine(decisions: list[Decision | None]) -> Decision:

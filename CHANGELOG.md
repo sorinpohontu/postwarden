@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`postwarden stats`.** Counts postwarden's log lines for a period (journal, default the last 24 hours; or whole syslog files with `--file`): messages accepted, recipients delivered and allowed, refusals by rule and reason, observe-mode outcomes apart, and the top senders by limit key with their `per_hour`/`per_day` from the configuration. `--json` for scripts. Reports name their source and say when the period may be incomplete.
 
+#### Policy simulation
+
+- **`postwarden simulate`.** Shows what postwarden would decide for given connection facts (`--ingress`, `--peer`, `--login`, `--from`, `--to`) and an optional message file, with the daemon's own policy code: one line per recipient and the end-of-message outcome, with rule, reason and reply, plus the sending-limit key and limits. SPF and DKIM come from DNS or are forced with `--spf`/`--dkim`. Try a candidate with `--config`; nothing is sent and the running daemon is not affected. Exit status 0 allowed, 1 refused, 2 usage error, 3 RCPT stage only.
+
 ### Changed
 
 #### Logs and troubleshooting
