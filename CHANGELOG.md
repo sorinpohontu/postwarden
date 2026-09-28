@@ -9,20 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Sending limits
+
 - **Sending limits.** Recipients are counted per login (587/465), per envelope sender of local mail and per `mynetworks` client without a login, over a rolling hour and day, plus one cap over all local mail. Defaults: 100 per hour and 500 per day per sender; 1000 and 5000 for all local mail. Over the limit, SMTP mail is deferred at RCPT with the new `sending_limit` reply (`451 4.7.1 Sending limit exceeded - try again later`); local `sendmail` mail is deferred at end of message and waits in `maildrop`. Outside mail is never limited.
 - **`[sending_limits]` configuration** with its own `mode` (`observe` by default, `enforce`, `off`; the top-level observe mode still wins) and `[sending_limits.multipliers]` for a domain, account, `login:NAME`, client address or network, or `<>`. `check-config` validates them; `show-config` prints the resulting limits. When observed limits and an enforced rule both refuse a message, the enforced refusal is sent.
+- **Sending-limit state file.** Counts are saved to `/var/lib/postwarden/limits.json` every minute and on stop, and restored at start, so restarts and reboots keep them. The start line reports `limit_state=`, `limit_keys=` and `limit_state_age=`; the stop line whether the state was saved. A missing or damaged file starts empty with an `event=limit_state_empty` warning; a failed save logs `event=limit_state_save_failed` and is retried.
 - **Log fields and events.** `limit_key=` and `limit_measured=` on end-of-message lines of limited mail; `rule=sending_limit` with reasons `per_hour`, `per_day`, `local_per_hour`, `local_per_day` and `key_store_full`; `event=limit_reached` and `event=key_store_full` warnings. The start line reports `sending_limits=`, and `check-config` its mode.
 - **`inspect` and `check-config` show Postfix's per-client rate limits**, globally and per SMTP service, and warn when a submission service's recipient rate is below the highest sending limit. `inspect` also reports local mail waiting in `maildrop` and warns at 100 files or a file older than an hour. Warnings, marked `~`, never block the installer.
-- **Sending-limit state file.** Counts are saved to `/var/lib/postwarden/limits.json` every minute and on stop, and restored at start, so restarts and reboots keep them. The start line reports `limit_state=`, `limit_keys=` and `limit_state_age=`; the stop line whether the state was saved. A missing or damaged file starts empty with an `event=limit_state_empty` warning; a failed save logs `event=limit_state_save_failed` and is retried.
+
+#### Statistics
+
+- **`postwarden stats`.** Counts postwarden's log lines for a period (journal, default the last 24 hours; or whole syslog files with `--file`): messages accepted, recipients delivered and allowed, refusals by rule and reason, observe-mode outcomes apart, and the top senders by limit key with their `per_hour`/`per_day` from the configuration. `--json` for scripts. Reports name their source and say when the period may be incomplete.
 
 ### Changed
 
-- **`lookup` reads only lines written by `postwarden.service`** from the journal, so lines forged with `logger -t postwarden` no longer appear. `--any-source` matches the `postwarden` tag instead, for a daemon started by hand. Output names its source; lines from `--file`, or from `/var/log/mail.log*` when `journalctl` is missing, are labelled unverified. A note says when `--since` reaches before the journal's oldest entry.
+#### Logs and troubleshooting
 
 - **Recipient refusal counts on the end-of-message line.** `rejected_rcpts` and `deferred_rcpts` now count only refusals actually sent. Refusals that observe mode only logged are counted in the new fields `would_rejected_rcpts` and `would_deferred_rcpts`.
 - **Start line.** `event=start` also reports `logging_level=`.
+- **One end-of-message line per message.** Every message that reaches end of message gets exactly one `stage=eom` line with `rcpts=` and, where it has one, `limit_key=`. New: a message that observe mode let through after a refusal at MAIL FROM (`max_open_messages`) gets a `would_defer` end-of-message line; before, it had none.
+- **`lookup` reads only lines written by `postwarden.service`** from the journal, so lines forged with `logger -t postwarden` no longer appear. `--any-source` matches the `postwarden` tag instead, for a daemon started by hand. Output names its source; lines from `--file`, or from `/var/log/mail.log*` when `journalctl` is missing, are labelled unverified. A note says when `--since` reaches before the journal's oldest entry.
 
 ### Fixed
+
+#### Logs and troubleshooting
 
 - **`lookup` message when nothing matches.** It mentions journal permissions only when the journal was read; the searched source is named on the first line.
 
@@ -30,11 +40,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### Installation and updates
+
 - **Installation directory permissions.** `install --apply` now also removes group and other write permission in `/etc/postwarden`, including the directory itself, and repairs it even when the release is unchanged. `inspect` reports writable paths.
 - **Macro repair.** `configure-postfix` now repairs missing Postfix macros, as `inspect` recommends, instead of refusing because of that finding.
 - **`--apply` with `--dry-run`** is refused; before, `--apply` won.
 - **`install.py --config`** applies to `inspect` only. `install`, `configure-postfix` and `rollback` refuse it, since they always use `/etc/postwarden/config.toml`; use `install --import-config` to install another file.
-- **Documentation.** Clearer structure and terms; corrected the installer's dry-run guarantee, which recipients a refusal affects, and the load-test commands.
+
+#### Documentation
+
+- **Clearer structure and terms**; corrected the installer's dry-run guarantee, which recipients a refusal affects, and the load-test commands.
 
 ## [1.0.0] - 2026-09-24
 

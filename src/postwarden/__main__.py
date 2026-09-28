@@ -32,6 +32,16 @@ def build_parser() -> argparse.ArgumentParser:
                                      "their lines cannot be verified")
     find.add_argument("--any-source", action="store_true",
                       help="match the postwarden tag instead of the postwarden.service unit, for a daemon started by hand")
+    stats = sub.add_parser("stats", help="totals, refusals and top senders counted from the log")
+    stats.add_argument("--since", help="how far back the journal is read (default: -24h); not with --file")
+    stats.add_argument("--file", help="read these syslog files instead of the journal (glob); whole-file totals, "
+                                      "unverified")
+    stats.add_argument("--any-source", action="store_true",
+                       help="match the postwarden tag instead of the postwarden.service unit")
+    stats.add_argument("--top", type=int, default=20, help="senders to list (default: 20)")
+    stats.add_argument("--json", action="store_true", help="machine-readable output")
+    stats.add_argument("--config", default=argparse.SUPPRESS,
+                       help="configuration whose sending limits are shown next to each sender")
     wait = sub.add_parser("wait-ready", help="wait until the configured milter socket accepts connections")
     wait.add_argument("--timeout", type=float, default=15.0, help="seconds to wait (default: 15)")
     return parser
@@ -173,6 +183,42 @@ def cmd_lookup(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_stats(args: argparse.Namespace) -> int:
+    from .logsource import SourceError, coverage_note, journal_start, lines, select
+    from .stats import render, report, tally
+    if args.top < 1:
+        print("--top must be at least 1", file=sys.stderr)
+        return 2
+    source = select(since=args.since or "-24h", files=args.file, any_source=args.any_source)
+    if source.kind == "files" and args.since:
+        print(f"--since applies to the journal only; {source.describe()} gives whole-file totals", file=sys.stderr)
+        return 2
+    notes = []
+    try:
+        limits = load_settings(args.config).sending_limits
+    except ConfigError as exc:
+        print(f"{args.config}: {len(exc.errors)} problem(s); fix it or pass --config", file=sys.stderr)
+        for error in exc.errors:
+            print(f"  {error}", file=sys.stderr)
+        return 2
+    if source.kind == "files":
+        notes.append("whole-file totals: --since does not apply to files")
+    else:
+        note = coverage_note(source, journal_start())
+        if note:
+            notes.append(note)
+    try:
+        result = tally(lines(source))
+    except (SourceError, OSError) as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    data = report(result, limits, top=args.top, config=args.config, notes=notes,
+                  source={"kind": source.kind, "description": source.describe(), "verified": source.verified,
+                          "since": source.since, "pattern": source.pattern})
+    print(json.dumps(data, indent=2) if args.json else "\n".join(render(data)))
+    return 0
+
+
 def socket_address(spec: str) -> tuple[int, object]:
     """Translate a libmilter socket spec (unix:PATH, inet:PORT[@HOST], inet6:PORT[@HOST]) into a connect target."""
     kind, _, rest = spec.partition(":")
@@ -210,7 +256,7 @@ def cmd_wait_ready(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     handler = {"check-config": cmd_check_config, "show-config": cmd_show_config, "run": cmd_run,
-               "lookup": cmd_lookup, "wait-ready": cmd_wait_ready}[args.command]
+               "lookup": cmd_lookup, "stats": cmd_stats, "wait-ready": cmd_wait_ready}[args.command]
     return handler(args)
 
 

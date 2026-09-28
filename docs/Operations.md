@@ -4,15 +4,16 @@ Day-to-day commands, the log format, and what to do when something goes wrong.
 
 ## Commands
 
-| Command                                           | What it does                                                                |
-| ------------------------------------------------- | --------------------------------------------------------------------------- |
-| `systemctl status postwarden`                     | service state                                                               |
-| `postwarden check-config`                         | validates `/etc/postwarden/config.toml` and shows what it read from Postfix |
-| `postwarden show-config`                          | prints the settings in effect                                               |
-| `systemctl restart postwarden`                    | applies configuration changes                                               |
-| `postwarden wait-ready`                           | exits 0 once the socket accepts connections (default timeout 15 s)          |
-| `postwarden lookup <ref>`                         | prints the log lines for a reply reference                                  |
-| `ls -l /var/spool/postfix/postwarden/policy.sock` | the socket Postfix connects to (`srwxrwx--- postwarden postfix`)            |
+| Command                                           | What it does                                                                 |
+| ------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `systemctl status postwarden`                     | service state                                                                |
+| `postwarden check-config`                         | validates `/etc/postwarden/config.toml` and shows what it read from Postfix  |
+| `postwarden show-config`                          | prints the settings in effect                                                |
+| `systemctl restart postwarden`                    | applies configuration changes                                                |
+| `postwarden wait-ready`                           | exits 0 once the socket accepts connections (default timeout 15 s)           |
+| `postwarden lookup <ref>`                         | prints the log lines for a reply reference                                   |
+| `postwarden stats`                                | totals, refusals and top senders for the last 24 hours, counted from the log |
+| `ls -l /var/spool/postfix/postwarden/policy.sock` | the socket Postfix connects to (`srwxrwx--- postwarden postfix`)             |
 
 ## Changing the configuration
 
@@ -43,29 +44,29 @@ Message bodies, passwords and raw headers are never logged; only envelope addres
 
 ### Fields
 
-| Field                                          | Meaning                                                                                             |
-| ---------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `action`                                       | what happened; see [Actions](#actions)                                                              |
-| `stage`                                        | when: `connect`, `mail`, `rcpt`, `eom` (end of message) or `abort`                                  |
-| `rule`, `reason`                               | the deciding rule and its reason; see [Reasons](#reasons)                                           |
-| `reply`                                        | the SMTP reply sent, or in observe mode the reply that would be sent                                |
-| `cid`, `mid`                                   | connection id and message id; `mid` is the reference in replies                                     |
-| `queue_id`                                     | Postfix queue id, once Postfix has assigned one                                                     |
-| `ingress`, `trust`                             | how the message arrived and its trust class (see [Configuration](Configuration.md#trust-classes))   |
-| `peer`, `port`, `sasl`                         | client address, server port, login                                                                  |
-| `sender`, `rcpt`                               | envelope sender; recipient (on `rcpt` lines)                                                        |
-| `transport`                                    | Postfix transport the recipient resolves to (`rcpt` lines only)                                     |
-| `rcpts`                                        | number of recipients in the transaction (`eom` lines)                                               |
-| `rejected_rcpts`, `deferred_rcpts`             | recipients refused at RCPT, by class; absent when zero                                              |
-| `would_rejected_rcpts`, `would_deferred_rcpts` | observe mode: recipients that enforce mode would have refused, by class; absent when zero           |
-| `limit_key`                                    | what the message counts against for sending limits; absent for outside mail                         |
-| `limit_measured`                               | `yes` counted; `no` not counted because the key store was full (observe mode); `off` limits are off |
-| `limit`                                        | the limit that was reached (`event=limit_reached`)                                                  |
-| `from_domain`                                  | domain of the visible `From` address                                                                |
-| `spf`, `spf_domain`                            | SPF result and the domain it was evaluated for                                                      |
-| `dkim`                                         | DKIM results as `domain:result,...`; `skipped` when SPF already decided; `none` without signatures  |
-| `elapsed`                                      | seconds from MAIL FROM to the decision, including receiving the message                             |
-| `auth_elapsed`                                 | seconds spent on SPF/DKIM, including waiting for a free slot; only when they ran                    |
+| Field                                          | Meaning                                                                                                          |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `action`                                       | what happened; see [Actions](#actions)                                                                           |
+| `stage`                                        | when: `connect`, `mail`, `rcpt`, `eom` (end of message) or `abort`                                               |
+| `rule`, `reason`                               | the deciding rule and its reason; see [Reasons](#reasons)                                                        |
+| `reply`                                        | the SMTP reply sent, or in observe mode the reply that would be sent                                             |
+| `cid`, `mid`                                   | connection id and message id; `mid` is the reference in replies                                                  |
+| `queue_id`                                     | Postfix queue id, once Postfix has assigned one                                                                  |
+| `ingress`, `trust`                             | how the message arrived and its trust class (see [Configuration](Configuration.md#trust-classes))                |
+| `peer`, `port`, `sasl`                         | client address, server port, login                                                                               |
+| `sender`, `rcpt`                               | envelope sender; recipient (on `rcpt` lines)                                                                     |
+| `transport`                                    | Postfix transport the recipient resolves to (`rcpt` lines only)                                                  |
+| `rcpts`                                        | number of recipients in the transaction (`eom` lines; every message that reaches end of message has exactly one) |
+| `rejected_rcpts`, `deferred_rcpts`             | recipients refused at RCPT, by class; absent when zero                                                           |
+| `would_rejected_rcpts`, `would_deferred_rcpts` | observe mode: recipients that enforce mode would have refused, by class; absent when zero                        |
+| `limit_key`                                    | what the message counts against for sending limits; absent for outside mail                                      |
+| `limit_measured`                               | `yes` counted; `no` not counted because the key store was full (observe mode); `off` limits are off              |
+| `limit`                                        | the limit that was reached (`event=limit_reached`)                                                               |
+| `from_domain`                                  | domain of the visible `From` address                                                                             |
+| `spf`, `spf_domain`                            | SPF result and the domain it was evaluated for                                                                   |
+| `dkim`                                         | DKIM results as `domain:result,...`; `skipped` when SPF already decided; `none` without signatures               |
+| `elapsed`                                      | seconds from MAIL FROM to the decision, including receiving the message                                          |
+| `auth_elapsed`                                 | seconds spent on SPF/DKIM, including waiting for a free slot; only when they ran                                 |
 
 ### Actions
 
@@ -118,6 +119,44 @@ Counts are kept in `/var/lib/postwarden/limits.json` (owner `postwarden`, mode `
 - **A legitimate sender needs more:** add a multiplier in `[sending_limits.multipliers]`, run `postwarden check-config`, then `systemctl restart postwarden`.
 - **A compromised account:** change its password; the limit only slows it down.
 - **Local mail over a limit** waits in Postfix's `maildrop` directory (`install.py inspect` warns at 100 files or a file older than an hour) and is retried every minute, without a lifetime or bounce, until the limits allow it; every retry is logged. Count it with `find /var/spool/postfix/maildrop -type f | wc -l`, read one with `postcat /var/spool/postfix/maildrop/<file>`, and delete unwanted files with `rm`; the rest go through once the window allows.
+
+## Statistics
+
+`postwarden stats` counts postwarden's own log lines for a period and prints totals, refusals by rule and reason, and the senders that reached the most recipients:
+
+```sh
+postwarden stats                              # journal, last 24 hours, top 20 senders
+postwarden stats --since -7d --top 50
+postwarden stats --file '/var/log/mail.log*'  # syslog files: whole-file totals, unverified
+postwarden stats --json                       # for scripts and monitoring
+```
+
+It reads the same sources as `lookup`: the journal lines of `postwarden.service` (verified), the `postwarden` tag with `--any-source`, or syslog files with `--file` (unverified; `--since` is refused there, since the totals cover whole files). The first lines name the source and the configuration used for the limits column, and say when the period may be incomplete: no daemon start line in the period, or a `logging_level` above `info`, which does not log decisions.
+
+| Measure              | Meaning                                                                                                                                                                                                              |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| messages accepted    | messages postwarden let through, from their end-of-message line (in observe mode, including those it would have refused)                                                                                             |
+| recipients delivered | their recipients minus the refusals actually sent: handed on to Postfix. Final delivery is in Postfix's own log                                                                                                      |
+| recipients allowed   | recipients delivered minus observe-mode refusals: what enforcement would have let through. A message that observe mode would have refused as a whole counts as delivered, not allowed                                |
+| refusals sent        | `reject` and `defer` lines by rule and reason, per recipient (RCPT) or per message (MAIL, end of message). Held local mail counts once per retry                                                                     |
+| observe mode         | `would_reject` and `would_defer` lines, kept apart from refusals sent                                                                                                                                                |
+| senders              | per limit key: messages, recipients delivered and allowed, recipients not measured (full key store in observe mode), sending-limit deferrals sent and observed, and `per_hour`/`per_day` from the configuration used |
+
+Sender counts are totals for the period, not peaks: they do not show how close a rolling hour came to its limit, and the limits column comes from the configuration file `stats` reads (`--config` for another), which may differ from the one in force when the lines were written. A login without a domain gets one row per sender domain, since each domain can have its own multiplier, below a total row. Outside mail has no limit key and appears in the totals only.
+
+`--json` gives the same content. Its field names are stable:
+
+| Field                        | Contents                                                                                                                                 |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `source`                     | `kind` (`journal`, `journal_tag`, `files`), `description`, `verified`, `since`, `pattern`                                                |
+| `config`                     | the configuration file used for the limits                                                                                               |
+| `complete`, `notes`          | `false` with the reasons in `notes` when lines may be missing; `notes` also carries the journal coverage and whole-file notes            |
+| `lines`                      | postwarden event lines read                                                                                                              |
+| `totals`                     | `messages`, `delivered`, `allowed`, `unmeasured`                                                                                         |
+| `refusals`, `observed`       | lists of `action`, `rule`, `reason`, `scope` (`recipient` or `message`), `count`                                                         |
+| `senders`                    | top senders: `limit_key`, `messages`, `delivered`, `allowed`, `unmeasured`, `limit_deferred`, `limit_would_defer`, `per_hour`, `per_day` |
+| `senders[].by_sender_domain` | logins without a domain: the same counts per `sender_domain`; `per_hour`/`per_day` of the login are `null` when the domains differ       |
+| `senders_total`              | number of limit keys in the period                                                                                                       |
 
 ## When postwarden is down
 

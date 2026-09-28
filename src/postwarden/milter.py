@@ -196,8 +196,9 @@ class PolicyMilter(Milter.Base):
             self.reservation = _quota.begin(self.limit_key)
         if not _open_slots.acquire(blocking=False):
             decision = Decision(Action.DEFER, "limits", "max_open_messages", _settings.reply("temporary_failure"))
-            if self.trust is TrustClass.LOCAL_PICKUP:
+            if self.trust is TrustClass.LOCAL_PICKUP or not self._enforced(decision):
                 self.state.deferred_rejections.append(decision)
+            if self.trust is TrustClass.LOCAL_PICKUP:
                 return Milter.CONTINUE
             return self._apply(decision, "mail", sender=self._sender_field(), **self._limit_fields())
         self.holds_slot = True
@@ -253,11 +254,6 @@ class PolicyMilter(Milter.Base):
 
     def _eom(self) -> int:
         capture = self.capture
-        if capture is None:
-            if not self.state.deferred_rejections:
-                return Milter.CONTINUE
-            return self._apply(self._final(list(self.state.deferred_rejections)), "eom", sender=self._sender_field(),
-                               **self._limit_fields())
         fields = dict(sender=self._sender_field(), rcpts=len(self.state.recipients) + self.state.overflow_rcpts)
         fields.update(self._limit_fields())
         refused = [r.decision for r in self.state.recipients
@@ -271,6 +267,13 @@ class PolicyMilter(Milter.Base):
             if hypothetical:
                 fields[f"would_{key}"] = hypothetical
         decisions: list[Decision | None] = list(self.state.deferred_rejections)
+        if capture is None:
+            final = self._final(decisions)
+            fields["elapsed"] = f"{time.monotonic() - self.started:.3f}"
+            rc = self._apply(final, "eom", **fields)
+            if final.action is Action.ALLOW:
+                _log.info(action="accept", stage="eom", rule=final.rule, reason=final.reason, **self._base_fields(), **fields)
+            return rc
 
         headers_complete = capture.over_limit not in ("max_headers", "max_header_bytes")
         header_from = None

@@ -152,6 +152,8 @@ Reading the journal needs root or the `adm` or `systemd-journal` group.
 
 `lookup` reads only journal lines written by the `postwarden.service` unit, so lines that any local user can forge with `logger -t postwarden` never appear. It names its source on the first line; lines from `--file` are labelled unverified, since syslog files cannot tell who wrote a line. When `--since` reaches back further than the journal, a note says so and points to `--file`.
 
+`postwarden stats` counts the same lines: messages accepted, recipients delivered, refusals by rule and reason, and the senders that reached the most recipients, with their sending limits. It is the tool for choosing multipliers before sending limits are enforced.
+
 [Operations](docs/Operations.md) lists every reason code and common tasks: updates, rollback, and what happens when the daemon is down.
 
 ## Documentation
@@ -177,7 +179,6 @@ The tests, the server test matrix (`docs/Testing.md`) and the release procedure 
 ## Roadmap
 
 - **1.1: `postwarden simulate`.** Check what postwarden would decide for a message file and given connection details (port, login, client address) before changing the live configuration; nothing is sent.
-- **1.1: `postwarden stats`.** Totals of accepted, refused and deferred mail per rule and reason for a period, counted from the log.
 
 ## License
 

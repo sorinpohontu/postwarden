@@ -29,7 +29,10 @@ exposes no metrics listener.
 
 Measures are named, never raw line counts:
 
-- **messages accepted**: end-of-message lines with `action=accept`;
+- **messages accepted**: messages postwarden handed on to Postfix, read from
+  their end-of-message line: `action=accept`, or `would_reject`/`would_defer`
+  (observe mode, global or the sending limits' own), since those messages
+  continue to Postfix;
 - **recipients delivered**: on those lines, `rcpts` minus `rejected_rcpts`
   and `deferred_rcpts`, which count only refusals actually sent (a
   two-recipient message with one RCPT refusal adds one). "Delivered" means
@@ -38,14 +41,22 @@ Measures are named, never raw line counts:
 - **recipients allowed**: recipients delivered minus `would_rejected_rcpts`
   and `would_deferred_rcpts`, the observe-mode refusals (global mode or the
   sending limits' own mode) that enforcement would have sent; equal to
-  recipients delivered when nothing is observed;
+  recipients delivered when nothing is observed. A message that observe mode
+  would have refused as a whole counts as delivered and not allowed;
 - **refusals** per rule and reason: `reject`/`defer` decision lines, each a
   recipient (RCPT stage) or a message (MAIL/EOM stage), reported separately;
 - **observe-mode outcomes** (`would_reject`, `would_defer`) in their own
   columns, never mixed with real refusals.
 
-A transaction without an end-of-message line (abort, refusal at MAIL)
-contributes only its refusal lines. Held local mail retried by `pickup`
+The daemon writes exactly one end-of-message line, with `rcpts=` and, where
+the mail has one, `limit_key=`, for every message that reaches end of message,
+in every mode and on every path, including a message received without capture
+after an observe-mode refusal at MAIL; `stats` never infers delivery from other
+lines. That end-of-message line repeats the refusal (`would_defer`, same rule
+and reason), so its `action` always states the outcome for the message;
+`stats` counts a message-scope refusal once per message (`mid`, action, rule,
+reason), and either line alone still counts it. A transaction that ends before end of message (abort, refusal sent at
+MAIL) contributes only its refusal lines. Held local mail retried by `pickup`
 produces one deferral per retry and is shown as such. The ranking per limit
 key uses recipients delivered; recipients of keys logged with
 `limit_measured=no` (a full key store in observe mode, ADR-0007) are shown in
@@ -85,8 +96,9 @@ the report says so. The current setting alone never marks a period complete.
 
 ## Consequences
 
-- No daemon change, no new network surface, no dependency; counts survive
-  daemon restarts because they come from the log.
+- No daemon counters, no new network surface, no dependency; counts survive
+  daemon restarts because they come from the log. The one daemon change is
+  the end-of-message line guarantee above.
 - Counts are only as complete as the log: `logging.level` above `info`
   drops decision lines, and log retention bounds the period.
 - Reading the journal needs root or the `adm`/`systemd-journal` group, and

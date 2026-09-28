@@ -188,6 +188,21 @@ without backoff, bounce or lifetime, until it is accepted; every retry is a
 new decision and log line (ADR-0007). Not the deferred queue: `postqueue`
 tools do not age or expire it.
 
+### End-of-message line
+
+The one log line (`stage=eom`) the daemon writes for every message that reaches
+end of message, whatever the mode or path, with `rcpts=` and `limit_key=`. Its
+`action` is what happened to the message: `accept`, `reject`, `defer`, or in
+observe mode `would_reject`/`would_defer` (the message still continues).
+`stats` reads delivery only from this line (ADR-0020). Not the RCPT or MAIL
+decision lines, which record single refusals.
+
+### Messages accepted (`stats`, 1.1)
+
+Messages postwarden handed on to Postfix: end-of-message lines with `accept`,
+or with an observe-mode `would_*` action. Includes messages enforcement would
+have refused; there is no separate "messages allowed" measure.
+
 ### Recipients delivered / allowed (`stats`, 1.1)
 
 Two `stats` measures. **Delivered**: recipients postwarden handed on to
