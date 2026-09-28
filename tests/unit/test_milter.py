@@ -10,6 +10,7 @@ import Milter  # noqa: E402  (stub)
 from postwarden import milter  # noqa: E402
 from postwarden.logging import format_event  # noqa: E402
 from postwarden.policy import AuthStatus, AuthenticationInput, DkimOutcome, SpfOutcome  # noqa: E402
+from postwarden.quota import QuotaStore  # noqa: E402
 
 from helpers import settings  # noqa: E402
 
@@ -403,6 +404,176 @@ class LocalPickup(unittest.TestCase):
         self.assertEqual(rc, Milter.CONTINUE)
 
 
+LIMITS = '\n[sending_limits]\nper_hour = 2\nper_day = 3\nlocal_per_hour = 3\nlocal_per_day = 5\n'
+
+
+class SendingLimits(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(setattr, milter, "authenticator", None)
+        milter.authenticator = auth_result()
+
+    def session(self, mode="enforce", limits="enforce", extra="", capacity=100):
+        log = RecordingLogger()
+        cfg = settings(f'\nmode = "{mode}"\n' + LIMITS.replace("per_hour = 2", f'mode = "{limits}"\nper_hour = 2', 1) + extra)
+        self.quota = QuotaStore(cfg.sending_limits, capacity=capacity)
+        milter.configure(cfg, log, self.quota)
+        m = milter.PolicyMilter()
+        m.macros, m.replies = {}, []
+        m.negotiate([0x1ff, 0x1fffff, 0, 0])
+        return m, log
+
+    def submission(self, login="demo@example.com", **kwargs):
+        m, log = self.session(**kwargs)
+        connect(m, port="587", ingress="SUBMISSION587", login=login, cipher="256")
+        return m, log
+
+    def pickup(self, **kwargs):
+        m, log = self.session(**kwargs)
+        m.macros.update({"{daemon_port}": "0", "{postwarden_ingress}": "LOCAL_PICKUP"})
+        m.connect("localhost", 2, ("127.0.0.1", 0))
+        return m, log
+
+    def send(self, m, sender, count, first=0):
+        return message(m, sender, [f"<r{first + n}@example.net>" for n in range(count)], [("From", f" {sender}")])
+
+    def eom(self, log):
+        return [f for _, f in log.events if f.get("stage") == "eom"][-1]
+
+    def counts(self, key, now=None):
+        return self.quota.counts(key, now or milter.time.time())
+
+    def test_over_the_limit_defers_from_the_first_recipient_over(self):
+        m, log = self.submission()
+        codes, rc = self.send(m, "demo@example.com", 3)
+        self.assertEqual((codes, rc), ([Milter.CONTINUE, Milter.CONTINUE, Milter.TEMPFAIL], Milter.CONTINUE))
+        self.assertEqual(m.replies[0][:2], ("451", "4.7.1"))
+        self.assertRegex(m.replies[0][2], r"^Sending limit exceeded - try again later \(ref [0-9a-f]{12}\)$")
+        refusal = [f for _, f in log.events if f.get("rule") == "sending_limit" and f.get("action")][0]
+        self.assertEqual((refusal["action"], refusal["reason"], refusal["limit_key"]), ("defer", "per_hour", "demo@example.com"))
+        eom = self.eom(log)
+        self.assertEqual((eom["limit_key"], eom["limit_measured"], eom["deferred_rcpts"]), ("demo@example.com", "yes", 1))
+        self.assertEqual(self.counts("demo@example.com"), (2, 2))
+
+    def test_first_refusal_per_window_is_a_warning(self):
+        m, log = self.submission()
+        self.send(m, "demo@example.com", 4)
+        self.send(m, "demo@example.com", 1)
+        warnings = [f for level, f in log.events if level == "warning"]
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual((warnings[0]["event"], warnings[0]["reason"], warnings[0]["limit"]), ("limit_reached", "per_hour", 2))
+
+    def test_own_observe_mode_logs_would_defer_while_other_rules_enforce(self):
+        m, log = self.submission(limits="observe")
+        codes, rc = self.send(m, "demo@example.com", 3)
+        self.assertEqual((set(codes), rc, m.replies), ({Milter.CONTINUE}, Milter.CONTINUE, []))
+        self.assertIn(("rcpt", "would_defer", "sending_limit"), log.actions())
+        self.assertEqual(self.eom(log)["would_deferred_rcpts"], 1)
+        self.assertEqual(self.counts("demo@example.com"), (2, 2))
+        codes, _ = message(m, "<demo@example.com>", ["<all@example.com>"], [("From", " demo@example.com")])
+        self.assertEqual(codes, [Milter.REJECT])
+
+    def test_global_observe_wins_over_enforced_limits(self):
+        m, log = self.submission(mode="observe", limits="enforce")
+        codes, _ = self.send(m, "demo@example.com", 3)
+        self.assertEqual((set(codes), m.replies), ({Milter.CONTINUE}, []))
+        self.assertIn(("rcpt", "would_defer", "sending_limit"), log.actions())
+
+    def test_off_counts_nothing_but_still_logs_the_key(self):
+        m, log = self.submission(limits="off")
+        self.assertIsNone(milter._quota)
+        codes, _ = self.send(m, "demo@example.com", 5)
+        self.assertEqual(set(codes), {Milter.CONTINUE})
+        self.assertFalse([f for _, f in log.events if f.get("rule") == "sending_limit"])
+        self.assertEqual((self.eom(log)["limit_key"], self.eom(log)["limit_measured"]), ("demo@example.com", "off"))
+
+    def test_recipients_refused_by_another_rule_reserve_nothing(self):
+        m, log = self.submission()
+        codes, _ = message(m, "<demo@example.com>", ["<all@example.com>", "<r1@example.net>"], [("From", " demo@example.com")])
+        self.assertEqual(codes, [Milter.REJECT, Milter.CONTINUE])
+        self.assertEqual(self.counts("demo@example.com"), (1, 1))
+
+    def test_message_refused_at_eom_releases_its_reservations(self):
+        m, log = self.submission(extra="\n[limits]\nmessage_bytes = 10\n")
+        _, rc = self.send(m, "demo@example.com", 2)
+        self.assertEqual(rc, Milter.TEMPFAIL)
+        self.assertEqual(self.counts("demo@example.com"), (0, 0))
+
+    def test_abort_new_mail_and_close_release_reservations(self):
+        for end in ("abort", "envfrom", "close"):
+            with self.subTest(end=end):
+                m, log = self.submission()
+                m.envfrom("<demo@example.com>")
+                m.envrcpt("<r1@example.net>")
+                self.assertEqual(self.counts("demo@example.com"), (1, 1))
+                getattr(m, end)(*(["<other@example.com>"] if end == "envfrom" else []))
+                self.assertEqual(self.counts("demo@example.com"), (0, 0))
+
+    def test_observe_mode_counts_what_enforcement_would_commit(self):
+        m, log = self.submission(mode="observe", extra="\n[limits]\nmessage_bytes = 10\n")
+        _, rc = self.send(m, "demo@example.com", 2)
+        self.assertEqual(rc, Milter.CONTINUE)
+        self.assertEqual(self.counts("demo@example.com"), (0, 0))
+
+    def test_short_login_is_its_own_key(self):
+        m, log = self.submission(login="Demo")
+        self.send(m, "demo@example.com", 1)
+        self.assertEqual(self.eom(log)["limit_key"], "login:demo")
+
+    def test_local_mail_over_the_local_cap_is_held_at_eom(self):
+        m, log = self.pickup()
+        for n, sender in enumerate(("a@example.com", "b@example.com", "c@example.com")):
+            _, rc = self.send(m, sender, 1, first=n)
+            self.assertEqual(rc, Milter.CONTINUE)
+        codes, rc = self.send(m, "d@example.com", 1)
+        self.assertEqual((codes, rc), ([Milter.CONTINUE], Milter.TEMPFAIL))
+        self.assertIn(("rcpt", "pending_eom", "sending_limit"), log.actions())
+        eom = self.eom(log)
+        self.assertEqual((eom["action"], eom["rule"], eom["reason"], eom["limit_key"]),
+                         ("defer", "sending_limit", "local_per_hour", "d@example.com"))
+        self.assertEqual(self.quota.local_counts(milter.time.time()), (3, 3))
+
+    def test_local_mail_held_for_one_recipient_releases_the_others(self):
+        m, log = self.pickup()
+        _, rc = self.send(m, "a@example.com", 3)
+        self.assertEqual(rc, Milter.TEMPFAIL)
+        self.assertEqual((self.counts("a@example.com"), self.quota.local_counts(milter.time.time())), ((0, 0), (0, 0)))
+
+    def test_an_observed_limit_never_hides_an_enforced_deferral(self):
+        m, log = self.pickup(limits="observe", extra="\n[limits]\nmax_recipients = 3\n")
+        _, rc = self.send(m, "a@example.com", 4)
+        self.assertEqual(rc, Milter.TEMPFAIL)
+        eom = self.eom(log)
+        self.assertEqual((eom["action"], eom["rule"], eom["reason"]), ("defer", "limits", "max_recipients"))
+
+    def test_relays_count_by_client_address_and_untrusted_mail_is_not_limited(self):
+        m, log = self.session()
+        connect(m, peer="203.0.113.9")
+        self.send(m, "app@example.org", 1)
+        self.assertEqual(self.eom(log)["limit_key"], "203.0.113.9")
+        m, log = self.session()
+        connect(m, peer="198.51.100.7")
+        codes, _ = self.send(m, "bob@example.org", 5)
+        self.assertEqual(set(codes), {Milter.CONTINUE})
+        self.assertNotIn("limit_key", self.eom(log))
+
+    def test_full_key_store_defers_new_keys_in_enforce(self):
+        m, log = self.submission(capacity=1)
+        self.send(m, "demo@example.com", 1)
+        m.macros["{auth_authen}"] = "other@example.com"
+        codes, _ = self.send(m, "other@example.com", 1)
+        self.assertEqual(codes, [Milter.TEMPFAIL])
+        self.assertEqual([f["event"] for level, f in log.events if level == "warning"], ["key_store_full"])
+
+    def test_full_key_store_in_observe_leaves_the_new_key_unmeasured(self):
+        m, log = self.submission(limits="observe", capacity=1)
+        self.send(m, "demo@example.com", 1)
+        m.macros["{auth_authen}"] = "other@example.com"
+        codes, _ = self.send(m, "other@example.com", 1)
+        self.assertEqual(codes, [Milter.CONTINUE])
+        self.assertIn(("rcpt", "would_defer", "sending_limit"), log.actions())
+        self.assertEqual(self.eom(log)["limit_measured"], "no")
+
+
 class Lifecycle(unittest.TestCase):
     def test_start_line_reports_mode_and_logging_level(self):
         log = RecordingLogger()
@@ -414,7 +585,7 @@ class Lifecycle(unittest.TestCase):
              unittest.mock.patch.object(milter.Milter, "runmilter"):
             milter.run_daemon(cfg)
         start = [f for level, f in log.events if f.get("event") == "start"][0]
-        self.assertEqual((start["mode"], start["logging_level"]), ("enforce", "warning"))
+        self.assertEqual((start["mode"], start["sending_limits"], start["logging_level"]), ("enforce", "observe", "warning"))
         self.assertEqual([f.get("event") for level, f in log.events], ["start", "stop"])
 
 

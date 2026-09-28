@@ -201,13 +201,63 @@ The group `all@*` must protect `all@` on the domains this server hosts, but not 
 
 Every limit defers, so senders retry and nothing is lost. Postfix's own `message_size_limit` (about 10 MB by default) usually refuses large mail before postwarden sees it.
 
+## `[sending_limits]`
+
+Caps how many recipients each sender may reach per rolling hour and rolling day, so a stolen password or a hacked script is throttled within minutes, whatever addresses it connects from. One counter counts recipients: a message to 100 recipients and 100 messages to one recipient each both count 100.
+
+| Key              | Default     | Meaning                                                                                             |
+| ---------------- | ----------- | --------------------------------------------------------------------------------------------------- |
+| `mode`           | `"observe"` | `observe` logs `would_defer` and lets mail through; `enforce` defers; `off` neither counts nor logs |
+| `per_hour`       | `100`       | recipients per sender in the last hour                                                              |
+| `per_day`        | `500`       | recipients per sender in the last 24 hours; not lower than `per_hour`                               |
+| `local_per_hour` | `1000`      | all local mail together in the last hour                                                            |
+| `local_per_day`  | `5000`      | all local mail together in the last 24 hours; not lower than `local_per_hour`                       |
+
+Sending limits have their own `mode`, so you can enforce the other rules while limits are only observed. The top-level `mode = "observe"` still wins: in observe mode nothing is deferred for any rule.
+
+What each message counts against, its **limit key**:
+
+| Mail                                             | Limit key                                        |
+| ------------------------------------------------ | ------------------------------------------------ |
+| logged in on 587 or 465                          | the login (`login:NAME` for a login without `@`) |
+| local `sendmail` and SMTP from the server itself | the envelope sender (`<>` for bounces)           |
+| `mynetworks` client without a login              | the client IP address                            |
+| outside mail                                     | none: never limited                              |
+
+Local mail also counts toward the **local cap** (`local_per_hour`, `local_per_day`), one extra counter over all local mail, because a script can change its envelope sender for every message. The stricter of the two limits applies.
+
+Over a limit, postwarden answers `451 4.7.1` from the first recipient over it; earlier recipients of the same message go through, and the client retries the rest later. For local `sendmail`, the whole message is deferred at end of message: Postfix keeps it in `maildrop` and retries every minute until the limits allow all its recipients. A local message with more recipients than its limit can never pass; raise that sender's limit with a multiplier.
+
+Recipients refused by any rule, and messages refused at end of message, do not count. Postfix's own per-client rate limits (`smtpd_client_recipient_rate_limit` and related settings) are independent; recipients Postfix refuses never reach postwarden.
+
+postwarden tracks at most 20000 limit keys. When all are in use by senders counted within the last day, mail from a new sender is deferred with `reason=key_store_full` (in observe mode only logged, and that sender is not counted: `limit_measured=no`).
+
+### `[sending_limits.multipliers]`
+
+Exceptions multiply both `per_hour` and `per_day` for one match. Write every key in quotes.
+
+```toml
+[sending_limits.multipliers]
+"example.com" = 2               # every account of this domain, not its subdomains
+"marketing@example.com" = 10    # one account: a login, or the envelope sender of local mail
+"login:john" = 3                # a login without a domain
+"192.0.2.10" = 5                # a mynetworks client without a login; an IP address or network
+"<>" = 5                        # local mail with an empty sender, such as vacation replies
+```
+
+- The most specific match wins, and factors are never combined: `marketing@example.com` above gets 10 × (1000 per hour), not 20 ×. For clients, the longest matching network wins.
+- A login without a domain uses the multiplier of its envelope sender's domain, unless it has its own `login:NAME` entry.
+- A multiplier is a positive number; fractions such as `0.5` tighten a limit. There is no "unlimited". Results are rounded down, at least 1.
+- The local cap takes no multiplier.
+- `check-config` rejects zero, negative values, malformed keys and the same key written twice (logins and addresses ignore case). `show-config` prints the resulting limits for every entry.
+
 ## `[responses.<rule>]`
 
 Each reply can be reworded, but its class cannot change: a rejection stays a rejection and a deferral stays a deferral.
 
 | Key             | Meaning                                                                      |
 | --------------- | ---------------------------------------------------------------------------- |
-| `smtp_code`     | `550` or `554` for rejections; `450`, `451` or `452` for `temporary_failure` |
+| `smtp_code`     | `550` or `554` for rejections; `450`, `451` or `452` for deferrals           |
 | `enhanced_code` | `class.subject.detail`, with the class matching the code                     |
 | `message`       | printable ASCII; the whole reply, including the reference, at most 510 bytes |
 
@@ -220,6 +270,7 @@ postwarden adds ` (ref <mid>)` to every reply. `<mid>` is the message id in the 
 | `authentication_failed` | `550 5.7.26 Message rejected: Sender domain authentication failed (SPF, DKIM)` |
 | `invalid_from`          | `550 5.7.1 Message rejected: From header does not conform to RFC 5322`         |
 | `invalid_recipient`     | `550 5.1.3 Recipient address rejected: Bad address syntax`                     |
+| `sending_limit`         | `451 4.7.1 Sending limit exceeded - try again later`                           |
 | `temporary_failure`     | `451 4.7.1 Service unavailable - try again later`                              |
 
 `5.7.26` is the RFC 7372 code for "multiple authentication checks failed". `temporary_failure` uses the same text as Postfix when the milter is unreachable, so an outage and an internal temporary failure look alike from outside.

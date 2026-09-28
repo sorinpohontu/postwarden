@@ -4,7 +4,8 @@ A Postfix mail filter (milter) that decides, while a message is still being rece
 
 - limits who may send to **protected addresses** such as `all@example.com`;
 - refuses outside mail that uses the recipient's own address as the sender (**self-sender** mail);
-- requires outside mail to prove it comes from the domain in its `From` address, using **SPF and DKIM**.
+- requires outside mail to prove it comes from the domain in its `From` address, using **SPF and DKIM**;
+- caps how many recipients each login, local sender and trusted client may reach per hour and day (**sending limits**, coming in 1.1).
 
 Mail arriving over SMTP is refused with an SMTP error before Postfix takes responsibility for it, so the sender learns at once.
 Mail submitted with local `sendmail` is checked after submission; if it is refused, it bounces to the sender.
@@ -12,6 +13,8 @@ Mail submitted with local `sendmail` is checked after submission; if it is refus
 **Status: 1.0.1, a maintenance release of 1.0.0, the first release.**
 
 Tested on Debian 12 (Postfix 3.7) and Debian 13 (Postfix 3.10), on customised servers and on a stock installation: automated and manual installation, observe and enforce modes, rollback, migration from pipe-based content filters, DNS failure, load, and alias, forwarder and BCC delivery.
+
+Version 1.1 is in development in this repository: sending limits are implemented but not yet released.
 
 See the [changelog](CHANGELOG.md) for what each release contains and the [roadmap](#roadmap) for what comes next.
 
@@ -53,6 +56,25 @@ By default **both** must pass. With `require = "either"` in `[sender_authenticat
 
 Local mail, `mynetworks` clients and logged-in users on 587/465 are exempt from sender authentication. These exemptions never grant access to protected addresses.
 
+### Sending limits (coming in 1.1)
+
+A stolen password or a hacked website can send spam through your server until someone notices. postwarden counts recipients per **limit key** over a rolling hour and day, and defers mail over the limit with `451`, so nothing is lost:
+
+- logged-in users (587/465): per login;
+- local `sendmail` and SMTP from the server itself: per envelope sender, plus one cap over all local mail, because a script can change its sender;
+- `mynetworks` clients without a login: per client address;
+- outside mail is never limited.
+
+The defaults are 100 recipients per hour and 500 per day per sender, and 1000 per hour and 5000 per day for all local mail. A message to 100 recipients counts the same as 100 messages to one recipient each. Busier senders get a **multiplier** instead of their own numbers:
+
+```toml
+[sending_limits.multipliers]
+"example.com" = 2               # every account of this domain
+"marketing@example.com" = 10    # one account
+```
+
+Sending limits have their own mode and start in observe mode, even when the other rules are enforced: they log `would_defer` until you set `[sending_limits] mode = "enforce"`.
+
 ### Observe and enforce modes
 
 In **observe** mode postwarden only logs what it would do and every message continues. In **enforce** mode it sends its replies. Start in observe mode: the default rule refuses unsigned mail and forwarded mail that fails SPF, so review the log before enforcing.
@@ -93,7 +115,7 @@ Later, `configure-postfix --phase enforce --apply` switches postwarden and Postf
 All settings are in one file, `/etc/postwarden/config.toml`; every command uses it by default.
 The commented example [etc/config.example.toml](etc/config.example.toml) lists every setting.
 
-You set the protected addresses and their logins, self-sender exceptions and, optionally, whether SPF and DKIM must both pass, exemptions, resource limits, the log level and the wording of replies.
+You set the protected addresses and their logins, self-sender exceptions, sending limits and, optionally, whether SPF and DKIM must both pass, exemptions, resource limits, the log level and the wording of replies.
 A rejection can never be configured into a deferral or an acceptance. Trusted networks (`mynetworks`) and the recipient delimiter are read from Postfix at start, never copied by hand.
 
 ```sh
@@ -152,8 +174,6 @@ The tests, the server test matrix (`docs/Testing.md`) and the release procedure 
 
 ## Roadmap
 
-- **1.1: sending limits.** Rolling hourly and daily caps on recipients (default 100 per hour, 500 per day) per login, local sender and trusted relay, plus a cap on all local mail together, to contain compromised accounts and hacked scripts.
-One set of defaults, with a multiplier for a busier domain, account or relay (for example `example.com = 2`, `marketing@example.com = 10`). Over the limit, mail will be deferred, not lost.
 - **1.1: `postwarden simulate`.** Check what postwarden would decide for a message file and given connection details (port, login, client address) before changing the live configuration; nothing is sent.
 - **1.1: `postwarden stats`.** Totals of accepted, refused and deferred mail per rule and reason for a period, counted from the log.
 

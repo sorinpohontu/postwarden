@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Sending limits.** Recipients are counted per login (587/465), per envelope sender of local mail and per `mynetworks` client without a login, over a rolling hour and day, plus one cap over all local mail. Defaults: 100 per hour and 500 per day per sender; 1000 and 5000 for all local mail. Over the limit, SMTP mail is deferred at RCPT with the new `sending_limit` reply (`451 4.7.1 Sending limit exceeded - try again later`); local `sendmail` mail is deferred at end of message and waits in `maildrop`. Outside mail is never limited.
+- **`[sending_limits]` configuration** with its own `mode` (`observe` by default, `enforce`, `off`; the top-level observe mode still wins) and `[sending_limits.multipliers]` for a domain, account, `login:NAME`, client address or network, or `<>`. `check-config` validates them; `show-config` prints the resulting limits. When observed limits and an enforced rule both refuse a message, the enforced refusal is sent.
+- **Log fields and events.** `limit_key=` and `limit_measured=` on end-of-message lines of limited mail; `rule=sending_limit` with reasons `per_hour`, `per_day`, `local_per_hour`, `local_per_day` and `key_store_full`; `event=limit_reached` and `event=key_store_full` warnings. The start line reports `sending_limits=`, and `check-config` its mode.
+
 ### Changed
 
 - **Recipient refusal counts on the end-of-message line.** `rejected_rcpts` and `deferred_rcpts` now count only refusals actually sent. Refusals that observe mode only logged are counted in the new fields `would_rejected_rcpts` and `would_deferred_rcpts`.

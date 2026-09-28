@@ -204,6 +204,11 @@ per_day = 500
   script that drops 10,000 messages causes 10,000 decisions and log lines per
   minute until its windows allow them. Accepted for complete logs; the
   operator removes the backlog.
+- A local message with more recipients than its sender's limit, or the local
+  cap, can never pass and is held until the operator raises the limit with a
+  multiplier or removes the message; SMTP clients instead get the excess
+  deferred and send it later. Rejecting it was not taken: the bounce would go
+  to an envelope sender that a hacked script chooses.
 - Under an attack with many distinct senders, a full key store delays new
   legitimate senders (deferred, not lost) rather than letting counted senders
   regain quota or new keys go unlimited.

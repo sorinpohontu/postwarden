@@ -16,6 +16,7 @@ from .policy import (Action, ConnectionFacts, Decision, RecipientState, Transact
                      classify_trust, combine, evaluate_authentication, evaluate_recipient,
                      evaluate_self_sender_header, evaluate_visible_from, requires_authentication,
                      spf_decides)
+from .quota import KEY_STORE_FULL, LimitKey, QuotaStore, Reservation, limit_key
 
 P_HDR_LEADSPC = getattr(Milter, "P_HDR_LEADSPC", 0x100000)
 SPOOL_DIR = "/var/lib/postwarden"
@@ -24,6 +25,7 @@ _settings: Settings
 _log: EventLogger
 _verify_slots: threading.BoundedSemaphore
 _open_slots: threading.BoundedSemaphore
+_quota: QuotaStore | None = None
 authenticator = None
 
 
@@ -47,6 +49,8 @@ class PolicyMilter(Milter.Base):
         self.mid: str | None = None
         self.started = 0.0
         self.holds_slot = False
+        self.limit_key: LimitKey | None = None
+        self.reservation: Reservation | None = None
 
     # -- helpers -------------------------------------------------------------
 
@@ -57,6 +61,10 @@ class PolicyMilter(Milter.Base):
         if self.holds_slot:
             _open_slots.release()
             self.holds_slot = False
+        if self.reservation is not None and _quota is not None:
+            _quota.release(self.reservation)
+        self.reservation = None
+        self.limit_key = None
         self.state = TransactionState()
         self.mid = None
 
@@ -98,7 +106,43 @@ class PolicyMilter(Milter.Base):
         return Milter.REJECT if decision.action is Action.REJECT else Milter.TEMPFAIL
 
     def _enforced(self, decision: Decision) -> bool:
+        if decision.rule == "sending_limit":
+            return _limits_enforced()
         return _settings.mode == "enforce"
+
+    def _final(self, decisions: list[Decision | None]) -> Decision:
+        """An enforced refusal outranks an observed one, so observing one rule never lets another's refusal through."""
+        enforced = [d for d in decisions if d is not None and d.action is not Action.ALLOW and self._enforced(d)]
+        return combine(enforced) if enforced else combine(decisions)
+
+    def _limit_fields(self) -> dict:
+        if self.limit_key is None:
+            return {}
+        if _quota is None:
+            measured = "off"
+        else:
+            measured = "yes" if self.reservation is None or self.reservation.measured else "no"
+        return {"limit_key": self.limit_key.text, "limit_measured": measured}
+
+    def _reserve(self, decision: Decision) -> Decision:
+        """Take one sending-limit reservation for a recipient every other rule allowed."""
+        if self.reservation is None or _quota is None or decision.action is not Action.ALLOW:
+            return decision
+        verdict = _quota.reserve(self.reservation, time.time(), observe=not _limits_enforced())
+        if verdict is None:
+            return decision
+        key = self.limit_key
+        if verdict.first:
+            if verdict.reason == KEY_STORE_FULL:
+                _log.warning(event="key_store_full", rule="sending_limit", keys=_quota.capacity,
+                             limit_key=key.text, **self._base_fields())
+            else:
+                limit = {"per_hour": key.per_hour, "per_day": key.per_day,
+                         "local_per_hour": _settings.sending_limits.local_per_hour,
+                         "local_per_day": _settings.sending_limits.local_per_day}[verdict.reason]
+                _log.warning(event="limit_reached", rule="sending_limit", reason=verdict.reason, limit=limit,
+                             limit_key=key.text, **self._base_fields())
+        return Decision(Action.DEFER, "sending_limit", verdict.reason, _settings.reply("sending_limit"))
 
     def _refresh_facts(self) -> None:
         self.facts = ConnectionFacts(
@@ -145,12 +189,16 @@ class PolicyMilter(Milter.Base):
             _log.warning(stage="mail", event="sender_unparseable", detail=str(exc), **self._base_fields())
             sender, null_sender = None, False
         self.state = TransactionState(sender=sender, null_sender=null_sender, raw_sender=None if null_sender else raw)
+        self.limit_key = limit_key(_settings.sending_limits, self.trust.value, login=self.facts.auth_authen,
+                                   sender=sender, null_sender=null_sender, raw_sender=raw, peer_ip=self.peer_ip)
+        if self.limit_key is not None and _quota is not None:
+            self.reservation = _quota.begin(self.limit_key)
         if not _open_slots.acquire(blocking=False):
             decision = Decision(Action.DEFER, "limits", "max_open_messages", _settings.reply("temporary_failure"))
             if self.trust is TrustClass.LOCAL_PICKUP:
                 self.state.deferred_rejections.append(decision)
                 return Milter.CONTINUE
-            return self._apply(decision, "mail", sender=self._sender_field())
+            return self._apply(decision, "mail", sender=self._sender_field(), **self._limit_fields())
         self.holds_slot = True
         self.capture = MessageCapture(_settings.limits, SPOOL_DIR if os.path.isdir(SPOOL_DIR) else None, self.leadspc)
         return Milter.CONTINUE
@@ -176,6 +224,11 @@ class PolicyMilter(Milter.Base):
             return self._refuse_recipient(decision, None, detail=str(exc))
         transport = self.getsymval("{rcpt_mailer}") or None
         decision = evaluate_recipient(_settings, self.facts, self.trust, self.state, recipient, transport)
+        limited = self._reserve(decision)
+        if limited is not decision:
+            self.state.recipients[-1].decision = limited
+            return self._refuse_recipient(limited, recipient, recorded=True, rcpt=str(recipient),
+                                          transport=transport, limit_key=self.limit_key.text)
         return self._refuse_recipient(decision, recipient, recorded=True, rcpt=str(recipient), transport=transport)
 
     def header(self, name, hval):
@@ -202,8 +255,10 @@ class PolicyMilter(Milter.Base):
         if capture is None:
             if not self.state.deferred_rejections:
                 return Milter.CONTINUE
-            return self._apply(combine(list(self.state.deferred_rejections)), "eom", sender=self._sender_field())
+            return self._apply(self._final(list(self.state.deferred_rejections)), "eom", sender=self._sender_field(),
+                               **self._limit_fields())
         fields = dict(sender=self._sender_field(), rcpts=len(self.state.recipients) + self.state.overflow_rcpts)
+        fields.update(self._limit_fields())
         refused = [r.decision for r in self.state.recipients
                    if r.decision is not None and r.decision.action is not Action.ALLOW]
         refused += [Decision(Action.DEFER, "limits", "max_recipients", None)] * self.state.overflow_rcpts
@@ -235,9 +290,11 @@ class PolicyMilter(Milter.Base):
 
         if not any(d is not None for d in decisions):
             decisions.append(Decision.allow("trust", f"exempt_{self.trust.value}"))
-        final = combine(decisions)
+        final = self._final(decisions)
         fields["elapsed"] = f"{time.monotonic() - self.started:.3f}"
         rc = self._apply(final, "eom", **fields)
+        if self.reservation is not None and combine(decisions).action is Action.ALLOW:
+            _quota.commit(self.reservation, time.time())
         if final.action is Action.ALLOW:
             _log.info(action="accept", stage="eom", rule=final.rule, reason=final.reason, **self._base_fields(), **fields)
         return rc
@@ -278,15 +335,23 @@ class PolicyMilter(Milter.Base):
         return Milter.CONTINUE
 
 
+def _limits_enforced() -> bool:
+    return _settings.mode == "enforce" and _settings.sending_limits.mode == "enforce"
+
+
 def _bytes(value) -> bytes:
     if isinstance(value, bytes):
         return value
     return value.encode("utf-8", "surrogateescape")
 
 
-def configure(settings: Settings, logger: EventLogger | None = None) -> None:
-    global _settings, _log, _verify_slots, _open_slots
+def configure(settings: Settings, logger: EventLogger | None = None, quota: QuotaStore | None = None) -> None:
+    global _settings, _log, _verify_slots, _open_slots, _quota
     _settings = settings
+    if settings.sending_limits.mode == "off":
+        _quota = None
+    else:
+        _quota = quota if quota is not None else QuotaStore(settings.sending_limits)
     _log = logger or EventLogger(settings.logging)
     _verify_slots = threading.BoundedSemaphore(settings.limits.max_concurrent_messages)
     _open_slots = threading.BoundedSemaphore(settings.limits.max_open_messages)
@@ -304,8 +369,8 @@ def run_daemon(settings: Settings) -> int:
     Milter.set_flags(0)
     Milter.set_exception_policy(Milter.TEMPFAIL)
     addresses, groups = settings.protection.counts()
-    _log.lifecycle(event="start", mode=settings.mode, logging_level=settings.logging.level, socket=socket,
-                   config=settings.source,
+    _log.lifecycle(event="start", mode=settings.mode, sending_limits=settings.sending_limits.mode,
+                   logging_level=settings.logging.level, socket=socket, config=settings.source,
                    protected_addresses=addresses, protected_groups=groups, mynetworks=len(settings.trust.mynetworks),
                    recipient_delimiter=settings.trust.recipient_delimiter)
     try:

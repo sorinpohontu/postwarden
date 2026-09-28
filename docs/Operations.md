@@ -43,36 +43,39 @@ Message bodies, passwords and raw headers are never logged; only envelope addres
 
 ### Fields
 
-| Field                                          | Meaning                                                                                            |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `action`                                       | what happened; see [Actions](#actions)                                                             |
-| `stage`                                        | when: `connect`, `mail`, `rcpt`, `eom` (end of message) or `abort`                                 |
-| `rule`, `reason`                               | the deciding rule and its reason; see [Reasons](#reasons)                                          |
-| `reply`                                        | the SMTP reply sent, or in observe mode the reply that would be sent                               |
-| `cid`, `mid`                                   | connection id and message id; `mid` is the reference in replies                                    |
-| `queue_id`                                     | Postfix queue id, once Postfix has assigned one                                                    |
-| `ingress`, `trust`                             | how the message arrived and its trust class (see [Configuration](Configuration.md#trust-classes))  |
-| `peer`, `port`, `sasl`                         | client address, server port, login                                                                 |
-| `sender`, `rcpt`                               | envelope sender; recipient (on `rcpt` lines)                                                       |
-| `transport`                                    | Postfix transport the recipient resolves to (`rcpt` lines only)                                    |
-| `rcpts`                                        | number of recipients in the transaction (`eom` lines)                                              |
-| `rejected_rcpts`, `deferred_rcpts`             | recipients refused at RCPT, by class; absent when zero                                             |
-| `would_rejected_rcpts`, `would_deferred_rcpts` | observe mode: recipients that enforce mode would have refused, by class; absent when zero          |
-| `from_domain`                                  | domain of the visible `From` address                                                               |
-| `spf`, `spf_domain`                            | SPF result and the domain it was evaluated for                                                     |
-| `dkim`                                         | DKIM results as `domain:result,...`; `skipped` when SPF already decided; `none` without signatures |
-| `elapsed`                                      | seconds from MAIL FROM to the decision, including receiving the message                            |
-| `auth_elapsed`                                 | seconds spent on SPF/DKIM, including waiting for a free slot; only when they ran                   |
+| Field                                          | Meaning                                                                                             |
+| ---------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `action`                                       | what happened; see [Actions](#actions)                                                              |
+| `stage`                                        | when: `connect`, `mail`, `rcpt`, `eom` (end of message) or `abort`                                  |
+| `rule`, `reason`                               | the deciding rule and its reason; see [Reasons](#reasons)                                           |
+| `reply`                                        | the SMTP reply sent, or in observe mode the reply that would be sent                                |
+| `cid`, `mid`                                   | connection id and message id; `mid` is the reference in replies                                     |
+| `queue_id`                                     | Postfix queue id, once Postfix has assigned one                                                     |
+| `ingress`, `trust`                             | how the message arrived and its trust class (see [Configuration](Configuration.md#trust-classes))   |
+| `peer`, `port`, `sasl`                         | client address, server port, login                                                                  |
+| `sender`, `rcpt`                               | envelope sender; recipient (on `rcpt` lines)                                                        |
+| `transport`                                    | Postfix transport the recipient resolves to (`rcpt` lines only)                                     |
+| `rcpts`                                        | number of recipients in the transaction (`eom` lines)                                               |
+| `rejected_rcpts`, `deferred_rcpts`             | recipients refused at RCPT, by class; absent when zero                                              |
+| `would_rejected_rcpts`, `would_deferred_rcpts` | observe mode: recipients that enforce mode would have refused, by class; absent when zero           |
+| `limit_key`                                    | what the message counts against for sending limits; absent for outside mail                         |
+| `limit_measured`                               | `yes` counted; `no` not counted because the key store was full (observe mode); `off` limits are off |
+| `limit`                                        | the limit that was reached (`event=limit_reached`)                                                  |
+| `from_domain`                                  | domain of the visible `From` address                                                                |
+| `spf`, `spf_domain`                            | SPF result and the domain it was evaluated for                                                      |
+| `dkim`                                         | DKIM results as `domain:result,...`; `skipped` when SPF already decided; `none` without signatures  |
+| `elapsed`                                      | seconds from MAIL FROM to the decision, including receiving the message                             |
+| `auth_elapsed`                                 | seconds spent on SPF/DKIM, including waiting for a free slot; only when they ran                    |
 
 ### Actions
 
-| `action`                      | Meaning                                                                                                                                                                                                        |
-| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `accept`                      | end of message; the message continues. Recipients refused earlier are logged on their own `rcpt` lines                                                                                                         |
-| `reject`, `defer`             | reply sent (enforce mode)                                                                                                                                                                                      |
-| `would_reject`, `would_defer` | observe mode: the reply enforce mode would have sent                                                                                                                                                           |
-| `pending_eom`                 | a protected address on the local `sendmail` path; decided at end of message                                                                                                                                    |
-| `event=start`, `event=stop`   | daemon start and stop. The start line gives the mode, log level, socket, configuration file, numbers of protected addresses and groups, and the `mynetworks` count and `recipient_delimiter` read from Postfix |
+| `action`                      | Meaning                                                                                                                                                                                                                                 |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `accept`                      | end of message; the message continues. Recipients refused earlier are logged on their own `rcpt` lines                                                                                                                                  |
+| `reject`, `defer`             | reply sent (enforce mode)                                                                                                                                                                                                               |
+| `would_reject`, `would_defer` | observe mode: the reply enforce mode would have sent                                                                                                                                                                                    |
+| `pending_eom`                 | a refusal on the local `sendmail` path; decided at end of message                                                                                                                                                                       |
+| `event=start`, `event=stop`   | daemon start and stop. The start line gives the mode, the sending-limits mode, log level, socket, configuration file, numbers of protected addresses and groups, and the `mynetworks` count and `recipient_delimiter` read from Postfix |
 
 ### Reasons
 
@@ -84,6 +87,7 @@ Message bodies, passwords and raw headers are never logged; only envelope addres
 | `invalid_recipient`   | `recipient_unparseable`: the RCPT address cannot be parsed, so it is refused                                                                                                                                                                                                                                                 |
 | `authentication`      | `spf_and_dkim_aligned`; `spf_<result>` (such as `spf_softfail`), `spf_unaligned`, `dkim_absent`, `dkim_no_aligned_pass`; `spf_temperror`, `dkim_temperror`, `evaluation_incomplete` (defer); `null_sender_dkim_aligned`; with `require = "either"`: `spf_aligned`, `dkim_aligned`, `no_aligned_pass`; `exempt_<trust class>` |
 | `limits`              | `message_bytes`, `max_headers`, `max_header_bytes`, `max_recipients`, `max_concurrent_messages`, `max_open_messages` (all defer)                                                                                                                                                                                             |
+| `sending_limit`       | `per_hour`, `per_day`, `local_per_hour`, `local_per_day`, `key_store_full` (all defer)                                                                                                                                                                                                                                       |
 | `trust`               | `exempt_<trust class>`: no rule refused the message and its trust class exempted it from the remaining checks (`accept` only)                                                                                                                                                                                                |
 
 ### Log level
@@ -96,6 +100,18 @@ Message bodies, passwords and raw headers are never logged; only envelope addres
 2. **Read `rule` and `reason`.** They name the check that failed. For sender authentication, `spf=` and `dkim=` show the raw results.
 3. **`spf_temperror`, `dkim_temperror`:** a DNS problem, not policy. Check the resolver, for example `dig TXT <selector>._domainkey.<domain>`.
 4. **`ingress_unclassified`:** Postfix did not tell postwarden how the message arrived. Check `postconf -P | grep postwarden_ingress` and `postconf -h milter_macro_defaults`, or run `python3 scripts/install.py inspect`.
+
+## Sending limits
+
+A sender over its limit is deferred with `rule=sending_limit`. The first refusal per sender and hour (or day, for daily limits) is also logged at `warning` as `event=limit_reached`, with `limit_key=` and the `limit=` reached, so existing log alerts can pick it up. A full key store logs `event=key_store_full` at most once a minute.
+
+```sh
+journalctl -t postwarden -p warning | grep limit_reached
+```
+
+- **A legitimate sender needs more:** add a multiplier in `[sending_limits.multipliers]`, run `postwarden check-config`, then `systemctl restart postwarden`.
+- **A compromised account:** change its password; the limit only slows it down.
+- **Local mail over a limit** waits in Postfix's `maildrop` directory and is retried every minute, without a lifetime or bounce, until the limits allow it; every retry is logged. Count it with `find /var/spool/postfix/maildrop -type f | wc -l`, read one with `postcat /var/spool/postfix/maildrop/<file>`, and delete unwanted files with `rm`; the rest go through once the window allows.
 
 ## When postwarden is down
 
