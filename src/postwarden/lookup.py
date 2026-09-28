@@ -1,14 +1,11 @@
 """Find the log lines for a reply reference (the `mid` field)."""
 from __future__ import annotations
 
-import glob
-import gzip
 import re
-import shutil
-import subprocess
 from typing import Iterable, Iterator
 
-MAIL_LOGS = "/var/log/mail.log*"
+from .logsource import Source, SourceError, lines
+
 _REF = re.compile(r"[0-9a-f]{12}")
 
 
@@ -33,35 +30,8 @@ def matching(lines: Iterable[str], ref: str) -> Iterator[str]:
     return (line.rstrip("\n") for line in lines if token.search(line))
 
 
-def journal_lines(since: str) -> Iterator[str]:
-    proc = subprocess.Popen(["journalctl", "--no-pager", "-o", "short-iso", "-t", "postwarden", "--since", since],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
-    assert proc.stdout is not None
-    yield from proc.stdout
-    stderr = proc.stderr.read() if proc.stderr else ""
-    if proc.wait() != 0:
-        raise LookupFailed(f"journalctl failed: {stderr.strip() or proc.returncode}")
-
-
-def file_lines(pattern: str) -> Iterator[str]:
-    paths = sorted(glob.glob(pattern), reverse=True)
-    if not paths:
-        raise LookupFailed(f"no log files match {pattern}")
-    for path in paths:
-        opener = gzip.open if path.endswith(".gz") else open
-        with opener(path, "rt", errors="replace") as fh:
-            yield from (line for line in fh if "postwarden" in line)
-
-
-def log_files(files: str | None) -> str | None:
-    """The file pattern to search, or None for the journal."""
-    if files is None and shutil.which("journalctl"):
-        return None
-    return files or MAIL_LOGS
-
-
-def lookup(ref: str, *, since: str, files: str | None) -> list[str]:
-    pattern = log_files(files)
-    if pattern is None:
-        return list(matching(journal_lines(since), ref))
-    return list(matching(file_lines(pattern), ref))
+def lookup(ref: str, source: Source) -> list[str]:
+    try:
+        return list(matching(lines(source), ref))
+    except SourceError as exc:
+        raise LookupFailed(str(exc)) from None

@@ -17,12 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`lookup` reads only lines written by `postwarden.service`** from the journal, so lines forged with `logger -t postwarden` no longer appear. `--any-source` matches the `postwarden` tag instead, for a daemon started by hand. Output names its source; lines from `--file`, or from `/var/log/mail.log*` when `journalctl` is missing, are labelled unverified. A note says when `--since` reaches before the journal's oldest entry.
+
 - **Recipient refusal counts on the end-of-message line.** `rejected_rcpts` and `deferred_rcpts` now count only refusals actually sent. Refusals that observe mode only logged are counted in the new fields `would_rejected_rcpts` and `would_deferred_rcpts`.
 - **Start line.** `event=start` also reports `logging_level=`.
 
 ### Fixed
 
-- **`lookup` message when nothing matches.** It names what was searched (the journal, the `--file` pattern, or `/var/log/mail.log*` when `journalctl` is missing) and mentions journal permissions only when the journal was read.
+- **`lookup` message when nothing matches.** It mentions journal permissions only when the journal was read; the searched source is named on the first line.
 
 ## [1.0.1] - 2026-09-25
 

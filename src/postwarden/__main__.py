@@ -28,7 +28,10 @@ def build_parser() -> argparse.ArgumentParser:
     find = sub.add_parser("lookup", help="show the log lines for a reply reference such as (ref 3f9c2a7b41d0)")
     find.add_argument("ref", help="the reference from the SMTP reply or bounce")
     find.add_argument("--since", default="-7d", help="how far back journalctl searches (default: -7d)")
-    find.add_argument("--file", help="search these syslog files instead of the journal (glob, e.g. '/var/log/mail.log*')")
+    find.add_argument("--file", help="search these syslog files instead of the journal (glob, e.g. '/var/log/mail.log*'); "
+                                     "their lines cannot be verified")
+    find.add_argument("--any-source", action="store_true",
+                      help="match the postwarden tag instead of the postwarden.service unit, for a daemon started by hand")
     wait = sub.add_parser("wait-ready", help="wait until the configured milter socket accepts connections")
     wait.add_argument("--timeout", type=float, default=15.0, help="seconds to wait (default: 15)")
     return parser
@@ -145,20 +148,28 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 def cmd_lookup(args: argparse.Namespace) -> int:
-    from .lookup import LookupFailed, log_files, lookup, normalize_ref
+    from .logsource import coverage_note, journal_start, select
+    from .lookup import LookupFailed, lookup, normalize_ref
     try:
         ref = normalize_ref(args.ref)
-        lines = lookup(ref, since=args.since, files=args.file)
+    except LookupFailed as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    source = select(since=args.since, files=args.file, any_source=args.any_source)
+    print(f"source: {source.describe()}", file=sys.stderr)
+    note = coverage_note(source, journal_start()) if source.kind != "files" else None
+    if note:
+        print(f"note: {note}", file=sys.stderr)
+    try:
+        found = lookup(ref, source)
     except (LookupFailed, OSError) as exc:
         print(exc, file=sys.stderr)
         return 2
-    if not lines:
-        pattern = log_files(args.file)
-        searched = (f"the journal since {args.since}; reading it may need root or the adm or systemd-journal group"
-                    if pattern is None else pattern)
-        print(f"no postwarden log line with mid={ref} (searched {searched})", file=sys.stderr)
+    if not found:
+        hint = "; reading the journal may need root or the adm or systemd-journal group" if source.kind != "files" else ""
+        print(f"no postwarden log line with mid={ref}{hint}", file=sys.stderr)
         return 1
-    print("\n".join(lines))
+    print("\n".join(found))
     return 0
 
 

@@ -96,7 +96,7 @@ Message bodies, passwords and raw headers are never logged; only envelope addres
 
 ## Investigating a refusal
 
-1. **Find the lines.** If the sender quotes a reply ending in `(ref <id>)`, run `postwarden lookup <id>`. It searches the journal for the last 7 days; add `--since -30d` to look further back, or `--file '/var/log/mail.log*'` for syslog files, including rotated `.gz` files. Without a reference, search for the `queue_id=`; Postfix's own `milter-reject` line also contains the reference.
+1. **Find the lines.** If the sender quotes a reply ending in `(ref <id>)`, run `postwarden lookup <id>`. It searches the journal for the last 7 days, only lines written by `postwarden.service`; add `--since -30d` to look further back, or `--file '/var/log/mail.log*'` for syslog files, including rotated `.gz` files (their lines cannot be verified: any local user can write a `postwarden` line to syslog). For a daemon started by hand, outside the unit, add `--any-source`. The first line of output names the source; a note says when `--since` reaches before the journal's oldest entry. Without a reference, search for the `queue_id=`; Postfix's own `milter-reject` line also contains the reference.
 2. **Read `rule` and `reason`.** They name the check that failed. For sender authentication, `spf=` and `dkim=` show the raw results.
 3. **`spf_temperror`, `dkim_temperror`:** a DNS problem, not policy. Check the resolver, for example `dig TXT <selector>._domainkey.<domain>`.
 4. **`ingress_unclassified`:** Postfix did not tell postwarden how the message arrived. Check `postconf -P | grep postwarden_ingress` and `postconf -h milter_macro_defaults`, or run `python3 scripts/install.py inspect`.

@@ -1,3 +1,4 @@
+import contextlib
 import io
 import os
 import shutil
@@ -91,7 +92,25 @@ class Lookup(unittest.TestCase):
         self.assertEqual(len(found), 2)
         self.assertTrue(all("mid=3f9c2a7b41d0 " in line for line in found))
 
-    def test_searches_plain_and_compressed_files(self):
+    def journal(self, lines=None):
+        from postwarden import logsource
+        fake = mock.Mock(stdout=iter(self.LINES if lines is None else lines), stderr=mock.Mock(read=lambda: ""),
+                         wait=lambda: 0)
+        return (mock.patch.object(logsource.shutil, "which", return_value="/bin/journalctl"),
+                mock.patch.object(logsource.subprocess, "Popen", return_value=fake),
+                mock.patch.object(logsource, "journal_start", return_value=None))
+
+    def run_lookup(self, *argv, journal=True):
+        patches = self.journal() if journal else ()
+        with contextlib.ExitStack() as stack:
+            mocks = [stack.enter_context(p) for p in patches]
+            out = stack.enter_context(mock.patch("sys.stdout", new_callable=io.StringIO))
+            err = stack.enter_context(mock.patch("sys.stderr", new_callable=io.StringIO))
+            status = main(["lookup", *argv])
+        popen = mocks[1] if mocks else None
+        return status, out.getvalue(), err.getvalue(), popen
+
+    def test_searches_plain_and_compressed_files_and_labels_them_unverified(self):
         import gzip
         tmp = tempfile.mkdtemp(dir="/tmp")
         self.addCleanup(shutil.rmtree, tmp, True)
@@ -99,24 +118,28 @@ class Lookup(unittest.TestCase):
             fh.writelines(self.LINES[:2])
         with gzip.open(os.path.join(tmp, "mail.log.2.gz"), "wt") as fh:
             fh.writelines(self.LINES[2:])
-        with mock.patch("sys.stdout") as out:
-            status = main(["lookup", "(ref 3f9c2a7b41d0)", "--file", os.path.join(tmp, "mail.log*")])
+        status, out, err, _ = self.run_lookup("(ref 3f9c2a7b41d0)", "--file", os.path.join(tmp, "mail.log*"), journal=False)
         self.assertEqual(status, 0)
-        printed = "".join(call.args[0] for call in out.write.call_args_list)
-        self.assertIn("rule=protected_recipient", printed)
-        self.assertIn("rule=authentication", printed)
+        self.assertIn("rule=protected_recipient", out)
+        self.assertIn("rule=authentication", out)
+        self.assertIn(f"source: files {tmp}/mail.log* (unverified", err)
 
-    def test_journal_query_uses_structured_arguments(self):
-        from postwarden import lookup as mod
-        fake = mock.Mock(stdout=iter(self.LINES), stderr=mock.Mock(read=lambda: ""), wait=lambda: 0)
-        with mock.patch.object(mod.shutil, "which", return_value="/bin/journalctl"), \
-             mock.patch.object(mod.subprocess, "Popen", return_value=fake) as popen:
-            found = mod.lookup("3f9c2a7b41d0", since="-7d", files=None)
-        self.assertEqual(len(found), 2)
+    def test_journal_is_read_by_trusted_unit(self):
+        status, out, err, popen = self.run_lookup("3f9c2a7b41d0")
+        self.assertEqual((status, out.count("\n")), (0, 2))
         argv = popen.call_args.args[0]
-        self.assertEqual(argv[:1], ["journalctl"])
-        self.assertIn("postwarden", argv)
+        self.assertEqual(argv[0], "journalctl")
+        self.assertIn("_SYSTEMD_UNIT=postwarden.service", argv)
+        self.assertNotIn("-t", argv)
         self.assertEqual(argv[-2:], ["--since", "-7d"])
+        self.assertIn("source: journal, unit postwarden.service, since -7d (verified)", err)
+
+    def test_any_source_matches_the_tag_and_says_so(self):
+        status, _, err, popen = self.run_lookup("3f9c2a7b41d0", "--any-source", "--since", "-1d")
+        argv = popen.call_args.args[0]
+        self.assertIn("-t", argv)
+        self.assertNotIn("_SYSTEMD_UNIT=postwarden.service", argv)
+        self.assertIn("(--any-source), since -1d (unverified", err)
 
     def test_not_found_exit_status(self):
         tmp = tempfile.mkdtemp(dir="/tmp")
@@ -124,28 +147,52 @@ class Lookup(unittest.TestCase):
         path = os.path.join(tmp, "mail.log")
         with open(path, "w") as fh:
             fh.writelines(self.LINES)
-        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertEqual(main(["lookup", "bbbbbbbbbbbb", "--file", path]), 1)
-        self.assertIn(f"searched {path})", err.getvalue())
-        self.assertNotIn("journal", err.getvalue())
+        status, _, err, _ = self.run_lookup("bbbbbbbbbbbb", "--file", path, journal=False)
+        self.assertEqual(status, 1)
+        self.assertIn(f"source: files {path}", err)
+        self.assertNotIn("journal", err)
 
-    def test_not_found_in_journal_names_the_journal_and_its_permissions(self):
-        from postwarden import lookup as mod
-        fake = mock.Mock(stdout=iter(self.LINES), stderr=mock.Mock(read=lambda: ""), wait=lambda: 0)
-        with mock.patch.object(mod.shutil, "which", return_value="/bin/journalctl"), \
-             mock.patch.object(mod.subprocess, "Popen", return_value=fake), \
+    def test_not_found_in_journal_mentions_permissions(self):
+        status, _, err, _ = self.run_lookup("bbbbbbbbbbbb")
+        self.assertEqual(status, 1)
+        self.assertIn("systemd-journal", err)
+
+    def test_without_journalctl_the_mail_logs_are_named_as_a_fallback(self):
+        from postwarden import logsource
+        with mock.patch.object(logsource.shutil, "which", return_value=None), \
+             mock.patch.object(logsource, "_file_lines", return_value=iter(self.LINES)), \
              mock.patch("sys.stderr", new_callable=io.StringIO) as err:
             self.assertEqual(main(["lookup", "bbbbbbbbbbbb"]), 1)
-        self.assertIn("searched the journal since -7d", err.getvalue())
-        self.assertIn("systemd-journal", err.getvalue())
+        self.assertIn(f"source: files {logsource.MAIL_LOGS} (journalctl not found; unverified", err.getvalue())
 
-    def test_without_journalctl_the_mail_logs_are_named(self):
-        from postwarden import lookup as mod
-        with mock.patch.object(mod.shutil, "which", return_value=None), \
-             mock.patch.object(mod, "file_lines", return_value=iter(self.LINES)), \
-             mock.patch("sys.stderr", new_callable=io.StringIO) as err:
-            self.assertEqual(main(["lookup", "bbbbbbbbbbbb"]), 1)
-        self.assertIn(f"searched {mod.MAIL_LOGS})", err.getvalue())
+    def test_coverage_line_when_since_predates_the_journal(self):
+        from postwarden import logsource
+        patches = self.journal()
+        with patches[0], patches[1], mock.patch.object(logsource, "journal_start", return_value=time.time() - 86400), \
+             mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            main(["lookup", "3f9c2a7b41d0", "--since", "-30d"])
+        self.assertIn("note: the journal starts at ", err.getvalue())
+        self.assertIn("--file '/var/log/mail.log*' (unverified)", err.getvalue())
+
+
+class LogSource(unittest.TestCase):
+    NOW = 1_800_000_000.0
+
+    def test_since_forms(self):
+        from postwarden.logsource import since_timestamp
+        self.assertEqual(since_timestamp("-7d", self.NOW), self.NOW - 7 * 86400)
+        self.assertEqual(since_timestamp("-24h", self.NOW), self.NOW - 86400)
+        self.assertEqual(since_timestamp("-30days", self.NOW), self.NOW - 30 * 86400)
+        self.assertIsNotNone(since_timestamp("2026-09-01"))
+        self.assertIsNone(since_timestamp("yesterday"))
+
+    def test_no_coverage_line_inside_the_journal_or_for_files(self):
+        from postwarden.logsource import Source, coverage_note
+        journal = Source("journal", since="-1d")
+        self.assertIsNone(coverage_note(journal, self.NOW - 2 * 86400, self.NOW))
+        self.assertIsNotNone(coverage_note(journal, self.NOW - 3600, self.NOW))
+        self.assertIsNone(coverage_note(Source("files", pattern="/x"), self.NOW, self.NOW))
+        self.assertIsNone(coverage_note(journal, None, self.NOW))
 
 
 class CheckConfigSummary(unittest.TestCase):

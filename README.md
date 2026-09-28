@@ -150,6 +150,8 @@ postwarden lookup 3f9c2a7b41d0 --file '/var/log/mail.log*'  # syslog files, incl
 It prints every postwarden line for that message: the rule, the exact reason, the trust class and the SPF/DKIM results. It exits 1 when nothing matches.
 Reading the journal needs root or the `adm` or `systemd-journal` group.
 
+`lookup` reads only journal lines written by the `postwarden.service` unit, so lines that any local user can forge with `logger -t postwarden` never appear. It names its source on the first line; lines from `--file` are labelled unverified, since syslog files cannot tell who wrote a line. When `--since` reaches back further than the journal, a note says so and points to `--file`.
+
 [Operations](docs/Operations.md) lists every reason code and common tasks: updates, rollback, and what happens when the daemon is down.
 
 ## Documentation
