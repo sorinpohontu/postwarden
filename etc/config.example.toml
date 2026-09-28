@@ -78,6 +78,32 @@ authorized_logins = []
 # max_concurrent_messages = 32      # SPF/DKIM checks running at once
 # max_open_messages = 100           # messages being received at once; spool use <= this x message_bytes
 
+# -----------------------------------------------------------------------------
+# Sending limits: cap how many recipients each sender may reach per rolling hour
+# and day, to contain a stolen login or a hacked script. A message to 100
+# recipients and 100 messages to one recipient each both count 100.
+# Counted per login (587/465), per envelope sender of local mail, and per
+# client IP of mynetworks relays without a login; outside mail is never limited.
+# Over the limit, mail is deferred (451), never rejected.
+#
+[sending_limits]
+mode = "observe"            # observe | enforce | off; "observe" only logs, see postwarden stats
+per_hour = 100              # recipients per sender, rolling hour
+per_day = 500               # recipients per sender, rolling day
+# local_per_hour = 1000     # all local mail together (sendmail, SMTP from this server)
+# local_per_day = 5000
+
+# Exceptions multiply both per-sender limits. The most specific match wins:
+# an account over its domain; for relays, the longest network prefix.
+# Fractions tighten a limit. Keys containing dots must be quoted.
+#
+[sending_limits.multipliers]
+# "example.com" = 2               # every account of this domain (not subdomains)
+# "marketing@example.com" = 10    # one account: a login or a local envelope sender
+# "login:john" = 3                # a login without a domain
+# "192.0.2.10" = 5                # a mynetworks relay without a login (address or network)
+# "<>" = 5                        # local mail with an empty sender, such as vacation replies
+
 # SMTP replies sent to the sending server. The defaults below are used unless
 # you uncomment and change them. Only the wording and codes within the same
 # class can change: a rejection (5xx) cannot become a deferral (4xx) or an accept.
@@ -108,6 +134,11 @@ authorized_logins = []
 # smtp_code = 550
 # enhanced_code = "5.1.3"
 # message = "Recipient address rejected: Bad address syntax"
+#
+# [responses.sending_limit]
+# smtp_code = 451
+# enhanced_code = "4.7.1"
+# message = "Sending limit exceeded - try again later"
 #
 # [responses.temporary_failure]
 # smtp_code = 451

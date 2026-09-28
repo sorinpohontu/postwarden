@@ -68,6 +68,7 @@ def cmd_check_config(args: argparse.Namespace) -> int:
         print(f"{args.config}: {note}", file=sys.stderr)
         return 1
     print(f"{args.config}: OK (schema {settings.schema_version}, mode {settings.mode}, "
+          f"sending limits {settings.sending_limits.mode}, "
           f"{_protection_summary(settings)}; {note})")
     return 0
 

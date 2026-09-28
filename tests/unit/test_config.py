@@ -5,7 +5,8 @@ import tempfile
 import tomllib
 import unittest
 
-from postwarden.config import ConfigError, LimitSettings, describe, load_settings, parse_settings
+from postwarden.config import (ConfigError, LimitSettings, SendingLimitSettings, describe, load_settings,
+                               parse_settings)
 from postwarden.replies import Reply, validate_reply
 
 from helpers import BASE_TOML, EXAMPLE, example_settings, settings
@@ -141,6 +142,101 @@ class Validation(unittest.TestCase):
     def test_deadline_not_below_dns_timeout(self):
         errors = self.errors('\n[limits]\ndns_timeout_seconds = 30\nauthentication_deadline_seconds = 20\n')
         self.assertTrue(any("must not be shorter than dns_timeout_seconds" in e for e in errors))
+
+
+class SendingLimits(unittest.TestCase):
+    MULTIPLIERS = """
+[sending_limits.multipliers]
+"example.com" = 2
+"Marketing@Example.com" = 10
+"login:John" = 3
+"192.0.2.0/24" = 5
+"192.0.2.10" = 7
+"2001:db8::/32" = 0.5
+"<>" = 4
+"""
+
+    def errors(self, extra):
+        with self.assertRaises(ConfigError) as ctx:
+            settings(extra)
+        return ctx.exception.errors
+
+    def test_defaults_observe_with_100_and_500(self):
+        limits = settings().sending_limits
+        self.assertEqual((limits.mode, limits.per_hour, limits.per_day, limits.local_per_hour, limits.local_per_day),
+                         ("observe", 100, 500, 1000, 5000))
+        self.assertEqual(settings().reply("sending_limit").render(), "451 4.7.1 Sending limit exceeded - try again later")
+
+    def test_most_specific_multiplier_wins_and_factors_are_not_combined(self):
+        limits = settings(self.MULTIPLIERS).sending_limits
+        self.assertEqual(limits.multiplier_for(account="marketing@example.com", domain="example.com"), 10)
+        self.assertEqual(limits.multiplier_for(account="sales@example.com", domain="example.com"), 2)
+        self.assertEqual(limits.multiplier_for(account="sales@sub.example.com", domain="sub.example.com"), 1)
+        self.assertEqual(limits.multiplier_for(login="JOHN", domain="example.com"), 3)
+        self.assertEqual(limits.multiplier_for(login="mary", domain="example.com"), 2)
+        self.assertEqual(limits.multiplier_for(null_sender=True), 4)
+        self.assertEqual(limits.multiplier_for(relay="192.0.2.10"), 7)
+        self.assertEqual(limits.multiplier_for(relay="192.0.2.11"), 5)
+        self.assertEqual(limits.multiplier_for(relay="2001:db8::1"), 0.5)
+        self.assertEqual(limits.multiplier_for(relay="198.51.100.1"), 1)
+
+    def test_scaled_limits_round_down_with_a_minimum_of_one(self):
+        limits = SendingLimitSettings()
+        self.assertEqual(limits.scaled(10), (1000, 5000))
+        self.assertEqual(limits.scaled(0.5), (50, 250))
+        self.assertEqual(limits.scaled(0.333), (33, 166))
+        self.assertEqual(limits.scaled(0.001), (1, 1))
+
+    def test_show_config_prints_effective_limits_per_entry(self):
+        described = describe(settings(self.MULTIPLIERS))["sending_limits"]
+        self.assertEqual(described["multipliers"]["marketing@example.com"], "x10: 1000 per hour, 5000 per day")
+        self.assertEqual(described["multipliers"]["login:john"], "x3: 300 per hour, 1500 per day")
+        self.assertEqual(described["multipliers"]["192.0.2.10"], "x7: 700 per hour, 3500 per day")
+        self.assertEqual(described["multipliers"]["<>"], "x4: 400 per hour, 2000 per day")
+
+    def test_invalid_multiplier_keys_are_rejected(self):
+        errors = self.errors("""
+[sending_limits.multipliers]
+"login:john@example.com" = 2
+john = 2
+"192.0.2.10/24" = 2
+"zero.example" = 0
+"bool.example" = true
+example.com = 2
+""")
+        joined = "\n".join(errors)
+        self.assertIn("'login:john@example.com': login:NAME takes a login without @", joined)
+        self.assertIn("'john': not a domain, address, network, login:NAME or <>; a login without a domain is written login:john", joined)
+        self.assertIn("'192.0.2.10/24': not a valid IP address or network", joined)
+        self.assertIn("'zero.example': must be greater than zero", joined)
+        self.assertIn("'bool.example': must be a number", joined)
+        self.assertIn("'example': must be a number; write keys that contain dots in quotes", joined)
+        self.assertEqual(len(errors), 6)
+
+    def test_duplicates_are_found_after_case_folding(self):
+        errors = self.errors("""
+[sending_limits.multipliers]
+"login:John" = 2
+"login:john" = 3
+"Example.COM" = 2
+"example.com" = 3
+"A@example.com" = 2
+"a@example.com" = 3
+""")
+        self.assertEqual(sorted(e.split(": ", 1)[1] for e in errors),
+                         ["same key as another multiplier (a@example.com)",
+                          "same key as another multiplier (example.com)",
+                          "same key as another multiplier (login:john)"])
+
+    def test_domain_named_like_a_login_stays_a_domain(self):
+        limits = settings('\n[sending_limits.multipliers]\n"john.example" = 2\n"login:john" = 3\n').sending_limits
+        self.assertEqual((limits.domains, limits.logins), ({"john.example": 2}, {"john": 3}))
+
+    def test_mode_and_numbers_are_validated(self):
+        errors = self.errors('\n[sending_limits]\nmode = "strict"\nper_hour = 0\nlocal_per_hour = 600\nlocal_per_day = 500\n')
+        self.assertIn("sending_limits.mode: must be one of observe, enforce, off", errors)
+        self.assertIn("sending_limits.per_hour: must be greater than zero", errors)
+        self.assertIn("sending_limits.local_per_day: must not be lower than local_per_hour", errors)
 
 
 class Loading(unittest.TestCase):

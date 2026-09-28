@@ -42,6 +42,7 @@ DEFAULT_REPLIES: dict[str, Reply] = {
     "invalid_from": Reply(550, "5.7.1", "Message rejected: From header does not conform to RFC 5322"),
     "invalid_recipient": Reply(550, "5.1.3", "Recipient address rejected: Bad address syntax"),
     "temporary_failure": Reply(451, "4.7.1", "Service unavailable - try again later"),
+    "sending_limit": Reply(451, "4.7.1", "Sending limit exceeded - try again later"),
 }
 
 REPLY_CLASSES: dict[str, ReplyClass] = {

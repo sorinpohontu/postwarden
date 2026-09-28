@@ -13,6 +13,9 @@ from .replies import DEFAULT_REPLIES, Reply, validate_reply
 
 SUPPORTED_SCHEMA_VERSIONS = (1,)
 MODES = ("observe", "enforce")
+LIMIT_MODES = ("observe", "enforce", "off")
+NULL_SENDER_KEY = "<>"
+LOGIN_PREFIX = "login:"
 
 Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 
@@ -92,6 +95,51 @@ class LimitSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class SendingLimitSettings:
+    mode: str = "observe"
+    per_hour: int = 100
+    per_day: int = 500
+    local_per_hour: int = 1000
+    local_per_day: int = 5000
+    accounts: dict[str, float] = field(default_factory=dict)
+    logins: dict[str, float] = field(default_factory=dict)
+    domains: dict[str, float] = field(default_factory=dict)
+    networks: tuple[tuple[Network, float], ...] = ()
+    null_sender: float | None = None
+
+    def scaled(self, multiplier: float) -> tuple[int, int]:
+        """(per_hour, per_day) for a multiplier: rounded down, at least 1."""
+        return max(1, math.floor(self.per_hour * multiplier)), max(1, math.floor(self.per_day * multiplier))
+
+    def multiplier_for(self, *, account: str | None = None, login: str | None = None, domain: str | None = None,
+                       null_sender: bool = False, relay: str | None = None) -> float:
+        """The most specific multiplier for a limit key; 1 when nothing matches."""
+        if relay is not None:
+            address = ipaddress.ip_address(relay)
+            matches = [(net.prefixlen, m) for net, m in self.networks if address.version == net.version and address in net]
+            return max(matches)[1] if matches else 1.0
+        if null_sender:
+            return self.null_sender if self.null_sender is not None else 1.0
+        if account is not None and account in self.accounts:
+            return self.accounts[account]
+        if login is not None and login.casefold() in self.logins:
+            return self.logins[login.casefold()]
+        if domain is not None and domain in self.domains:
+            return self.domains[domain]
+        return 1.0
+
+    def entries(self) -> list[tuple[str, float]]:
+        """Every configured multiplier as written in the configuration, normalized."""
+        listed = [(key, m) for key, m in self.accounts.items()]
+        listed += [(f"{LOGIN_PREFIX}{key}", m) for key, m in self.logins.items()]
+        listed += [(key, m) for key, m in self.domains.items()]
+        listed += [(_network_text(net), m) for net, m in self.networks]
+        if self.null_sender is not None:
+            listed.append((NULL_SENDER_KEY, self.null_sender))
+        return listed
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     schema_version: int = 1
     mode: str = "observe"
@@ -102,6 +150,7 @@ class Settings:
     sender_authentication: SenderAuthenticationSettings = SenderAuthenticationSettings()
     protection: ProtectionSettings = ProtectionSettings()
     limits: LimitSettings = LimitSettings()
+    sending_limits: SendingLimitSettings = SendingLimitSettings()
     responses: dict[str, Reply] = field(default_factory=lambda: dict(DEFAULT_REPLIES))
     source: str = ""
 
@@ -192,7 +241,7 @@ def parse_settings(data: dict[str, Any], source: str = "") -> Settings:
     top = v.table(data, "", {
         "schema_version": int, "mode": str, "service": dict, "logging": dict, "trust": dict,
         "self_sender": dict, "authentication": dict, "sender_authentication": dict, "protection": dict, "protected_recipients": list,
-        "limits": dict, "responses": dict,
+        "limits": dict, "sending_limits": dict, "responses": dict,
     })
 
     schema_version = top.get("schema_version", 1)
@@ -306,6 +355,8 @@ def parse_settings(data: dict[str, Any], source: str = "") -> Settings:
     if limits.authentication_deadline_seconds < limits.dns_timeout_seconds:
         v.error("limits.authentication_deadline_seconds", "must not be shorter than dns_timeout_seconds")
 
+    sending_limits = _sending_limits(v, top.get("sending_limits", {}))
+
     responses = dict(DEFAULT_REPLIES)
     responses_data = top.get("responses", {})
     if isinstance(responses_data, dict):
@@ -326,8 +377,99 @@ def parse_settings(data: dict[str, Any], source: str = "") -> Settings:
     return Settings(
         schema_version=schema_version, mode=mode, service=service, logging=logging_s, trust=trust,
         self_sender=self_sender, sender_authentication=sender_authentication, protection=protection,
-        limits=limits, responses=responses, source=source,
+        limits=limits, sending_limits=sending_limits, responses=responses, source=source,
     )
+
+
+def _sending_limits(v: _Validator, data: Any) -> SendingLimitSettings:
+    t = v.table(data, "sending_limits", {
+        "mode": str, "per_hour": int, "per_day": int, "local_per_hour": int, "local_per_day": int,
+        "multipliers": dict})
+    v.choice(t.get("mode"), "sending_limits.mode", LIMIT_MODES)
+    d = SendingLimitSettings()
+    numbers = {name: v.positive(t.get(name), f"sending_limits.{name}", getattr(d, name), integer=True)
+               for name in ("per_hour", "per_day", "local_per_hour", "local_per_day")}
+    for hour, day in (("per_hour", "per_day"), ("local_per_hour", "local_per_day")):
+        if numbers[day] < numbers[hour]:
+            v.error(f"sending_limits.{day}", f"must not be lower than {hour}")
+    accounts: dict[str, float] = {}
+    logins: dict[str, float] = {}
+    domains: dict[str, float] = {}
+    networks: dict[Network, float] = {}
+    null_sender: float | None = None
+    raw = t.get("multipliers", {})
+    for name, value in raw.items():
+        path = f"sending_limits.multipliers.{name!r}"
+        if isinstance(value, dict):
+            v.error(path, "must be a number; write keys that contain dots in quotes, as in \"example.com\" = 2")
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            v.error(path, "must be a number")
+            continue
+        factor = v.positive(value, path, None, integer=False)
+        if factor is None:
+            continue
+        kind, key = _multiplier_key(v, name, path)
+        if kind is None:
+            continue
+        table = {"account": accounts, "login": logins, "domain": domains, "network": networks}.get(kind)
+        if kind == "null_sender":
+            if null_sender is not None:
+                v.error(path, "duplicate multiplier")
+                continue
+            null_sender = factor
+        elif key in table:
+            shown = f"{LOGIN_PREFIX}{key}" if kind == "login" else _network_text(key) if kind == "network" else key
+            v.error(path, f"same key as another multiplier ({shown})")
+        else:
+            table[key] = factor
+    return SendingLimitSettings(
+        mode=t.get("mode", d.mode), **numbers, accounts=accounts, logins=logins, domains=domains,
+        networks=tuple(networks.items()), null_sender=null_sender,
+    )
+
+
+def _network_text(network: Network) -> str:
+    return str(network.network_address) if network.prefixlen == network.max_prefixlen else str(network)
+
+
+def _is_ip(text: str) -> bool:
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+
+def _multiplier_key(v: _Validator, name: str, path: str) -> tuple[str | None, Any]:
+    """Classify a multiplier key: null sender, short login, relay network, account or domain."""
+    if name == NULL_SENDER_KEY:
+        return "null_sender", None
+    if name.startswith(LOGIN_PREFIX):
+        login = name[len(LOGIN_PREFIX):]
+        if not login or "@" in login or any(ch.isspace() for ch in login):
+            v.error(path, f"{LOGIN_PREFIX}NAME takes a login without @ and without spaces; "
+                          "write an address as the address itself")
+            return None, None
+        return "login", login.casefold()
+    if "/" in name or ":" in name or _is_ip(name):
+        try:
+            return "network", ipaddress.ip_network(name, strict=True)
+        except ValueError as exc:
+            v.error(path, f"not a valid IP address or network: {exc}")
+            return None, None
+    try:
+        if "@" in name:
+            return "account", parse_mailbox(name).lookup_key
+        domain = parse_mailbox(f"postmaster@{name}").domain
+    except AddressError as exc:
+        v.error(path, str(exc))
+        return None, None
+    if "." not in domain:
+        v.error(path, f"not a domain, address, network, {LOGIN_PREFIX}NAME or {NULL_SENDER_KEY}; "
+                      f"a login without a domain is written {LOGIN_PREFIX}{name}")
+        return None, None
+    return "domain", domain
 
 
 def load_settings(path: str = DEFAULT_CONFIG_PATH) -> Settings:
@@ -369,6 +511,21 @@ def describe(settings: Settings) -> dict[str, Any]:
                           for name, logins in sorted(settings.protection.addresses.items())},
         },
         "limits": {f.name: getattr(settings.limits, f.name) for f in fields(LimitSettings)},
+        "sending_limits": _describe_sending_limits(settings.sending_limits),
         "responses": {name: {"smtp_code": r.smtp_code, "enhanced_code": r.enhanced_code, "message": r.message}
                       for name, r in settings.responses.items()},
     }
+
+
+def _describe_sending_limits(limits: SendingLimitSettings) -> dict[str, Any]:
+    described: dict[str, Any] = {
+        "mode": limits.mode, "per_hour": limits.per_hour, "per_day": limits.per_day,
+        "local_per_hour": limits.local_per_hour, "local_per_day": limits.local_per_day,
+    }
+    multipliers = {}
+    for key, factor in limits.entries():
+        per_hour, per_day = limits.scaled(factor)
+        multipliers[key] = f"x{factor:g}: {per_hour} per hour, {per_day} per day"
+    if multipliers:
+        described["multipliers"] = multipliers
+    return described
