@@ -90,12 +90,15 @@ class PolicyMilter(Milter.Base):
             _log.debug(action="allow", **fields)
             return Milter.CONTINUE
         reply = (decision.reply or _settings.reply("temporary_failure")).with_reference(self.mid)
-        if _settings.mode != "enforce":
+        if not self._enforced(decision):
             _log.info(action=f"would_{decision.action.value}", reply=reply.render(), **fields)
             return Milter.CONTINUE
         _log.info(action=decision.action.value, reply=reply.render(), **fields)
         self.setreply(str(reply.smtp_code), reply.enhanced_code, reply.message)
         return Milter.REJECT if decision.action is Action.REJECT else Milter.TEMPFAIL
+
+    def _enforced(self, decision: Decision) -> bool:
+        return _settings.mode == "enforce"
 
     def _refresh_facts(self) -> None:
         self.facts = ConnectionFacts(
@@ -201,11 +204,16 @@ class PolicyMilter(Milter.Base):
                 return Milter.CONTINUE
             return self._apply(combine(list(self.state.deferred_rejections)), "eom", sender=self._sender_field())
         fields = dict(sender=self._sender_field(), rcpts=len(self.state.recipients) + self.state.overflow_rcpts)
+        refused = [r.decision for r in self.state.recipients
+                   if r.decision is not None and r.decision.action is not Action.ALLOW]
+        refused += [Decision(Action.DEFER, "limits", "max_recipients", None)] * self.state.overflow_rcpts
         for action, key in ((Action.REJECT, "rejected_rcpts"), (Action.DEFER, "deferred_rcpts")):
-            count = sum(1 for r in self.state.recipients if r.decision is not None and r.decision.action is action)
-            count += self.state.overflow_rcpts if action is Action.DEFER else 0
-            if count:
-                fields[key] = count
+            sent = sum(1 for d in refused if d.action is action and self._enforced(d))
+            hypothetical = sum(1 for d in refused if d.action is action and not self._enforced(d))
+            if sent:
+                fields[key] = sent
+            if hypothetical:
+                fields[f"would_{key}"] = hypothetical
         decisions: list[Decision | None] = list(self.state.deferred_rejections)
 
         headers_complete = capture.over_limit not in ("max_headers", "max_header_bytes")
@@ -296,7 +304,8 @@ def run_daemon(settings: Settings) -> int:
     Milter.set_flags(0)
     Milter.set_exception_policy(Milter.TEMPFAIL)
     addresses, groups = settings.protection.counts()
-    _log.lifecycle(event="start", mode=settings.mode, socket=socket, config=settings.source,
+    _log.lifecycle(event="start", mode=settings.mode, logging_level=settings.logging.level, socket=socket,
+                   config=settings.source,
                    protected_addresses=addresses, protected_groups=groups, mynetworks=len(settings.trust.mynetworks),
                    recipient_delimiter=settings.trust.recipient_delimiter)
     try:

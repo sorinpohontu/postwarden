@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "stubs"))
 
@@ -146,16 +147,18 @@ class SmtpTransactions(unittest.TestCase):
         self.assertIn(("rcpt", "would_reject", "protected_recipient"), log.actions())
         self.assertIn(("eom", "would_reject", "authentication"), log.actions())
 
-    def test_eom_summary_counts_refused_recipients(self):
-        for mode, refused_action in (("observe", "would_reject"), ("enforce", "reject")):
+    def test_eom_summary_separates_sent_and_observed_refusals(self):
+        for mode, refused_action, sent, observed in (("observe", "would_reject", None, 1), ("enforce", "reject", 1, None)):
             with self.subTest(mode=mode):
                 m, log = session(mode=mode)
                 connect(m, peer="127.0.0.1", ingress="SMTP25")
                 message(m, "<bob@example.org>", ["<all@example.com>", "<carol@example.com>"], [("From", " bob@example.org")])
                 self.assertIn(("rcpt", refused_action, "protected_recipient"), log.actions())
                 eom = [f for _, f in log.events if f.get("stage") == "eom" and f.get("action") == "accept"][0]
-                self.assertEqual((eom["rcpts"], eom["rejected_rcpts"]), (2, 1))
+                self.assertEqual((eom["rcpts"], eom.get("rejected_rcpts"), eom.get("would_rejected_rcpts")),
+                                 (2, sent, observed))
                 self.assertNotIn("deferred_rcpts", eom)
+                self.assertNotIn("would_deferred_rcpts", eom)
 
     def test_eom_summary_counts_deferred_recipients_separately(self):
         m, log = session(mode="observe")
@@ -164,16 +167,17 @@ class SmtpTransactions(unittest.TestCase):
         message(m, "<bob@example.org>", ["<all@example.com>", "<carol@example.com>"], [("From", " bob@example.org")])
         self.assertIn(("rcpt", "would_defer", "protected_recipient"), log.actions())
         eom = [f for _, f in log.events if f.get("stage") == "eom" and f.get("action") == "accept"][0]
-        self.assertEqual(eom["deferred_rcpts"], 1)
-        self.assertNotIn("rejected_rcpts", eom)
+        self.assertEqual(eom["would_deferred_rcpts"], 1)
+        self.assertNotIn("deferred_rcpts", eom)
+        self.assertNotIn("would_rejected_rcpts", eom)
 
     def test_eom_summary_omits_refusal_counts_when_none(self):
         m, log = session()
         connect(m, peer="127.0.0.1", ingress="SMTP25")
         message(m, "<bob@example.org>", ["<carol@example.com>"], [("From", " bob@example.org")])
         eom = [f for _, f in log.events if f.get("stage") == "eom" and f.get("action") == "accept"][0]
-        self.assertNotIn("rejected_rcpts", eom)
-        self.assertNotIn("deferred_rcpts", eom)
+        for key in ("rejected_rcpts", "deferred_rcpts", "would_rejected_rcpts", "would_deferred_rcpts"):
+            self.assertNotIn(key, eom)
 
     def test_untrusted_authentication_failure_rejects_at_eom(self):
         m, log = session()
@@ -397,6 +401,21 @@ class LocalPickup(unittest.TestCase):
         milter.authenticator = lambda *a, **k: self.fail("local mail is exempt")
         _, rc = message(m, "root@example.com", ["carol@example.com"], [("Subject", " cron")])
         self.assertEqual(rc, Milter.CONTINUE)
+
+
+class Lifecycle(unittest.TestCase):
+    def test_start_line_reports_mode_and_logging_level(self):
+        log = RecordingLogger()
+        log.lifecycle = lambda **f: log.event("lifecycle", **f)
+        cfg = settings('\nmode = "enforce"\n[logging]\nlevel = "warning"\n')
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+        with unittest.mock.patch.object(milter, "EventLogger", return_value=log), \
+             unittest.mock.patch.object(milter.Milter, "runmilter"):
+            milter.run_daemon(cfg)
+        start = [f for level, f in log.events if f.get("event") == "start"][0]
+        self.assertEqual((start["mode"], start["logging_level"]), ("enforce", "warning"))
+        self.assertEqual([f.get("event") for level, f in log.events], ["start", "stop"])
 
 
 class LogFormatting(unittest.TestCase):

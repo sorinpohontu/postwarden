@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Recipient refusal counts on the end-of-message line.** `rejected_rcpts` and `deferred_rcpts` now count only refusals actually sent. Refusals that observe mode only logged are counted in the new fields `would_rejected_rcpts` and `would_deferred_rcpts`.
+- **Start line.** `event=start` also reports `logging_level=`.
+
 ### Fixed
 
 - **`lookup` message when nothing matches.** It names what was searched (the journal, the `--file` pattern, or `/var/log/mail.log*` when `journalctl` is missing) and mentions journal permissions only when the journal was read.
