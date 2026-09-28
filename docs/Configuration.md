@@ -230,7 +230,7 @@ Over a limit, postwarden answers `451 4.7.1` from the first recipient over it; e
 
 Recipients refused by any rule, and messages refused at end of message, do not count. Postfix's own per-client rate limits (`smtpd_client_recipient_rate_limit` and related settings) are independent; recipients Postfix refuses never reach postwarden.
 
-postwarden tracks at most 20000 limit keys. When all are in use by senders counted within the last day, mail from a new sender is deferred with `reason=key_store_full` (in observe mode only logged, and that sender is not counted: `limit_measured=no`).
+Counts survive restarts and reboots (see [Operations](Operations.md#sending-limits)). postwarden tracks at most 20000 limit keys. When all are in use by senders counted within the last day, mail from a new sender is deferred with `reason=key_store_full` (in observe mode only logged, and that sender is not counted: `limit_measured=no`).
 
 ### `[sending_limits.multipliers]`
 

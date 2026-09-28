@@ -10,6 +10,7 @@ import Milter
 
 from .addresses import AddressError, Mailbox, parse_envelope
 from .config import Settings
+from . import limitstate
 from .logging import EventLogger
 from .message import MessageCapture
 from .policy import (Action, ConnectionFacts, Decision, RecipientState, TransactionState, TrustClass,
@@ -369,12 +370,27 @@ def run_daemon(settings: Settings) -> int:
     Milter.set_flags(0)
     Milter.set_exception_policy(Milter.TEMPFAIL)
     addresses, groups = settings.protection.counts()
+    state = limitstate.LoadResult("off") if _quota is None else limitstate.load(_quota, limitstate.STATE_FILE)
     _log.lifecycle(event="start", mode=settings.mode, sending_limits=settings.sending_limits.mode,
                    logging_level=settings.logging.level, socket=socket, config=settings.source,
                    protected_addresses=addresses, protected_groups=groups, mynetworks=len(settings.trust.mynetworks),
-                   recipient_delimiter=settings.trust.recipient_delimiter)
+                   recipient_delimiter=settings.trust.recipient_delimiter,
+                   limit_state=state.status, limit_keys=state.keys if _quota is not None else None,
+                   limit_state_age=state.age)
+    saver = None
+    if _quota is not None:
+        if state.status != "loaded":
+            _log.warning(event="limit_state_empty", reason=state.status, detail=state.detail, path=limitstate.STATE_FILE)
+        last_saved = time.time() - state.age if state.age is not None else None
+        saver = limitstate.Saver(_quota, _save_failed, limitstate.STATE_FILE, last_saved=last_saved)
+        saver.start()
     try:
         Milter.runmilter(settings.logging.identifier, socket, int(settings.limits.authentication_deadline_seconds) + 40)
     finally:
-        _log.lifecycle(event="stop")
+        saved = None if saver is None else ("saved" if saver.stop() else "failed")
+        _log.lifecycle(event="stop", limit_state=saved)
     return 0
+
+
+def _save_failed(detail: str, age: int | None) -> None:
+    _log.warning(event="limit_state_save_failed", detail=detail, snapshot_age=age, path=limitstate.STATE_FILE)

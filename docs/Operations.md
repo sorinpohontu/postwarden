@@ -69,13 +69,13 @@ Message bodies, passwords and raw headers are never logged; only envelope addres
 
 ### Actions
 
-| `action`                      | Meaning                                                                                                                                                                                                                                 |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `accept`                      | end of message; the message continues. Recipients refused earlier are logged on their own `rcpt` lines                                                                                                                                  |
-| `reject`, `defer`             | reply sent (enforce mode)                                                                                                                                                                                                               |
-| `would_reject`, `would_defer` | observe mode: the reply enforce mode would have sent                                                                                                                                                                                    |
-| `pending_eom`                 | a refusal on the local `sendmail` path; decided at end of message                                                                                                                                                                       |
-| `event=start`, `event=stop`   | daemon start and stop. The start line gives the mode, the sending-limits mode, log level, socket, configuration file, numbers of protected addresses and groups, and the `mynetworks` count and `recipient_delimiter` read from Postfix |
+| `action`                      | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `accept`                      | end of message; the message continues. Recipients refused earlier are logged on their own `rcpt` lines                                                                                                                                                                                                                                                                                                                           |
+| `reject`, `defer`             | reply sent (enforce mode)                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `would_reject`, `would_defer` | observe mode: the reply enforce mode would have sent                                                                                                                                                                                                                                                                                                                                                                             |
+| `pending_eom`                 | a refusal on the local `sendmail` path; decided at end of message                                                                                                                                                                                                                                                                                                                                                                |
+| `event=start`, `event=stop`   | daemon start and stop. The start line gives the mode, the sending-limits mode, log level, socket, configuration file, numbers of protected addresses and groups, the `mynetworks` count and `recipient_delimiter` read from Postfix, and the sending-limit state (`limit_state=loaded`, `missing`, `invalid` or `off`, with `limit_keys=` and `limit_state_age=` in seconds). The stop line reports whether that state was saved |
 
 ### Reasons
 
@@ -108,6 +108,12 @@ A sender over its limit is deferred with `rule=sending_limit`. The first refusal
 ```sh
 journalctl -t postwarden -p warning | grep limit_reached
 ```
+
+Counts are kept in `/var/lib/postwarden/limits.json` (owner `postwarden`, mode `0600`), written every minute and when the daemon stops, and read at start, so restarts and reboots keep the windows. Downtime still ages them. A crash loses at most the last minute of counts.
+
+- A missing, damaged or incompatible file is never fatal: postwarden starts with empty windows and logs `event=limit_state_empty` with the reason. On a first start, `reason=missing` is expected.
+- A failed save logs `event=limit_state_save_failed` with `snapshot_age=`, the age in seconds of the last good snapshot, and is retried a minute later; mail keeps flowing.
+- To reset all counts, stop postwarden, delete the file and start it again.
 
 - **A legitimate sender needs more:** add a multiplier in `[sending_limits.multipliers]`, run `postwarden check-config`, then `systemctl restart postwarden`.
 - **A compromised account:** change its password; the limit only slows it down.

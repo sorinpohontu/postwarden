@@ -22,6 +22,15 @@ LOCAL_PER_HOUR = "local_per_hour"
 LOCAL_PER_DAY = "local_per_day"
 KEY_STORE_FULL = "key_store_full"
 
+STATE_VERSION = 1
+MAX_KEY_TEXT = 1024
+MAX_BUCKET_COUNT = 10**9
+CLOCK_SKEW = 300
+
+
+class StateError(ValueError):
+    """A window snapshot that cannot be restored; the store starts empty."""
+
 
 @dataclass(frozen=True, slots=True)
 class LimitKey:
@@ -31,6 +40,33 @@ class LimitKey:
     per_day: int
     multiplier: float
     local: bool
+
+
+def _buckets(window: _Window) -> dict:
+    return {"hour": sorted([b, c] for b, c in window.hour.items()),
+            "day": sorted([b, c] for b, c in window.day.items())}
+
+
+def _window_from(value, now: float) -> _Window:
+    if not isinstance(value, dict) or set(value) != {"hour", "day"}:
+        raise StateError("unexpected window structure")
+    window = _Window()
+    for name, size, span in (("hour", HOUR_BUCKET, HOUR), ("day", DAY_BUCKET, DAY)):
+        entries = value[name]
+        if not isinstance(entries, list) or len(entries) > span // size + 1:
+            raise StateError(f"invalid {name} buckets")
+        target = getattr(window, name)
+        for entry in entries:
+            if (not isinstance(entry, list) or len(entry) != 2
+                    or not all(isinstance(v, int) and not isinstance(v, bool) for v in entry)):
+                raise StateError(f"invalid {name} bucket")
+            start, count = entry
+            if start % size or not 0 < count <= MAX_BUCKET_COUNT or start in target:
+                raise StateError(f"invalid {name} bucket")
+            if start <= now:
+                target[start] = count
+    window.expire(now)
+    return window
 
 
 def _relay_text(peer_ip: str) -> str:
@@ -213,9 +249,50 @@ class QuotaStore:
         with self._lock:
             return self._local.counts(now)
 
-    def __len__(self) -> int:
+    def key_count(self) -> int:
         with self._lock:
             return len(self._keys)
+
+    def export(self, now: float) -> dict:
+        """Committed counts only; in-flight reservations are not part of a snapshot."""
+        with self._lock:
+            keys = {}
+            for text, window in self._keys.items():
+                window.expire(now)
+                if window.hour or window.day:
+                    keys[text] = _buckets(window)
+            self._local.expire(now)
+            return {"version": STATE_VERSION, "saved": int(now), "local": _buckets(self._local), "keys": keys}
+
+    def restore(self, data, now: float) -> int:
+        """Replace all windows with a snapshot; raises StateError and changes nothing when any part is invalid."""
+        if not isinstance(data, dict) or set(data) != {"version", "saved", "local", "keys"}:
+            raise StateError("unexpected structure")
+        if data["version"] != STATE_VERSION or isinstance(data["version"], bool):
+            raise StateError(f"unsupported version {data['version']!r}")
+        saved = data["saved"]
+        if not isinstance(saved, int) or isinstance(saved, bool) or saved > now + CLOCK_SKEW:
+            raise StateError("invalid or future save time")
+        keys = data["keys"]
+        if not isinstance(keys, dict):
+            raise StateError("keys is not a table")
+        if len(keys) > self.capacity:
+            raise StateError(f"{len(keys)} keys, more than {self.capacity}")
+        restored = {}
+        for text, value in keys.items():
+            if not text or len(text) > MAX_KEY_TEXT:
+                raise StateError("invalid key")
+            window = _window_from(value, now)
+            if window.hour or window.day:
+                restored[text] = window
+        local = _window_from(data["local"], now)
+        with self._lock:
+            reserved = {t: w.reserved for t, w in self._keys.items() if w.reserved}
+            for text, count in reserved.items():
+                restored.setdefault(text, _Window()).reserved = count
+            local.reserved = self._local.reserved
+            self._keys, self._local = restored, local
+        return len(restored)
 
     def _window(self, text: str, now: float) -> _Window | None:
         window = self._keys.get(text)

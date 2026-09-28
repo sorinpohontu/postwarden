@@ -201,7 +201,7 @@ class KeyStore(unittest.TestCase):
         verdicts = [quota.reserve(reservation, T0 + s, observe=False) for s in (0, 30, 61)]
         self.assertEqual([(v.reason, v.first) for v in verdicts],
                          [(KEY_STORE_FULL, True), (KEY_STORE_FULL, False), (KEY_STORE_FULL, True)])
-        self.assertEqual(len(quota), 3)
+        self.assertEqual(quota.key_count(), 3)
 
     def test_full_store_in_observe_leaves_the_new_key_unmeasured(self):
         quota = store()
@@ -238,7 +238,7 @@ class KeyStore(unittest.TestCase):
         quota = store()
         self.fill(quota)
         self.assertEqual(send(quota, key("d"), 1, T0 + DAY + 900), [])
-        self.assertEqual(len(quota), 1)
+        self.assertEqual(quota.key_count(), 1)
 
 
 if __name__ == "__main__":

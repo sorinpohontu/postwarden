@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 import unittest.mock
 
@@ -507,6 +508,7 @@ class SendingLimits(unittest.TestCase):
                 self.assertEqual(self.counts("demo@example.com"), (1, 1))
                 getattr(m, end)(*(["<other@example.com>"] if end == "envfrom" else []))
                 self.assertEqual(self.counts("demo@example.com"), (0, 0))
+                m.close()
 
     def test_observe_mode_counts_what_enforcement_would_commit(self):
         m, log = self.submission(mode="observe", extra="\n[limits]\nmessage_bytes = 10\n")
@@ -575,18 +577,54 @@ class SendingLimits(unittest.TestCase):
 
 
 class Lifecycle(unittest.TestCase):
-    def test_start_line_reports_mode_and_logging_level(self):
+    def run_daemon(self, extra="", during=None):
         log = RecordingLogger()
         log.lifecycle = lambda **f: log.event("lifecycle", **f)
-        cfg = settings('\nmode = "enforce"\n[logging]\nlevel = "warning"\n')
+        cfg = settings('\nmode = "enforce"\n[logging]\nlevel = "warning"\n' + extra)
         previous = os.umask(0o022)
         self.addCleanup(os.umask, previous)
         with unittest.mock.patch.object(milter, "EventLogger", return_value=log), \
-             unittest.mock.patch.object(milter.Milter, "runmilter"):
+             unittest.mock.patch.object(milter.Milter, "runmilter", side_effect=lambda *a: during and during()), \
+             unittest.mock.patch.object(milter.limitstate, "STATE_FILE", self.path):
             milter.run_daemon(cfg)
-        start = [f for level, f in log.events if f.get("event") == "start"][0]
+        return log
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = os.path.join(directory.name, "limits.json")
+
+    def events(self, log, name):
+        return [f for _, f in log.events if f.get("event") == name]
+
+    def test_start_line_reports_mode_and_logging_level(self):
+        log = self.run_daemon()
+        start = self.events(log, "start")[0]
         self.assertEqual((start["mode"], start["sending_limits"], start["logging_level"]), ("enforce", "observe", "warning"))
+        self.assertEqual([f.get("event") for level, f in log.events], ["start", "limit_state_empty", "stop"])
+        self.assertEqual((start["limit_state"], self.events(log, "limit_state_empty")[0]["reason"]), ("missing", "missing"))
+
+    def test_windows_survive_a_restart(self):
+        def traffic():
+            m = milter.PolicyMilter()
+            m.macros, m.replies = {}, []
+            connect(m, port="587", ingress="SUBMISSION587", login="demo@example.com", cipher="256")
+            milter.authenticator = auth_result()
+            message(m, "<demo@example.com>", ["<r1@example.net>", "<r2@example.net>"], [("From", " demo@example.com")])
+        self.addCleanup(setattr, milter, "authenticator", None)
+        stop = self.events(self.run_daemon(during=traffic), "stop")[0]
+        self.assertEqual(stop["limit_state"], "saved")
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+        log = self.run_daemon()
+        start = self.events(log, "start")[0]
+        self.assertEqual((start["limit_state"], start["limit_keys"], start["limit_state_age"]), ("loaded", 1, 0))
+        self.assertEqual(milter._quota.counts("demo@example.com", milter.time.time()), (2, 2))
+
+    def test_limits_off_neither_loads_nor_saves(self):
+        log = self.run_daemon('\n[sending_limits]\nmode = "off"\n')
+        self.assertEqual(self.events(log, "start")[0]["limit_state"], "off")
         self.assertEqual([f.get("event") for level, f in log.events], ["start", "stop"])
+        self.assertFalse(os.path.exists(self.path))
 
 
 class LogFormatting(unittest.TestCase):

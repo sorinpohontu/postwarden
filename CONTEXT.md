@@ -135,7 +135,7 @@ The ` (ref <mid>)` suffix the daemon appends to every SMTP reply it sends (and
 to observe-mode `would_*` replies). Equals `mid=` on the log line, which holds
 the precise rule and reason that the terse public reply leaves out.
 
-### Sending limit (planned, 1.1)
+### Sending limit (1.1)
 
 A rolling-hour and rolling-day cap on recipients per **limit key**, enforced by the `sending_limit` rule with a temporary failure
 (ADR-0007). Protects against compromised logins and hacked scripts; not a
@@ -149,7 +149,7 @@ submission, the envelope sender for local mail, the client IP for `mynetworks`
 relays without a login, plus one **local cap** over all local mail.
 Untrusted inbound mail has no limit key.
 
-### Local cap (planned, 1.1)
+### Local cap (1.1)
 
 One extra sending-limit counter over all local mail together (`sendmail`,
 unauthenticated SMTP from the server itself), because a script can rotate
@@ -157,7 +157,7 @@ envelope senders. Every local recipient counts toward its sender's key and
 the local cap; the stricter defers. `local_per_hour`/`local_per_day`
 (1000/5000), no multiplier (ADR-0007). Not a limit on all mail of the host.
 
-### Limit multiplier (planned, 1.1)
+### Limit multiplier (1.1)
 
 A positive factor that scales both default sending limits for one
 account (limit key), one domain (exact match) or one relay IP/CIDR. The most
@@ -166,14 +166,14 @@ specific match wins; factors are never combined and there is no "unlimited"
 (a login without a domain), a dotted domain, an IP/CIDR, or `<>` (null
 sender).
 
-### Key store (planned, 1.1)
+### Key store (1.1)
 
 The daemon's bounded set of tracked limit keys (fixed maximum 20000). Only keys whose
 windows have fully expired and that hold no reservation are freed; when the
 store is full a new key is deferred (`key_store_full`; only logged in
 observe mode), so no counted sender regains quota (ADR-0007). The local-cap key is outside it.
 
-### Window state file (planned, 1.1)
+### Window state file (1.1)
 
 `/var/lib/postwarden/limits.json`: the daemon's own snapshot of its
 sending-limit windows, written every minute and on stop, loaded at start, so
