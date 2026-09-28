@@ -125,8 +125,9 @@ Also seen in docs as: "old filters", "pipe filters" (prefer Legacy components).
 ### Recipient refusal
 
 A recipient whose RCPT-stage decision was not `allow`. Counted on the
-end-of-message line by class, `rejected_rcpts` and `deferred_rcpts`, in both
-modes; only `action` (`reject` vs `would_reject`) says whether it was enforced.
+end-of-message line by class: refusals actually sent in `rejected_rcpts` and
+`deferred_rcpts`, observe-mode refusals in `would_rejected_rcpts` and
+`would_deferred_rcpts` (from 1.1).
 
 ### Reply reference
 
@@ -145,15 +146,32 @@ per-message recipient cap (`limits.max_recipients`) and not Postfix's per-IP
 
 What a sending limit counts against: the SASL login for authenticated
 submission, the envelope sender for local mail, the client IP for `mynetworks`
-relays without a login, plus one **host-wide local cap** over all local mail.
+relays without a login, plus one **local cap** over all local mail.
 Untrusted inbound mail has no limit key.
+
+### Local cap (planned, 1.1)
+
+One extra sending-limit counter over all local mail together (`sendmail`,
+unauthenticated SMTP from the server itself), because a script can rotate
+envelope senders. Every local recipient counts toward its sender's key and
+the local cap; the stricter defers. `local_per_hour`/`local_per_day`
+(1000/5000), no multiplier (ADR-0007). Not a limit on all mail of the host.
 
 ### Limit multiplier (planned, 1.1)
 
 A positive factor that scales both default sending limits for one
 account (limit key), one domain (exact match) or one relay IP/CIDR. The most
 specific match wins; factors are never combined and there is no "unlimited"
-(ADR-0007). Not an absolute limit.
+(ADR-0007). Not an absolute limit. Keys: an address (account), `login:NAME`
+(a login without a domain), a dotted domain, an IP/CIDR, or `<>` (null
+sender).
+
+### Key store (planned, 1.1)
+
+The daemon's bounded set of tracked limit keys (fixed maximum 20000). Only keys whose
+windows have fully expired and that hold no reservation are freed; when the
+store is full a new key is deferred (`key_store_full`; only logged in
+observe mode), so no counted sender regains quota (ADR-0007). The local-cap key is outside it.
 
 ### Window state file (planned, 1.1)
 
@@ -161,6 +179,21 @@ specific match wins; factors are never combined and there is no "unlimited"
 sending-limit windows, written every minute and on stop, loaded at start, so
 restarts and reboots do not reset the limits (ADR-0007). Counts never come
 from logs.
+
+### Held local mail (1.1)
+
+Local `sendmail` mail that postwarden deferred at end of message. Postfix
+keeps the original file in `maildrop` and `pickup` resubmits it every 60 s,
+without backoff, bounce or lifetime, until it is accepted; every retry is a
+new decision and log line (ADR-0007). Not the deferred queue: `postqueue`
+tools do not age or expire it.
+
+### Recipients delivered / allowed (`stats`, 1.1)
+
+Two `stats` measures. **Delivered**: recipients postwarden handed on to
+Postfix (`rcpts` minus refusals actually sent), not final delivery, which
+only Postfix logs. **Allowed**: delivered minus observe-mode refusals, what
+enforcement would have let through (ADR-0020).
 
 ### Open message
 

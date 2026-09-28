@@ -21,6 +21,16 @@ carry no such field.
   hand in the foreground (tests, debugging).
 - With `--file`, results come from syslog files and the output says that their
   source cannot be verified.
+- When `journalctl` is missing, the automatic fallback to
+  `/var/log/mail.log*` is labelled the same way; it is never silent.
+- Every `lookup` and `stats` output names its source (trusted journal,
+  journal by tag with `--any-source`, or files) and its verification status.
+- The journal stays the default even where `/var/log/mail.log` exists: it is
+  the unforgeable source, and it is indexed. When `--since` reaches before the
+  journal's oldest entry (a volatile or size-capped journal), `lookup` and
+  `stats` say so in one line, with the journal's start time and a pointer to
+  `--file '/var/log/mail.log*'` as an unverified source. They never switch
+  source by themselves.
 
 ## Consequences
 
@@ -30,4 +40,10 @@ carry no such field.
   instead of a guarantee.
 - A daemon not run by `postwarden.service` is invisible to both commands
   unless `--any-source` is given.
-- Not taken: trusted-only with no fallback; keeping the identifier match.
+- On a host whose journal is volatile or small, older history needs an
+  explicit `--file`; the coverage line makes the gap visible instead of
+  returning silently short totals.
+- Not taken: trusted-only with no fallback; keeping the identifier match;
+  preferring `/var/log/mail.log` when it exists (forgeable, slower, and on
+  the reference production host it kept about 8 days against the journal's
+  4 weeks).

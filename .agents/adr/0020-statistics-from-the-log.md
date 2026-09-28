@@ -27,12 +27,66 @@ mail, `mynetworks` relays; absent for untrusted inbound), so `stats` never
 re-derives keys or their case folding. The daemon keeps no counters and
 exposes no metrics listener.
 
+Measures are named, never raw line counts:
+
+- **messages accepted**: end-of-message lines with `action=accept`;
+- **recipients delivered**: on those lines, `rcpts` minus `rejected_rcpts`
+  and `deferred_rcpts`, which count only refusals actually sent (a
+  two-recipient message with one RCPT refusal adds one). "Delivered" means
+  handed on to Postfix by postwarden; final delivery is Postfix's and is not
+  in postwarden's log. The report legend says so;
+- **recipients allowed**: recipients delivered minus `would_rejected_rcpts`
+  and `would_deferred_rcpts`, the observe-mode refusals (global mode or the
+  sending limits' own mode) that enforcement would have sent; equal to
+  recipients delivered when nothing is observed;
+- **refusals** per rule and reason: `reject`/`defer` decision lines, each a
+  recipient (RCPT stage) or a message (MAIL/EOM stage), reported separately;
+- **observe-mode outcomes** (`would_reject`, `would_defer`) in their own
+  columns, never mixed with real refusals.
+
+A transaction without an end-of-message line (abort, refusal at MAIL)
+contributes only its refusal lines. Held local mail retried by `pickup`
+produces one deferral per retry and is shown as such. The ranking per limit
+key uses recipients delivered; recipients of keys logged with
+`limit_measured=no` (a full key store in observe mode, ADR-0007) are shown in
+their own column; with `limit_measured=off` (limits switched off) senders are
+still ranked and the report says limits were off. Mail without a limit key (untrusted inbound) counts in the
+totals only.
+
+Interface: `postwarden stats [--since -24h] [--file GLOB] [--any-source]
+[--top 20] [--config FILE] [--json]`. The default output is aligned text in
+sections: a header with source, verification status, period and completeness,
+then totals, refusals by rule and reason, and the top senders. `--json` gives
+the same content for monitoring scripts; its field names are a documented
+interface. The ranking shows per key: messages, recipients delivered,
+recipients allowed, sending-limit deferrals, and the key's effective
+`per_hour`/`per_day` from the selected configuration (multiplier applied),
+labelled as such; the counts are labelled totals for the period. A login
+without a domain takes its domain multiplier from each message's envelope
+sender (ADR-0007), so it gets one row per sender domain, each with its own
+effective limits, plus a total row for the login; an account multiplier
+that overrides them gives a single row. `stats`
+makes no claim about remaining quota or peaks: a period total does not show
+how close a rolling window came to its limit, and the configuration in force
+when the lines were written may differ. `stats` reads `config.toml` for this
+(`--config` for another file).
+
+Line format: `stats` reads the 1.1 log format only. 1.0.x was never deployed
+in production, so no older lines need to be recognised or converted.
+
+Time and sources: `--since` applies to the journal only. With `--file`, or
+when `journalctl` is missing and the syslog files are read instead, `stats`
+reports whole-file totals and refuses `--since`. Every report states its
+source and whether it is verified (ADR-0021). Totals are best-effort for the
+period: lines lost to retention, rotation or a `logging.level` above `info`
+cannot be reconstructed. The `event=start` line records `logging_level=`;
+when a start line in the period shows a level above `info`, or none is found,
+the report says so. The current setting alone never marks a period complete.
+
 ## Consequences
 
 - No daemon change, no new network surface, no dependency; counts survive
   daemon restarts because they come from the log.
-- Lines written before `limit_key=` existed are counted in the totals but
-  not ranked.
 - Counts are only as complete as the log: `logging.level` above `info`
   drops decision lines, and log retention bounds the period.
 - Reading the journal needs root or the `adm`/`systemd-journal` group, and
