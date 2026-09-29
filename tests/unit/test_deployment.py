@@ -88,7 +88,8 @@ class EnforcementWithLegacyFilters(unittest.TestCase):
         report = {**self.CLEAN, "daemon_active": True, "socket_present": True, "config": {"valid": True, "mode": "observe"},
                   "findings": [deployment.MACRO_FINDING + "milter_mail_macros lacks {auth_authen}; run configure-postfix to repair",
                                deployment.CHAIN_FINDING + "smtpd_milters; run configure-postfix to repair"]}
-        with mock.patch.object(deployment, "stage_postfix", return_value=(Path("/nonexistent"), [], "")) as stage:
+        with mock.patch.object(deployment, "stage_postfix", return_value=(Path("/nonexistent"), [], "")) as stage, \
+             mock.patch.object(deployment, "snapshot", return_value={}):
             deployment.configure_postfix("observe", report, apply=False, log=lambda m: None)
         stage.assert_called_once()
 

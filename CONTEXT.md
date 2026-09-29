@@ -101,8 +101,10 @@ is on. None bypass protected recipients.
 ### Mode
 
 `observe` logs the decision that would be taken and lets the message continue;
-`enforce` returns the configured SMTP reply. One global daemon setting; from
-1.1 sending limits also have their own mode (`observe`, `enforce`, `off`,
+`enforce` returns the configured SMTP reply. One global daemon setting,
+covering protected recipients, self-sender, sender authentication and the
+resource limits (`[limits]`); self-sender and sender authentication have no
+mode of their own. From 1.1 sending limits also have their own mode (`observe`, `enforce`, `off`,
 default `observe`), and a global `observe` overrides it (ADR-0007).
 
 ### Phase
@@ -183,10 +185,11 @@ from logs.
 ### Held local mail (1.1)
 
 Local `sendmail` mail that postwarden deferred at end of message. Postfix
-keeps the original file in `maildrop` and `pickup` resubmits it every 60 s,
-without backoff, bounce or lifetime, until it is accepted; every retry is a
-new decision and log line (ADR-0007). Not the deferred queue: `postqueue`
-tools do not age or expire it.
+keeps the original file in `maildrop` and `pickup` resubmits it at every scan
+(every 60 s and whenever new local mail is submitted), without backoff, bounce
+or lifetime, until it is accepted; every retry is a new decision and log line
+(ADR-0007). Not the deferred queue: `mailq` lists it, but nothing ages or
+expires it.
 
 ### End-of-message line
 

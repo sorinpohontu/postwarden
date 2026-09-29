@@ -175,6 +175,15 @@ class Lookup(unittest.TestCase):
         self.assertIn("--file '/var/log/mail.log*' (unverified)", err.getvalue())
 
 
+class NegativeSince(unittest.TestCase):
+    def test_relative_since_is_a_value_on_every_python(self):
+        from postwarden.__main__ import _join_negative_values
+        self.assertEqual(_join_negative_values(["lookup", "x", "--since", "-30d", "--file", "f"]),
+                         ["lookup", "x", "--since=-30d", "--file", "f"])
+        self.assertEqual(_join_negative_values(["stats", "--since", "2026-09-01"]), ["stats", "--since", "2026-09-01"])
+        self.assertEqual(_join_negative_values(["stats", "--since", "--json"]), ["stats", "--since", "--json"])
+
+
 class LogSource(unittest.TestCase):
     NOW = 1_800_000_000.0
 
@@ -193,6 +202,90 @@ class LogSource(unittest.TestCase):
         self.assertIsNotNone(coverage_note(journal, self.NOW - 3600, self.NOW))
         self.assertIsNone(coverage_note(Source("files", pattern="/x"), self.NOW, self.NOW))
         self.assertIsNone(coverage_note(journal, None, self.NOW))
+
+
+class Overview(unittest.TestCase):
+    def run_bare(self, *argv, which=None, shown=""):
+        from postwarden import __main__ as cli
+        result = mock.Mock(stdout=shown)
+        with mock.patch("shutil.which", return_value=which), \
+             mock.patch("subprocess.run", return_value=result), \
+             mock.patch.object(cli.socket, "gethostname", return_value="mx1"), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            status = main(list(argv))
+        return status, out.getvalue().splitlines()
+
+    @staticmethod
+    def rows(out):
+        """Box rows as (label, value); a row with an empty label continues the previous one; '---' is a separator."""
+        rows = []
+        for line in out[1:]:
+            if line.startswith("+-"):
+                rows.append(("---", ""))
+            elif line.startswith("| "):
+                label, value = (cell.strip() for cell in line.strip("|").split("|", 1))
+                rows.append((label or rows[-1][0], value))
+            else:
+                break
+        return rows
+
+    def write(self, directory, text):
+        path = os.path.join(directory, "config.toml")
+        Path(path).write_text(text)
+        return path
+
+    def test_bare_call_shows_version_config_modes_service_and_commands(self):
+        from postwarden import __version__
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(directory, BASE_TOML)
+            status, out = self.run_bare("--config", path, which="/bin/systemctl",
+                                        shown="ActiveState=active\nActiveEnterTimestamp=Tue 2026-09-29 11:52:15 EEST\n")
+        self.assertEqual(status, 0)
+        self.assertEqual(self.rows(out), [
+            ("postwarden", f"{__version__} on mx1"), ("Config", path), ("---", ""),
+            ("Mode", "enforce (all rules except sending limits)"),
+            ("Sending limits", "observe; 100/h, 500/day per sender; local 1000/h, 5000/day"), ("Protected", "all@*"), ("Protected", "everyone@*"),
+            ("Protected", "all@example.com"), ("Protected", "everyone@example.com"), ("---", ""),
+            ("Service", "active since Tue 2026-09-29 11:52:15 EEST"), ("---", ""),
+            ("Docs", "/etc/postwarden/docs"), ("Homepage", "https://github.com/sorinpohontu/postwarden"), ("---", "")])
+        self.assertIn("commands", out)
+        self.assertTrue(any(line.startswith("  stats ") for line in out))
+
+    def test_long_protected_list_is_capped_with_a_pointer(self):
+        entries = "".join(f'[protection.addresses."a{n}@example.com"]\nauthorized_logins = []\n' for n in range(7))
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(directory, "schema_version = 1\n" + entries)
+            status, out = self.run_bare("--config", path)
+        protected = [value for label, value in self.rows(out) if label == "Protected"]
+        self.assertEqual(protected, ["a0@example.com", "a1@example.com", "a2@example.com", "a3@example.com",
+                                     f"... and 3 more: postwarden --config {path} show-config"])
+
+    def test_limits_row_lists_only_keys_changed_from_their_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(directory, BASE_TOML + "\n[limits]\nmax_recipients = 500\nmessage_bytes = 41943040\n"
+                                                      "dns_timeout_seconds = 3\n")
+            status, out = self.run_bare("--config", path)
+        self.assertEqual(dict(self.rows(out))["Limits"], "max_recipients 500, dns_timeout_seconds 3")
+
+    def test_sending_limits_show_numbers_and_multipliers_but_not_when_off(self):
+        extra = ('\n[sending_limits]\nper_hour = 50\n[sending_limits.multipliers]\n'
+                 '"marketing@example.com" = 10\n"example.org" = 0.5\n')
+        with tempfile.TemporaryDirectory() as directory:
+            rows = self.rows(self.run_bare("--config", self.write(directory, BASE_TOML + extra))[1])
+            off = self.rows(self.run_bare("--config", self.write(
+                directory, BASE_TOML + extra.replace("per_hour = 50", 'mode = "off"')))[1])
+        self.assertEqual(dict(rows)["Sending limits"], "observe; 50/h, 500/day per sender; local 1000/h, 5000/day")
+        self.assertEqual([value for label, value in rows if label == "Multipliers"],
+                         ["marketing@example.com x10 (500/h, 5000/day)", "example.org x0.5 (25/h, 250/day)"])
+        self.assertEqual(dict(off)["Sending limits"], "off")
+        self.assertNotIn("Multipliers", dict(off))
+
+    def test_missing_config_and_systemctl_are_lines_not_errors(self):
+        status, out = self.run_bare("--config", "/nonexistent/config.toml")
+        rows = dict(self.rows(out))
+        self.assertEqual(status, 0)
+        self.assertTrue(rows["Mode"].startswith("not read: configuration file not found"))
+        self.assertEqual(rows["Service"], "unknown (systemctl not found)")
 
 
 class CheckConfigSummary(unittest.TestCase):

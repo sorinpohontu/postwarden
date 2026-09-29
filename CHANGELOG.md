@@ -7,38 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-29
+
+Sending limits slow down a stolen password or a hacked script; `postwarden stats` shows who sends how much, and `postwarden simulate` tries a decision without sending anything. Upgrading keeps your configuration, and the new limits start in observe mode, so nothing is refused until you enforce them.
+
 ### Added
 
 #### Sending limits
 
-- **Sending limits.** Recipients are counted per login (587/465), per envelope sender of local mail and per `mynetworks` client without a login, over a rolling hour and day, plus one cap over all local mail. Defaults: 100 per hour and 500 per day per sender; 1000 and 5000 for all local mail. Over the limit, SMTP mail is deferred at RCPT with the new `sending_limit` reply (`451 4.7.1 Sending limit exceeded - try again later`); local `sendmail` mail is deferred at end of message and waits in `maildrop`. Outside mail is never limited.
-- **`[sending_limits]` configuration** with its own `mode` (`observe` by default, `enforce`, `off`; the top-level observe mode still wins) and `[sending_limits.multipliers]` for a domain, account, `login:NAME`, client address or network, or `<>`. `check-config` validates them; `show-config` prints the resulting limits. When observed limits and an enforced rule both refuse a message, the enforced refusal is sent.
-- **Sending-limit state file.** Counts are saved to `/var/lib/postwarden/limits.json` every minute and on stop, and restored at start, so restarts and reboots keep them. The start line reports `limit_state=`, `limit_keys=` and `limit_state_age=`; the stop line whether the state was saved. A missing or damaged file starts empty with an `event=limit_state_empty` warning; a failed save logs `event=limit_state_save_failed` and is retried.
-- **Log fields and events.** `limit_key=` and `limit_measured=` on end-of-message lines of limited mail; `rule=sending_limit` with reasons `per_hour`, `per_day`, `local_per_hour`, `local_per_day` and `key_store_full`; `event=limit_reached` and `event=key_store_full` warnings. The start line reports `sending_limits=`, and `check-config` its mode.
-- **`inspect` and `check-config` show Postfix's per-client rate limits**, globally and per SMTP service, and warn when a submission service's recipient rate is below the highest sending limit. `inspect` also reports local mail waiting in `maildrop` and warns at 100 files or a file older than an hour. Warnings, marked `~`, never block the installer.
+- **Recipients per sender are capped** over a rolling hour and a rolling day. A sender is a login (587/465), the envelope sender of local mail, or a `mynetworks` client without a login; all local mail together has one more cap. Outside mail is never limited.
+  - Defaults: 100 per hour and 500 per day per sender; 1000 and 5000 for all local mail.
+  - Over the limit, SMTP mail gets `451 4.7.1 Sending limit exceeded - try again later` (the new `sending_limit` reply) at RCPT, so the sender retries later. Local `sendmail` mail waits in `maildrop` and is retried by Postfix.
+- **Configuration in `[sending_limits]`**, with its own `mode`: `observe` (the default), `enforce` or `off`. A top-level `mode = "observe"` still wins.
+  - `[sending_limits.multipliers]` gives busier senders more: a domain, an account, `login:NAME`, a client address or network, or bounces (`<>`).
+  - `check-config` validates the section and `show-config` prints the resulting limits.
+  - When an observed limit and an enforced rule both refuse a message, the enforced refusal is sent.
+- **Counts survive restarts and reboots.** They are saved to `/var/lib/postwarden/limits.json` every minute and when the service stops, and loaded at start.
+  - A missing or damaged file starts empty, with an `event=limit_state_empty` warning.
+  - A failed save logs `event=limit_state_save_failed` and is retried.
+- **Log fields.** End-of-message lines of limited mail carry `limit_key=` and `limit_measured=`. Refusals use `rule=sending_limit` with the reasons `per_hour`, `per_day`, `local_per_hour`, `local_per_day` and `key_store_full`. New warnings: `event=limit_reached` and `event=key_store_full`. The start line reports `sending_limits=`, `limit_state=`, `limit_keys=` and `limit_state_age=`; the stop line says whether the counts were saved.
+- **Postfix's own rate limits are shown** by `inspect` and `check-config`, globally and per SMTP service, with a warning when a submission service allows fewer recipients than the highest sending limit.
+- **Local mail waiting in `maildrop` is reported** by `inspect`, with a warning at 100 files or a file older than an hour. Warnings are marked `~` and never block the installer.
 
 #### Statistics
 
-- **`postwarden stats`.** Counts postwarden's log lines for a period (journal, default the last 24 hours; or whole syslog files with `--file`): messages accepted, recipients delivered and allowed, refusals by rule and reason, observe-mode outcomes apart, and the top senders by limit key with their `per_hour`/`per_day` from the configuration. `--json` for scripts. Reports name their source and say when the period may be incomplete.
+- **`postwarden stats`** summarises postwarden's log for the last 24 hours (`--since` for another period, `--file` for syslog files):
+  - messages accepted, recipients delivered and allowed, and refusals by rule and reason, with observe-mode results apart;
+  - the busiest senders by limit key, next to their limits from the configuration;
+  - readable tables that leave out empty columns and sections; `--json` for scripts, with the version and host;
+  - the source, the period covered, and a note when lines may be missing.
 
-#### Policy simulation
+#### Trying a decision
 
-- **`postwarden simulate`.** Shows what postwarden would decide for given connection facts (`--ingress`, `--peer`, `--login`, `--from`, `--to`) and an optional message file, with the daemon's own policy code: one line per recipient and the end-of-message outcome, with rule, reason and reply, plus the sending-limit key and limits. SPF and DKIM come from DNS or are forced with `--spf`/`--dkim`. Try a candidate with `--config`; nothing is sent and the running daemon is not affected. Exit status 0 allowed, 1 refused, 2 usage error, 3 RCPT stage only.
+- **`postwarden simulate`** shows what postwarden would decide for a message, with the daemon's own rules: one line per recipient and the end-of-message outcome, with rule, reason and reply, plus the sender's limits.
+  - Give the connection facts (`--ingress`, `--peer`, `--login`, `--from`, `--to`) and, optionally, a message file.
+  - SPF and DKIM come from DNS, or are set with `--spf` and `--dkim`.
+  - `--config` tries a candidate file. Nothing is sent and the running daemon is not affected.
+  - Exit status: 0 allowed, 1 refused, 2 usage error, 3 RCPT stage only.
+
+#### Command line
+
+- **`postwarden` on its own** shows an overview and exits 0: version and host, the configuration file, the global mode (which covers all rules except sending limits), the sending-limit mode and limits, multipliers, `[limits]` values changed from their defaults, the protected addresses, whether the service runs, where the documentation is, and the commands. Long lists stop at five rows and point to `show-config`.
+- **The same header** opens `stats` and `simulate`: version and host, then the configuration file. `postwarden --help` names the documentation too.
+
+#### Installation
+
+- **Manual upgrade steps** in the installation guide, with the way back.
 
 ### Changed
 
 #### Logs and troubleshooting
 
-- **Recipient refusal counts on the end-of-message line.** `rejected_rcpts` and `deferred_rcpts` now count only refusals actually sent. Refusals that observe mode only logged are counted in the new fields `would_rejected_rcpts` and `would_deferred_rcpts`.
-- **Start line.** `event=start` also reports `logging_level=`.
-- **One end-of-message line per message.** Every message that reaches end of message gets exactly one `stage=eom` line with `rcpts=` and, where it has one, `limit_key=`. New: a message that observe mode let through after a refusal at MAIL FROM (`max_open_messages`) gets a `would_defer` end-of-message line; before, it had none.
-- **`lookup` reads only lines written by `postwarden.service`** from the journal, so lines forged with `logger -t postwarden` no longer appear. `--any-source` matches the `postwarden` tag instead, for a daemon started by hand. Output names its source; lines from `--file`, or from `/var/log/mail.log*` when `journalctl` is missing, are labelled unverified. A note says when `--since` reaches before the journal's oldest entry.
+- **`lookup` trusts only the postwarden service.** It reads journal lines written by `postwarden.service`, so lines forged with `logger -t postwarden` no longer appear. `--any-source` matches the `postwarden` tag instead, for a daemon started by hand. The output names its source; lines from `--file`, or from `/var/log/mail.log*` when `journalctl` is missing, are labelled unverified. A note says when `--since` reaches before the journal's oldest entry.
+- **Recipient counts on the end-of-message line** now separate refusals that were sent (`rejected_rcpts`, `deferred_rcpts`) from those observe mode only logged (new `would_rejected_rcpts`, `would_deferred_rcpts`).
+- **Exactly one end-of-message line per message**, with `rcpts=` and, where there is one, `limit_key=`. A message that observe mode let through after a refusal at MAIL FROM (`max_open_messages`) now gets a `would_defer` line; before, it had none.
+- **The start line** also reports `logging_level=`.
 
 ### Fixed
 
 #### Logs and troubleshooting
 
-- **`lookup` message when nothing matches.** It mentions journal permissions only when the journal was read; the searched source is named on the first line.
+- **`--since -30d` on Debian 12.** Python 3.11 read `-30d` as another option, so `lookup` refused the documented example. Relative times now work with `lookup` and `stats` on every supported Python.
+- **`lookup` when nothing matches** mentions journal permissions only when the journal was read.
 
 ## [1.0.1] - 2026-09-25
 

@@ -192,8 +192,7 @@ def render(settings: Settings, facts: Facts, outcome: Outcome, message_name: str
     conn = connection(facts)
     login = f", login {facts.login}" if facts.login else ""
     tls = "" if facts.ingress not in ("587", "465") else (", TLS" if facts.tls else ", no TLS")
-    out = [f"configuration: {settings.source} (mode {settings.mode}); the running daemon is not affected",
-           f"connection: ingress {facts.ingress}, peer {conn.peer_ip}{login}{tls} -> trust {outcome.trust.value}"]
+    out = [f"connection: ingress {facts.ingress}, peer {conn.peer_ip}{login}{tls} -> trust {outcome.trust.value}"]
     if settings.mode != "enforce":
         out.append("note: observe mode: postwarden would only log the refusals below and let the mail through")
     if outcome.limit is None:

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Iterable
 
 from .config import LOGIN_PREFIX, NULL_SENDER_KEY, SendingLimitSettings
+from .textbox import box, header
 
 _PREFIX = re.compile(r"\bpostwarden(?:\[\d+\])?: ")
 _FIELD = re.compile(r'([a-z_]+)=("(?:[^"\\]|\\.)*"|\S*)')
@@ -30,7 +31,9 @@ def parse_line(line: str) -> tuple[str, dict[str, str]] | None:
     fields = {key: _unescape(value) for key, value in _FIELD.findall(line[match.end():].rstrip("\n"))}
     if "action" not in fields and "event" not in fields:
         return None
-    return line[:match.start()].split(" ", 1)[0], fields
+    head = line[:match.start()].split()
+    stamp = " ".join(head[:3]) if head and head[0].isalpha() else (head[0] if head else "")
+    return stamp, fields
 
 
 def _int(fields: dict, name: str) -> int:
@@ -65,6 +68,8 @@ class Tally:
     senders: dict[str, dict[str | None, Counts]] = field(default_factory=dict)
     starts: list[tuple[str, str]] = field(default_factory=list)
     limits_off: bool = False
+    first: str | None = None
+    last: str | None = None
 
     def sender(self, key: str, domain: str | None) -> Counts:
         return self.senders.setdefault(key, {}).setdefault(domain, Counts())
@@ -84,6 +89,8 @@ def tally(lines: Iterable[str]) -> Tally:
             continue
         stamp, fields = parsed
         result.lines += 1
+        result.first = result.first or stamp
+        result.last = stamp
         if fields.get("event") == "start":
             result.starts.append((stamp, fields.get("logging_level", "")))
             continue
@@ -125,8 +132,16 @@ def completeness(result: Tally) -> list[str]:
     """Reasons the period may miss lines; empty only when every start line in it logged at info or below."""
     if not result.starts:
         return ["no daemon start line in the period: the logging level of the earliest lines is unknown"]
-    notes = [f"logging level {level} from {stamp}: decisions below it were not logged"
-             for stamp, level in result.starts if level not in _LEVELS[:2]]
+    notes = []
+    unknown = [stamp for stamp, level in result.starts if not level]
+    if len(unknown) == 1:
+        notes.append(f"start at {unknown[0]} did not log its logging level: decisions may be missing after it")
+    elif unknown:
+        notes.append(f"{len(unknown)} starts between {unknown[0]} and {unknown[-1]} did not log their logging level: "
+                     "decisions may be missing after them")
+    for stamp, level in result.starts:
+        if level and level not in _LEVELS[:2]:
+            notes.append(f"logging level {level} from {stamp}: decisions below it were not logged")
     return notes
 
 
@@ -196,40 +211,52 @@ def report(result: Tally, limits: SendingLimitSettings, *, source: dict, config:
     }
 
 
-def _table(headers: list[str], rows: list[list], indent: str = "  ") -> list[str]:
-    cells = [headers] + [["-" if v is None else str(v) for v in row] for row in rows]
-    widths = [max(len(row[i]) for row in cells) for i in range(len(headers))]
-    right = [i > 0 and all(c[i].isdigit() or c[i] == "-" for c in cells[1:]) for i in range(len(headers))]
-    return [indent + "  ".join(c.rjust(w) if r else c.ljust(w) for c, w, r in zip(row, widths, right)).rstrip()
-            for row in cells]
+def _limit(per_hour: int | None, per_day: int | None) -> str | None:
+    return None if per_hour is None else f"{per_hour}/{per_day}"
 
 
-def render(data: dict) -> list[str]:
-    source = data["source"]
-    out = [f"source: {source['description']}", f"configuration for limits: {data['config']}"]
+def render(data: dict, period: tuple[str | None, str | None] = (None, None)) -> list[str]:
+    source, t = data["source"], data["totals"]
+    first, last = period
+    span = "no postwarden lines" if first is None else f"{first} to {last}"
+    out = header(data.get("version", "-"), data.get("host", "-"), data["config"],
+                 [[["Source", source["description"]], ["Period", span],
+                   ["Complete", "yes" if data["complete"] else "no, see the notes below"]]])
     out += [f"note: {note}" for note in data["notes"]]
-    out.append("totals are best-effort for the period" + ("" if data["complete"] else " and may be incomplete"))
-    t = data["totals"]
-    out += ["", "Totals",
-            f"  messages accepted     {t['messages']}",
-            f"  recipients delivered  {t['delivered']}   (handed on to Postfix; final delivery is in Postfix's log)",
-            f"  recipients allowed    {t['allowed']}   (delivered minus observe-mode refusals)"]
+    show_allowed = t["allowed"] != t["delivered"]
+    totals = [["messages accepted", t["messages"]], ["recipients delivered", t["delivered"]]]
+    if show_allowed:
+        totals.append(["recipients allowed", t["allowed"]])
     if t["unmeasured"]:
-        out.append(f"  not measured          {t['unmeasured']}   (full key store in observe mode)")
-    for title, key in (("Refusals sent", "refusals"), ("Observe mode: refusals not sent", "observed")):
-        out += ["", title]
-        rows = [[r["action"], r["rule"], r["reason"], r["scope"], r["count"]] for r in data[key]]
-        out += _table(["action", "rule", "reason", "per", "count"], rows) if rows else ["  none"]
-    out += ["", f"Senders by recipients delivered (top {len(data['senders'])} of {data['senders_total']}; "
-                "period totals; limits from the configuration above)"]
-    rows = []
+        totals.append(["not measured", t["unmeasured"]])
+    out += ["", "Totals"] + box(["measure", "count"], totals)
+
+    headers = ["action", "rule", "reason", "per", "count"]
+    out += ["", "Refusals sent"]
+    rows = [[r["action"], r["rule"], r["reason"], r["scope"], r["count"]] for r in data["refusals"]]
+    out += box(headers, rows) if rows else ["none"]
+    if data["observed"]:
+        rows = [[r["action"], r["rule"], r["reason"], r["scope"], r["count"]] for r in data["observed"]]
+        out += ["", "Observe mode: refusals not sent"] + box(headers, rows)
+
+    out += ["", f"Senders by recipients delivered (top {len(data['senders'])} of {data['senders_total']})"]
+    entries = []
     for s in data["senders"]:
-        rows.append([s["limit_key"], s["messages"], s["delivered"], s["allowed"], s["unmeasured"],
-                     s["limit_deferred"], s["limit_would_defer"], s["per_hour"], s["per_day"]])
-        for d in s.get("by_sender_domain", []):
-            rows.append([f"  from {d['sender_domain'] or '<unknown>'}", d["messages"], d["delivered"], d["allowed"],
-                         d["unmeasured"], d["limit_deferred"], d["limit_would_defer"], d["per_hour"], d["per_day"]])
-    headers = ["limit key", "messages", "delivered", "allowed", "unmeasured", "limit deferred", "would defer",
-               "per_hour", "per_day"]
-    out += _table(headers, rows) if rows else ["  none"]
+        entries.append((s["limit_key"], s))
+        entries += [(f"  from {d['sender_domain'] or '<unknown>'}", d) for d in s.get("by_sender_domain", [])]
+    optional = [("allowed", "allowed", show_allowed)]
+    optional += [(name, key, any(e[key] for _, e in entries)) for name, key in
+                 (("unmeasured", "unmeasured"), ("limit deferred", "limit_deferred"),
+                  ("would defer", "limit_would_defer"))]
+    shown = [(name, key) for name, key, visible in optional if visible]
+    headers = ["limit key", "messages", "delivered"] + [name for name, _ in shown] + ["limit h/d"]
+    rows = [[label, e["messages"], e["delivered"], *(e[key] for _, key in shown), _limit(e["per_hour"], e["per_day"])]
+            for label, e in entries]
+    out += box(headers, rows) if rows else ["none"]
+
+    out += ["", "Counts are totals for the period; delivered means handed on to Postfix."]
+    if not show_allowed:
+        out.append("Recipients allowed equal delivered: no observe-mode refusals.")
+    out.append("Columns that are 0 for every sender are left out.")
+    out.append("Measures: Statistics in /etc/postwarden/docs/Operations.md; --json for every field.")
     return out

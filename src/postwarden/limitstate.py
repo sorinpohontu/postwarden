@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import threading
 import time
@@ -14,6 +15,7 @@ from .quota import QuotaStore, StateError
 STATE_FILE = "/var/lib/postwarden/limits.json"
 MAX_STATE_BYTES = 64 * 1024 * 1024
 SAVE_INTERVAL = 60
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,7 +86,10 @@ def save(store: QuotaStore, path: str = STATE_FILE, now: float | None = None) ->
 
 
 class Saver:
-    """Saves the store every interval until stopped; a failure is reported and retried at the next interval."""
+    """Saves the store every interval until stopped; a failure is reported and retried at the next interval.
+
+    The thread starts before libmilter, so it blocks the stop signals itself: libmilter receives them in its own
+    signal thread, and an unblocked thread would let the default action end the process without the final save."""
 
     def __init__(self, store: QuotaStore, on_failure: Callable[[str, int | None], None], path: str = STATE_FILE,
                  interval: float = SAVE_INTERVAL, last_saved: float | None = None) -> None:
@@ -119,5 +124,6 @@ class Saver:
         return self.save_now()
 
     def _run(self) -> None:
+        signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
         while not self._stop.wait(self.interval):
             self.save_now()

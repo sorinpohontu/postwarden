@@ -8,16 +8,17 @@ import socket
 import sys
 import time
 
-from . import DEFAULT_CONFIG_PATH, __version__
-from .config import ConfigError, Settings, describe, load_settings
+from . import DEFAULT_CONFIG_PATH, HOMEPAGE, __version__
+from .config import ConfigError, LimitSettings, Settings, describe, load_settings
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="postwarden", description="Postfix policy milter")
+    parser = argparse.ArgumentParser(prog="postwarden", description="Postfix policy milter",
+                                     epilog=f"Documentation: /etc/postwarden/docs and {HOMEPAGE}")
     parser.add_argument("--version", action="version", version=f"postwarden {__version__}")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH,
                         help=f"configuration file (default: {DEFAULT_CONFIG_PATH})")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
     sub.add_parser("check-config", help="validate the configuration file and report every problem")
     show = sub.add_parser("show-config", help="print the effective configuration")
     show.add_argument("--json", action="store_true", help="machine-readable output")
@@ -84,6 +85,40 @@ def _protection_summary(settings: Settings) -> str:
     if groups:
         parts.append(f"{groups} protected group{'' if groups == 1 else 's'}")
     return ", ".join(parts)
+
+
+MODE_SCOPE = "all rules except sending limits"
+
+
+LISTED = 5
+
+
+def _listed(label: str, items: list[str], empty: str | None, config: str) -> list[list[str]]:
+    """One row per item under one label, at most LISTED rows, the last pointing to show-config."""
+    shown = items if len(items) <= LISTED else items[:LISTED - 1]
+    if len(shown) < len(items):
+        option = "" if config == DEFAULT_CONFIG_PATH else f"--config {config} "
+        shown.append(f"... and {len(items) - len(shown)} more: postwarden {option}show-config")
+    return [[label if i == 0 else "", text] for i, text in enumerate(shown or ([empty] if empty else []))]
+
+
+def _mode_rows(settings: Settings, config: str) -> list[list[str]]:
+    limits = settings.sending_limits
+    sending = limits.mode
+    multipliers: list[str] = []
+    if limits.mode != "off":
+        sending += (f"; {limits.per_hour}/h, {limits.per_day}/day per sender; "
+                    f"local {limits.local_per_hour}/h, {limits.local_per_day}/day")
+        for key, factor in limits.entries():
+            per_hour, per_day = limits.scaled(factor)
+            multipliers.append(f"{key} x{factor:g} ({per_hour}/h, {per_day}/day)")
+    defaults = LimitSettings()
+    changed = [f"{f.name} {getattr(settings.limits, f.name):g}" for f in dataclasses.fields(LimitSettings)
+               if getattr(settings.limits, f.name) != getattr(defaults, f.name)]
+    custom = [["Limits", ", ".join(changed)]] if changed else []
+    return [["Mode", f"{settings.mode} ({MODE_SCOPE})"], ["Sending limits", sending],
+            *_listed("Multipliers", multipliers, None, config), *custom,
+            *_listed("Protected", list(settings.protection.addresses), "none", config)]
 
 
 def cmd_check_config(args: argparse.Namespace) -> int:
@@ -230,10 +265,11 @@ def cmd_stats(args: argparse.Namespace) -> int:
     except (SourceError, OSError) as exc:
         print(exc, file=sys.stderr)
         return 2
-    data = report(result, limits, top=args.top, config=args.config, notes=notes,
-                  source={"kind": source.kind, "description": source.describe(), "verified": source.verified,
-                          "since": source.since, "pattern": source.pattern})
-    print(json.dumps(data, indent=2) if args.json else "\n".join(render(data)))
+    data = {"version": __version__, "host": socket.gethostname(),
+            **report(result, limits, top=args.top, config=args.config, notes=notes,
+                     source={"kind": source.kind, "description": source.describe(), "verified": source.verified,
+                             "since": source.since, "pattern": source.pattern})}
+    print(json.dumps(data, indent=2) if args.json else "\n".join(render(data, (result.first, result.last))))
     return 0
 
 
@@ -274,7 +310,10 @@ def cmd_simulate(args: argparse.Namespace) -> int:
         print(f"SPF/DKIM from DNS needs the Debian packages python3-spf, python3-dkim and python3-dnspython ({exc}); "
               "or give --spf and --dkim", file=sys.stderr)
         return 2
-    print("\n".join(render(resolved, facts, outcome, args.message)))
+    from .textbox import header
+    about = header(__version__, socket.gethostname(), args.config,
+                   [_mode_rows(resolved, args.config), [["Daemon", "not affected; nothing is sent"]]])
+    print("\n".join(about + [""] + render(resolved, facts, outcome, args.message)))
     if note.startswith("Postfix settings not read"):
         print(f"note: {note}; mynetworks and recipient_delimiter are empty", file=sys.stderr)
     return outcome.exit_code
@@ -314,8 +353,59 @@ def cmd_wait_ready(args: argparse.Namespace) -> int:
         time.sleep(0.2)
 
 
+def _service_state() -> str:
+    import shutil
+    import subprocess
+    if not shutil.which("systemctl"):
+        return "unknown (systemctl not found)"
+    try:
+        shown = subprocess.run(["systemctl", "show", "postwarden.service", "-p", "ActiveState",
+                                "-p", "ActiveEnterTimestamp"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"unknown ({exc})"
+    values = dict(line.partition("=")[::2] for line in shown.stdout.splitlines())
+    state = values.get("ActiveState") or "unknown"
+    since = values.get("ActiveEnterTimestamp")
+    return f"{state} since {since}" if state == "active" and since else state
+
+
+def cmd_overview(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """A bare `postwarden`: version, host, configuration, service state and the commands."""
+    from .textbox import header
+    try:
+        settings = load_settings(args.config)
+        rows = _mode_rows(settings, args.config)
+    except ConfigError as exc:
+        rows = [["Mode", "not read: " + exc.errors[0].removeprefix(f"{args.config}: ")
+                 if len(exc.errors) == 1 and "not found" in exc.errors[0]
+                 else f"not read: {len(exc.errors)} problem(s); run postwarden check-config"]]
+    out = header(__version__, socket.gethostname(), args.config,
+                 [rows, [["Service", _service_state()]], [["Docs", "/etc/postwarden/docs"], ["Homepage", HOMEPAGE]]])
+    out += ["", "commands"]
+    commands = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))._choices_actions
+    width = max(len(c.dest) for c in commands)
+    out += [f"  {c.dest.ljust(width)}  {c.help}" for c in commands]
+    out += ["", "postwarden COMMAND --help for details"]
+    print("\n".join(out))
+    return 0
+
+
+def _join_negative_values(argv: list[str]) -> list[str]:
+    """`--since -7d` as `--since=-7d`: Python 3.11's argparse reads a value starting with '-' as an option."""
+    joined: list[str] = []
+    for arg in argv:
+        if joined and joined[-1] == "--since" and arg[:1] == "-" and arg[1:2].isdigit():
+            joined[-1] = f"--since={arg}"
+        else:
+            joined.append(arg)
+    return joined
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(_join_negative_values(sys.argv[1:] if argv is None else argv))
+    if args.command is None:
+        return cmd_overview(parser, args)
     handler = {"check-config": cmd_check_config, "show-config": cmd_show_config, "run": cmd_run,
                "lookup": cmd_lookup, "stats": cmd_stats, "simulate": cmd_simulate,
                "wait-ready": cmd_wait_ready}[args.command]

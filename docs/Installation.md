@@ -4,6 +4,16 @@ There are two equivalent ways to install postwarden: the **automated installer**
 
 In both, postwarden starts in **observe** mode: it logs what it would refuse and lets all mail through. Switch to **enforce** mode once the log looks right.
 
+The steps at a glance:
+
+1. Check the requirements and download the release.
+2. Create `/etc/postwarden/config.toml` with your protected addresses.
+3. Install the daemon; Postfix is not touched yet.
+4. Attach it to Postfix in observe mode and watch the log for a while (`journalctl -t postwarden -f`, `postwarden stats`).
+5. Switch to enforce mode.
+
+Every step can be undone: see [Rollback](#rollback). Upgrading later is one command: see [Upgrades](#upgrades).
+
 ## Requirements
 
 - Debian 12 (bookworm) or 13 (trixie), Postfix 3.7 or newer, systemd.
@@ -58,7 +68,7 @@ python3 scripts/install.py configure-postfix --phase observe --dry-run
 python3 scripts/install.py configure-postfix --phase observe --apply
 ```
 
-**5. Switch to enforce mode** after reviewing the log (`journalctl -t postwarden`):
+**5. Switch to enforce mode** after reviewing the log (`journalctl -t postwarden`, `postwarden stats`):
 
 ```sh
 python3 scripts/install.py configure-postfix --phase enforce --dry-run
@@ -90,7 +100,7 @@ python3 scripts/install.py install --dry-run
 python3 scripts/install.py install --apply
 ```
 
-The previous application is kept in the deployment backup, the new one is copied in and the daemon restarted. `config.toml` is never overwritten, unless you pass `--import-config <file>`.
+The previous application is kept in the deployment backup, the new one is copied in and the daemon restarted. `config.toml` is never overwritten, unless you pass `--import-config <file>`. Without the installer, see [Manual upgrade](#9-manual-upgrade).
 
 ### Rollback
 
@@ -103,7 +113,7 @@ Roll back in reverse order: the `configure-postfix` deployments first, then `ins
 
 ## Manual installation
 
-Run as root. Keep the unpacked release from [Get the release](#get-the-release) at hand.
+The same result without the installer, for administrators who want to see or adapt every change. Run as root, and keep the unpacked release from [Get the release](#get-the-release) at hand.
 
 ### 1. Packages
 
@@ -235,3 +245,31 @@ systemctl disable --now postwarden
 ```
 
 Both counts must be `0`. The files under `/etc/postwarden/` can stay.
+
+### 9. Manual upgrade
+
+Keep a copy of the current installation, replace the application files (so modules removed in the new release do not linger), then reinstall the launcher and unit and restart. `config.toml` is not part of the archive and stays as it is.
+
+```sh
+cp -a /etc/postwarden /root/postwarden-before-upgrade
+cd /etc/postwarden
+rm -rf src bin scripts packaging etc docs README.md CHANGELOG.md LICENSE pyproject.toml MANIFEST.sha256
+tar -xzf /root/postwarden-<version>.tar.gz -C /etc/postwarden
+install -m 0755 bin/postwarden /usr/local/sbin/postwarden
+install -m 0644 packaging/systemd/postwarden.service /etc/systemd/system/
+postwarden check-config
+systemctl daemon-reload && systemctl restart postwarden
+postwarden --version
+journalctl -t postwarden -n 5
+```
+
+The Postfix settings are unchanged. Read the new release's `CHANGELOG.md` for new configuration keys; defaults apply to keys you do not set.
+
+To go back, restore the copy the same way:
+
+```sh
+rm -rf /etc/postwarden && cp -a /root/postwarden-before-upgrade /etc/postwarden
+install -m 0755 /etc/postwarden/bin/postwarden /usr/local/sbin/postwarden
+install -m 0644 /etc/postwarden/packaging/systemd/postwarden.service /etc/systemd/system/
+systemctl daemon-reload && systemctl restart postwarden
+```

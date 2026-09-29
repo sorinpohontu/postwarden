@@ -166,5 +166,26 @@ class PeriodicSave(unittest.TestCase):
             self.assertTrue(saver.stop())
 
 
+class StopSignals(unittest.TestCase):
+    def test_saver_thread_never_receives_the_stop_signals(self):
+        import signal
+        seen = []
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        original = limitstate.save
+
+        def recording(*args, **kwargs):
+            seen.append(signal.pthread_sigmask(signal.SIG_BLOCK, []))
+            return original(*args, **kwargs)
+        with unittest.mock.patch.object(limitstate, "save", recording):
+            saver = limitstate.Saver(store(), lambda *a: None, os.path.join(directory.name, "limits.json"), interval=0.01)
+            saver.start()
+            deadline = threading.Event()
+            while not seen and not deadline.wait(0.01):
+                pass
+            saver.stop()
+        self.assertTrue({signal.SIGTERM, signal.SIGINT, signal.SIGHUP} <= seen[0])
+
+
 if __name__ == "__main__":
     unittest.main()

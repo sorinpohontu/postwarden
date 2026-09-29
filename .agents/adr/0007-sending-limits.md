@@ -102,7 +102,8 @@ internal application relaying from a fixed address.
   proceed. Local pickup: accumulated and returned at
   end of message, like other non-SMTP decisions. Verified on Debian 12 and
   13 (2026-09-25): Postfix keeps the original file in `maildrop`, `pickup`
-  retries it every 60 s with a fresh `cleanup` pass, no backoff, no bounce
+  retries it at every scan (every 60 s, and whenever new local mail is
+  submitted: verified 2026-09-29 on Debian 12) with a fresh `cleanup` pass, no backoff, no bounce
   and no queue lifetime, so the message is delivered once the window allows.
   Every retry is a full decision and one log line. `inspect` reports the
   number and oldest age of files in `maildrop`, with a finding at 100 files
@@ -200,9 +201,17 @@ per_day = 500
   sender, which the client chooses. Where Postfix does not enforce sender
   ownership (`reject_sender_login_mismatch` with `smtpd_sender_login_maps`), a
   stolen short login can pick a sender domain with a larger multiplier.
-- A flood of local mail held in `maildrop` is re-checked every minute: a
-  script that drops 10,000 messages causes 10,000 decisions and log lines per
-  minute until its windows allow them. Accepted for complete logs; the
+- A flood of local mail held in `maildrop` is re-checked at every `pickup`
+  scan, and every new submission starts another scan. Measured on Debian 12
+  (2026-09-29, 250 held files, 250 submissions in 10 s): after a first burst,
+  about one decision per second whatever the number of held files, consistent
+  with Postfix's `in_flow_delay` (1 s) pausing `pickup` while retries keep the
+  queue manager idle. So a flood costs at most about 3,600 decisions and 7,200
+  log lines an hour, and delays new local mail (and possibly SMTP intake, by
+  up to `in_flow_delay` per message) until the windows allow the held mail or
+  the operator removes it. Every retry stays an `info` line; a per-key
+  summary of repeated deferrals was designed and not built, as the measured
+  volume did not justify it. Accepted for complete logs; the
   operator removes the backlog.
 - A local message with more recipients than its sender's limit, or the local
   cap, can never pass and is held until the operator raises the limit with a

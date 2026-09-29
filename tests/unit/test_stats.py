@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "stubs"))
 
 import Milter  # noqa: E402  (stub)
 
-from postwarden import milter  # noqa: E402
+from postwarden import __version__, milter  # noqa: E402
 from postwarden.__main__ import main  # noqa: E402
 from postwarden.logging import format_event  # noqa: E402
 from postwarden.policy import AuthStatus, AuthenticationInput, DkimOutcome, SpfOutcome  # noqa: E402
@@ -212,6 +212,60 @@ class ObservedRefusalAtMail(unittest.TestCase):
                                 top=20, notes=[])["observed"][0]["count"], 1)
 
 
+class Text(unittest.TestCase):
+    """Boxed tables; columns and sections that carry nothing are left out."""
+
+    def lines(self, traffic):
+        result = tally(traffic.log.lines)
+        data = report(result, settings(LIMITS + MULTIPLIERS).sending_limits, source={"description": "test"},
+                      config="test.toml", top=20, notes=[])
+        return render(data, (result.first, result.last))
+
+    def section(self, out, title):
+        start = out.index(title) + 1
+        end = next((i for i in range(start, len(out)) if not out[i]), len(out))
+        return out[start:end]
+
+    def test_enforce_period_hides_allowed_observe_and_zero_columns(self):
+        traffic = Traffic(self)
+        traffic.send("demo@example.com", ["a@example.net"], login="demo@example.com")
+        out = self.lines(traffic)
+        self.assertEqual(out[0][0], "+")
+        self.assertIn("| Period     | 2026-09-28T09:00:00+0200 to 2026-09-28T10:00:00+0200 |", out)
+        self.assertEqual(self.section(out, "Totals"), [
+            "+----------------------+-------+", "| measure              | count |", "+----------------------+-------+",
+            "| messages accepted    |     1 |", "| recipients delivered |     1 |", "+----------------------+-------+"])
+        self.assertEqual(self.section(out, "Refusals sent"), ["none"])
+        self.assertNotIn("Observe mode: refusals not sent", out)
+        senders = self.section(out, "Senders by recipients delivered (top 1 of 1)")
+        self.assertEqual(senders[1], "| limit key        | messages | delivered | limit h/d |")
+        self.assertEqual(senders[3], "| demo@example.com |        1 |         1 |      6/30 |")
+        self.assertIn("Recipients allowed equal delivered: no observe-mode refusals.", out)
+
+    def test_observe_period_shows_allowed_and_the_observed_refusals(self):
+        traffic = Traffic(self, mode="observe", extra=LIMITS.replace("enforce", "observe"))
+        traffic.send("demo@example.com", ["a@example.net", "b@example.net", "c@example.net"], login="demo@example.com")
+        out = self.lines(traffic)
+        self.assertIn("| recipients allowed   |     2 |", self.section(out, "Totals"))
+        observed = self.section(out, "Observe mode: refusals not sent")
+        self.assertIn("| would_defer | sending_limit | per_hour | recipient |     1 |", observed)
+        senders = self.section(out, "Senders by recipients delivered (top 1 of 1)")
+        self.assertEqual(senders[1], "| limit key        | messages | delivered | allowed | would defer | limit h/d |")
+        self.assertEqual(senders[3], "| demo@example.com |        1 |         3 |       2 |           1 |      6/30 |")
+        self.assertNotIn("Recipients allowed equal delivered: no observe-mode refusals.", out)
+
+    def test_header_names_version_and_host_when_given(self):
+        traffic = Traffic(self)
+        result = tally(traffic.log.lines)
+        data = {"version": "9.9", "host": "mx1", **report(result, settings().sending_limits, source={"description": "t"},
+                                                        config="c", top=20, notes=[])}
+        self.assertTrue(render(data, (result.first, result.last))[1].startswith("| postwarden | 9.9 on mx1  "))
+
+    def test_syslog_file_timestamps_keep_date_and_time(self):
+        line = "Sep 29 11:37:13 vstore postwarden[1]: event=start logging_level=info\n"
+        self.assertEqual(parse_line(line)[0], "Sep 29 11:37:13")
+
+
 class Completeness(unittest.TestCase):
     def test_level_above_info_or_missing_start_line_is_reported(self):
         traffic = Traffic(self, level="warning")
@@ -220,6 +274,15 @@ class Completeness(unittest.TestCase):
         self.assertFalse(report(tally([]), settings().sending_limits, source={"description": "t"}, config="c",
                                 top=20, notes=[])["complete"])
         self.assertTrue(build(Traffic(self))["complete"])
+        unknown = report(tally(["2026-09-28T09:00:00+0200 h postwarden[1]: event=start mode=enforce\n"]),
+                         settings().sending_limits, source={"description": "t"}, config="c", top=20, notes=[])
+        self.assertEqual(unknown["notes"], ["start at 2026-09-28T09:00:00+0200 did not log its logging level: "
+                                            "decisions may be missing after it"])
+        two = report(tally(["2026-09-28T09:00:00+0200 h postwarden[1]: event=start mode=enforce\n",
+                            "2026-09-28T10:00:00+0200 h postwarden[2]: event=start mode=enforce\n"]),
+                     settings().sending_limits, source={"description": "t"}, config="c", top=20, notes=[])
+        self.assertEqual(two["notes"], ["2 starts between 2026-09-28T09:00:00+0200 and 2026-09-28T10:00:00+0200 did "
+                                        "not log their logging level: decisions may be missing after them"])
 
 
 class Command(unittest.TestCase):
@@ -251,7 +314,8 @@ class Command(unittest.TestCase):
         self.assertIn("whole-file totals: --since does not apply to files", data["notes"])
         self.assertEqual(data["totals"]["delivered"], 501)
         status, out, _ = self.run_stats("--file", path)
-        self.assertIn("unverified", out.splitlines()[0])
+        self.assertIn("| Source     | files /", out)
+        self.assertIn("(unverified:", out.splitlines()[4])
 
     def test_since_is_refused_with_files(self):
         status, _, err = self.run_stats("--file", "/nonexistent", "--since", "-1h")
@@ -269,7 +333,16 @@ class Command(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn("_SYSTEMD_UNIT=postwarden.service", argv)
         self.assertEqual(argv[-2:], ["--since", "-24h"])
-        self.assertIn("(verified)", out.splitlines()[0])
+        self.assertIn("(verified)", out.splitlines()[4])
+        self.assertTrue(out.splitlines()[1].startswith("| postwarden | "))
+        self.assertIn("| Period     | no postwarden lines", out)
+
+    def test_json_carries_version_and_host(self):
+        path = os.path.join(self.dir, "mail.log")
+        open(path, "w").close()
+        data = json.loads(self.run_stats("--file", path, "--json")[1])
+        self.assertEqual(data["version"], __version__)
+        self.assertTrue(data["host"])
 
 
 if __name__ == "__main__":

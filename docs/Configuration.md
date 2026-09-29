@@ -10,6 +10,21 @@ systemctl restart postwarden     # applies changes
 
 Unknown keys, wrong types and inconsistent values are errors. Run `check-config` before restarting: a restart with a broken file leaves postwarden stopped (see [Operations](Operations.md#changing-the-configuration)).
 
+## Common tasks
+
+| I want to…                                          | Do this                                                                                            |
+| --------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| let only certain users send to `all@example.com`    | list their logins under [`[protection.addresses."all@example.com"]`](#protection)                  |
+| close `all@` on every domain hosted here            | add a [protected group](#protection) `"all@*"` with no logins                                      |
+| accept forwarded or unsigned outside mail           | set `require = "either"` in [`[sender_authentication]`](#sender_authentication)                    |
+| let a trusted script or address send as a recipient | add it to `allow_senders` in [`[self_sender]`](#self_sender)                                       |
+| give a busy sender more than 100 recipients an hour | add a [multiplier](#sending_limitsmultipliers), for example `"newsletter@example.com" = 10`        |
+| start refusing senders over their limit             | set `mode = "enforce"` in [`[sending_limits]`](#sending_limits), after checking `postwarden stats` |
+| reword a reply                                      | add a [`[responses.<rule>]`](#responsesrule) section                                               |
+| see more detail in the log                          | set `level = "debug"` in [`[logging]`](#logging)                                                   |
+
+After every change: `postwarden check-config`, then `systemctl restart postwarden`.
+
 ## Top level
 
 | Key              | Default     | Meaning                                                                                      |
@@ -187,19 +202,23 @@ The group `all@*` must protect `all@` on the domains this server hosts, but not 
 
 ## `[limits]`
 
-| Key                               | Default    | Meaning                                                                                                                                                                                                                                                            |
-| --------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `message_bytes`                   | `41943040` | larger messages are deferred                                                                                                                                                                                                                                       |
-| `max_signatures`                  | `10`       | DKIM signatures checked per message                                                                                                                                                                                                                                |
-| `max_headers`                     | `1000`     | header fields per message                                                                                                                                                                                                                                          |
-| `max_header_bytes`                | `65536`    | total header size                                                                                                                                                                                                                                                  |
-| `max_recipients`                  | `1000`     | further recipients are deferred                                                                                                                                                                                                                                    |
-| `dns_timeout_seconds`             | `5`        | per DNS query                                                                                                                                                                                                                                                      |
-| `authentication_deadline_seconds` | `20`       | total SPF and DKIM time per message; at least `dns_timeout_seconds`. Results that arrive later are discarded and the message is deferred; a DKIM check already running is not interrupted. Keep Postfix's `content_timeout` (60 s in `postwarden_milter`) above it |
-| `max_concurrent_messages`         | `32`       | SPF/DKIM checks running at once; others wait within the deadline, then are deferred                                                                                                                                                                                |
-| `max_open_messages`               | `100`      | messages being received at once; above it `MAIL FROM` is deferred (local `sendmail`: at end of message). Spool use stays below this × `message_bytes`                                                                                                              |
+| Key                               | Default    | Meaning                                                                                                 |
+| --------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------- |
+| `message_bytes`                   | `41943040` | larger messages are deferred                                                                            |
+| `max_signatures`                  | `10`       | DKIM signatures checked per message                                                                     |
+| `max_headers`                     | `1000`     | header fields per message                                                                               |
+| `max_header_bytes`                | `65536`    | total header size                                                                                       |
+| `max_recipients`                  | `1000`     | further recipients are deferred                                                                         |
+| `dns_timeout_seconds`             | `5`        | per DNS query                                                                                           |
+| `authentication_deadline_seconds` | `20`       | total SPF and DKIM time per message; at least `dns_timeout_seconds` (see below)                         |
+| `max_concurrent_messages`         | `32`       | SPF/DKIM checks running at once; others wait within the deadline, then are deferred                     |
+| `max_open_messages`               | `100`      | messages being received at once; above it `MAIL FROM` is deferred (local `sendmail`: at end of message) |
 
-Every limit defers, so senders retry and nothing is lost. Postfix's own `message_size_limit` (about 10 MB by default) usually refuses large mail before postwarden sees it.
+Every limit defers, so senders retry and nothing is lost.
+
+- **Authentication deadline.** Results that arrive after it are discarded and the message is deferred; a DKIM check already running is not interrupted. Keep Postfix's `content_timeout` (60 s in `postwarden_milter`) above it.
+- **Spool use** stays below `max_open_messages` × `message_bytes`.
+- **Large mail.** Postfix's own `message_size_limit` (about 10 MB by default) usually refuses it before postwarden sees it.
 
 ## `[sending_limits]`
 
@@ -226,7 +245,7 @@ What each message counts against, its **limit key**:
 
 Local mail also counts toward the **local cap** (`local_per_hour`, `local_per_day`), one extra counter over all local mail, because a script can change its envelope sender for every message. The stricter of the two limits applies.
 
-Over a limit, postwarden answers `451 4.7.1` from the first recipient over it; earlier recipients of the same message go through, and the client retries the rest later. For local `sendmail`, the whole message is deferred at end of message: Postfix keeps it in `maildrop` and retries every minute until the limits allow all its recipients. A local message with more recipients than its limit can never pass; raise that sender's limit with a multiplier.
+Over a limit, postwarden answers `451 4.7.1` from the first recipient over it; earlier recipients of the same message go through, and the client retries the rest later. For local `sendmail`, the whole message is deferred at end of message: Postfix keeps it in `maildrop` and retries it at every `pickup` scan (every minute, and whenever new local mail is submitted) until the limits allow all its recipients. A local message with more recipients than its limit can never pass; raise that sender's limit with a multiplier.
 
 Recipients refused by any rule, and messages refused at end of message, do not count. Postfix's own per-client rate limits (`smtpd_client_recipient_rate_limit` and related settings) are independent: both apply, and recipients Postfix refuses never reach postwarden. `check-config` and `install.py inspect` show their values, globally and per SMTP service, and warn when a submission service's recipient rate, converted to an hour, is below the highest per-sender hourly limit (`per_hour` × the largest multiplier): that login would be stopped by Postfix first when it sends from one address. The warning never blocks anything, and the installer never changes these settings.
 

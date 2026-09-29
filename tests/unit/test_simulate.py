@@ -185,7 +185,13 @@ class Command(unittest.TestCase):
         status, out, _ = self.run_cli(*base, "--to", "carol@example.com")
         self.assertEqual(status, 3)
         self.assertIn("RCPT stage only", out)
-        self.assertIn(f"configuration: {self.config} (mode enforce)", out)
+        rows = {c[0].strip(): c[1].strip() for c in (l.strip("|").split("|", 1) for l in out.splitlines()
+                                                         if l.startswith("| ")) if c[0].strip()}
+        self.assertEqual((rows["Config"], rows["Sending limits"], rows["Daemon"]),
+                         (self.config, "observe; 100/h, 500/day per sender; local 1000/h, 5000/day",
+                          "not affected; nothing is sent"))
+        self.assertEqual(rows["Mode"], "enforce (all rules except sending limits)")
+        self.assertTrue(out.splitlines()[1].startswith("| postwarden "))
 
     def test_usage_errors(self):
         status, _, err = self.run_cli("--config", self.config, "--ingress", "587", "--from", "a@example.com",
