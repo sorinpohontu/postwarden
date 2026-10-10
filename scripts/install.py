@@ -34,13 +34,14 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     for name, version in report["packages"].items():
         print(f"package {name}: {version or 'not installed'}")
     print(f"installed release: {report['installed_release'] or 'none'}; unit={report['unit_installed']} active={report['daemon_active']} socket={report['socket_present']}")
+    print(f"active deployment: {report['active_record'] or 'none'}")
     if report.get("root_unmanaged"):
         print(f"  not part of the release (install --apply moves them to the backup directory): {', '.join(report['root_unmanaged'])}")
     config = report["config"]
-    print(f"config {config['path']}: " + ("missing" if not config["present"] else (f"valid, mode={config['mode']}, sending_limits={config['sending_limits']}" if config["valid"] else "INVALID")))
+    print(f"config {config['path']}: " + ("missing" if not config["present"] else ("valid, " + ", ".join(f"{k}={v}" for k, v in config["modes"].items()) + f", failure_action={config['failure_action']}" if config["valid"] else "INVALID")))
     if report["postfix"]:
         pf = report["postfix"]
-        print(f"postfix {pf['version']}: queue={pf['queue_directory']} delimiter={pf['recipient_delimiter']!r} attached={pf['attached']}")
+        print(f"postfix {pf['version']}: queue={pf['queue_directory']} delimiter={pf['recipient_delimiter']!r} attached={pf['attached']} failure_action={pf['failure_action'] or '-'}")
         print(f"  smtpd_milters = {pf['smtpd_milters']}")
         print(f"  services: " + ", ".join(f"{k}={'yes' if v else 'no'}" for k, v in pf["services"].items()))
         if pf["content_filters"]:
@@ -99,14 +100,14 @@ def cmd_configure_postfix(args: argparse.Namespace) -> int:
     require_root(args)
     report = deployment.inspect(DEFAULT_CONFIG_PATH)
     try:
-        backup = deployment.configure_postfix(args.phase, report, args.apply, log, args.remove_legacy, args.keep_legacy)
+        backup = deployment.configure_postfix(report, args.apply, log, args.remove_legacy, args.keep_legacy)
     except deployment.DeploymentError as exc:
         log(f"! {exc}")
         return 1
     if not args.apply:
         log("dry run: nothing changed (use --apply)")
     elif backup:
-        log(f"configure-postfix {args.phase} complete; deployment id {backup}")
+        log(f"configure-postfix complete; deployment id {backup}")
     return 0
 
 
@@ -114,12 +115,14 @@ def cmd_rollback(args: argparse.Namespace) -> int:
     only_inspect_takes_config(args)
     require_root(args)
     try:
-        deployment.rollback(args.deployment_id, args.apply, log, force=args.force)
+        record = deployment.rollback(args.deployment_id, args.apply, log, force=args.force)
     except deployment.DeploymentError as exc:
         log(f"! {exc}")
         return 1
     if not args.apply:
         log("dry run: nothing changed (use --apply)")
+    elif record:
+        log(f"rollback complete; deployment id {record}")
     return 0
 
 
@@ -137,14 +140,14 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("install", help="install packages, release, user, unit and start the daemon")
     mode_flags(p)
     p.add_argument("--import-config", metavar="FILE", help=f"copy FILE to {DEFAULT_CONFIG_PATH} before validation")
-    p = sub.add_parser("configure-postfix", help="attach the daemon to Postfix for the given phase")
-    p.add_argument("--phase", choices=deployment.PHASES, required=True)
+    p = sub.add_parser("configure-postfix", help="activate the configuration: restart the daemon when it changed, attach "
+                                                 "it to Postfix with the failure action from the configuration")
     mode_flags(p)
     p.add_argument("--remove-legacy", action="store_true",
-                   help="enforce phase only: drop pipe content filters and the policyd-spf call")
+                   help="drop pipe content filters and the policyd-spf call; needs protection and sender authentication enforced")
     p.add_argument("--keep-legacy", action="store_true",
-                   help="enforce while SMTP content filters remain (reinjected mail to protected recipients bounces)")
-    p = sub.add_parser("rollback", help="restore the files recorded for a deployment id")
+                   help="enforce protection while SMTP content filters remain (reinjected mail to protected recipients bounces)")
+    p = sub.add_parser("rollback", help="undo the active configure-postfix deployment, or an install")
     p.add_argument("--deployment-id", required=True)
     mode_flags(p)
     p.add_argument("--force", action="store_true", help="overwrite files changed since the deployment")

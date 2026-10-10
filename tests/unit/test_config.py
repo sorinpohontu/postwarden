@@ -15,7 +15,10 @@ from helpers import BASE_TOML, EXAMPLE, example_settings, settings
 class ExampleFile(unittest.TestCase):
     def test_example_validates_and_matches_defaults(self):
         s = example_settings()
-        self.assertEqual(s.mode, "observe")
+        self.assertEqual(s.section_modes(), {"protection": "enforce", "self_sender": "observe",
+                                             "sender_authentication": "observe", "limits": "observe",
+                                             "sending_limits": "observe"})
+        self.assertEqual(s.failure_action(), "tempfail")
         self.assertEqual(s.protection.addresses["all@*"], frozenset())
         self.assertEqual(s.protection.addresses["all@example.com"], frozenset({"manager@example.com"}))
         self.assertEqual(s.protection.addresses["board@example.com"], frozenset({"chair@example.com"}))
@@ -24,8 +27,8 @@ class ExampleFile(unittest.TestCase):
 
     def test_commented_example_defaults_match_the_code(self):
         text = EXAMPLE.read_text()
-        uncommented = re.sub(r"(?m)^# (\[[a-z_.]+\]|[a-z_]+ = .*)$", r"\1", text)
-        self.assertIn("[limits]\nmessage_bytes", uncommented)
+        uncommented = re.sub(r"(?m)^# (\[[a-z_.]+\]|[a-z_]+ += .*)$", r"\1", text)
+        self.assertIn("[limits]\nmode", uncommented)
         self.assertEqual(describe(parse_settings(tomllib.loads(uncommented), source="x")), describe(parse_settings(tomllib.loads(text), source="x")))
         limits = tomllib.loads(uncommented)["limits"]
         self.assertEqual(set(limits), set(LimitSettings.__dataclass_fields__))
@@ -43,26 +46,67 @@ class Validation(unittest.TestCase):
         self.assertTrue(any(e.startswith("logging.level: must be a string") for e in errors))
         self.assertTrue(any(e.startswith("limits.message_bytes: must be an integer") for e in errors))
 
+    def test_dkim_diagnostics_is_an_opt_in_boolean(self):
+        self.assertFalse(settings(base="").sender_authentication.dkim_diagnostics)
+        self.assertTrue(settings('\n[sender_authentication]\ndkim_diagnostics = true\n').sender_authentication.dkim_diagnostics)
+        self.assertTrue(any(e.startswith("sender_authentication.dkim_diagnostics: must be a boolean")
+                            for e in self.errors('\n[sender_authentication]\ndkim_diagnostics = "yes"\n')))
+
     def test_schema_version_optional_and_supported(self):
-        self.assertEqual(settings(base="mode = 'observe'\n").schema_version, 1)
+        self.assertEqual(settings(base="").schema_version, 1)
         self.assertTrue(any("unsupported version 2" in e for e in self.errors(base="schema_version = 2\n")))
 
     def test_mode_choice(self):
-        self.assertTrue(any(e.startswith("mode: must be one of") for e in self.errors(base="schema_version = 1\nmode = 'maybe'\n")))
+        for section in ("protection", "self_sender", "sender_authentication", "limits", "sending_limits"):
+            self.assertIn(f"{section}.mode: must be one of observe, enforce, off",
+                          self.errors(f"\n[{section}]\nmode = 'maybe'\n"), section)
+        self.assertEqual(self.errors(base="mode = 'enforce'\n"), ["mode: unknown key"])
+        self.assertEqual(self.errors("\n[self_sender]\nenabled = false\n"), ["self_sender.enabled: unknown key"])
 
-    def test_fixed_service_and_logging_keys_removed(self):
-        errors = self.errors('\n[service]\nsocket = "unix:/tmp/x"\n[logging]\nbackend = "stderr"\nidentifier = "x"\nlevel = "debug"\n')
-        self.assertIn("service: removed; the milter socket is fixed at unix:/var/spool/postfix/postwarden/policy.sock", errors)
-        self.assertEqual(sum(e.startswith(("logging.backend: removed", "logging.identifier: removed")) for e in errors), 2)
-        self.assertEqual(len(errors), 3)
+    def test_section_defaults_without_mode_keys(self):
+        s = settings(mode=None)
+        self.assertEqual(s.section_modes(), {"protection": "enforce", "self_sender": "observe",
+                                             "sender_authentication": "observe", "limits": "observe",
+                                             "sending_limits": "observe"})
 
-    def test_fixed_sender_authentication_keys_removed(self):
-        errors = self.errors('\n[sender_authentication]\nalignment = "strict"\n'
-                             'temporary_error = "defer"\nallow_local = false\n')
-        self.assertEqual(sorted(errors), [
-            "sender_authentication.alignment: removed; the rule is fixed: SPF and DKIM must match the From domain exactly",
-            "sender_authentication.temporary_error: removed; the rule is fixed: DNS and verifier trouble always defers"])
-        self.assertFalse(settings("\n[sender_authentication]\nallow_local = false\n").sender_authentication.allow_local)
+    def test_protection_off_refused_while_addresses_are_listed(self):
+        self.assertEqual(self.errors("\n[protection]\nmode = 'off'\n"), [
+            "protection.mode: off is refused while protected addresses are listed; use observe, or remove the addresses"])
+        self.assertEqual(settings("\n[protection]\nmode = 'off'\n", base="").protection.mode, "off")
+
+    def test_failure_action_accept_refused_while_listed_protection_enforces(self):
+        self.assertEqual(self.errors("\n[postfix]\nfailure_action = 'accept'\n"), [
+            "postfix.failure_action: accept is refused while protected addresses are enforced: "
+            "they would be open whenever postwarden is down"])
+        observed = settings("\n[postfix]\nfailure_action = 'accept'\n[protection]\nmode = 'observe'\n",
+                            mode="enforce")
+        self.assertEqual(observed.failure_action(), "accept")
+        self.assertTrue(any(e.startswith("postfix.failure_action: must be one of auto, accept, tempfail")
+                            for e in self.errors("\n[postfix]\nfailure_action = 'open'\n")))
+
+    def test_auto_failure_action_follows_enforcing_sections(self):
+        cases = [
+            ("", "observe", "accept"),
+            ("", "enforce", "tempfail"),
+            ("\n[protection]\nmode = 'enforce'\n", "observe", "tempfail"),
+            ("\n[sending_limits]\nmode = 'enforce'\n", "observe", "tempfail"),
+            ("\n[postfix]\nfailure_action = 'tempfail'\n", "observe", "tempfail"),
+        ]
+        for extra, mode, expected in cases:
+            self.assertEqual(settings(extra, mode=mode).failure_action(), expected, (extra, mode))
+        empty = settings("\n[protection]\nmode = 'enforce'\n", base="", mode="observe")
+        self.assertEqual(empty.failure_action(), "accept")
+
+    def test_rule_modes_follow_their_sections(self):
+        s = settings("\n[self_sender]\nmode = 'enforce'\n[sender_authentication]\nmode = 'off'\n"
+                     "[sending_limits]\nmode = 'off'\n", mode="observe")
+        self.assertEqual({rule: s.rule_mode(rule) for rule in (
+            "protected_recipient", "invalid_recipient", "self_sender", "authentication", "invalid_from",
+            "limits", "sending_limit")}, {
+            "protected_recipient": "observe", "invalid_recipient": "observe", "self_sender": "enforce",
+            "authentication": "off", "invalid_from": "enforce", "limits": "observe", "sending_limit": "off"})
+        both_off = settings("\n[self_sender]\nmode = 'off'\n[sender_authentication]\nmode = 'off'\n")
+        self.assertEqual(both_off.rule_mode("invalid_from"), "off")
 
     def test_timeouts_must_be_finite(self):
         for value in ("nan", "+nan", "inf"):
@@ -70,20 +114,6 @@ class Validation(unittest.TestCase):
             self.assertIn("limits.dns_timeout_seconds: must be a finite number", errors, value)
             self.assertIn("limits.authentication_deadline_seconds: must be a finite number", errors, value)
         self.assertEqual(settings("\n[limits]\ndns_timeout_seconds = 0.5\n").limits.dns_timeout_seconds, 0.5)
-
-    def test_port_lists_removed(self):
-        errors = self.errors('\n[self_sender]\nports = [25]\n[sender_authentication]\nallow_authenticated_ports = [587]\n')
-        self.assertEqual([e.split(":")[0] for e in errors], ["self_sender.ports", "sender_authentication.allow_authenticated_ports"])
-        self.assertEqual(self.errors('\n[authentication]\nnull_sender = "both"\n'), ["authentication: renamed to [sender_authentication]"])
-
-    def test_networks_are_no_longer_configured(self):
-        errors = self.errors('\n[trust]\nmynetworks = ["10.0.0.0/8"]\nlocal_ingress_marker = "LOCAL_PICKUP"\n')
-        self.assertEqual(errors, ["trust: removed; mynetworks and recipient_delimiter are read from Postfix at start, "
-                                  "same-server clients are detected automatically and the pickup marker is fixed"])
-
-    def test_old_protected_recipients_schema_rejected(self):
-        errors = self.errors('\n[[protected_recipients]]\naddresses = ["all@example.com"]\nauthorized_sasl_logins = ["x@example.com"]\n')
-        self.assertTrue(any(e.startswith("protected_recipients: removed; configure protected addresses under [protection]") for e in errors))
 
     def test_address_keys_are_normalized(self):
         s = settings('\n[protection.addresses."Board@B\u00fccher.Example"]\nauthorized_logins = ["x@example.org"]\n')
@@ -110,6 +140,14 @@ class Validation(unittest.TestCase):
             '[protection.addresses."ceo"]\nauthorized_logins = []\n'))
         self.assertIn("same address as another protection.addresses entry (ceo@example.com)", joined)
         self.assertIn("protection.addresses.'ceo': not a mailbox", joined)
+
+    def test_keys_of_earlier_releases_are_unknown(self):
+        errors = self.errors('\n[service]\nsocket = "unix:/tmp/x"\n[trust]\nmynetworks = []\n[authentication]\nrequire = "both"\n'
+                             '[logging]\nbackend = "stderr"\n[self_sender]\nports = [25]\n'
+                             '[sender_authentication]\nalignment = "strict"\n')
+        self.assertEqual(sorted(errors), ["authentication: unknown key", "logging.backend: unknown key",
+                                          "self_sender.ports: unknown key", "sender_authentication.alignment: unknown key",
+                                          "service: unknown key", "trust: unknown key"])
 
     def test_removed_keys_are_unknown(self):
         errors = self.errors('\n[protection]\nports = [587]\nrequire_tls = false\n'
@@ -143,6 +181,12 @@ class Validation(unittest.TestCase):
         errors = self.errors('\n[limits]\ndns_timeout_seconds = 30\nauthentication_deadline_seconds = 20\n')
         self.assertTrue(any("must not be shorter than dns_timeout_seconds" in e for e in errors))
 
+    def test_dkim_worker_memory_has_a_floor(self):
+        errors = self.errors('\n[limits]\ndkim_worker_memory = 1000000\n')
+        self.assertTrue(any(e.startswith("limits.dkim_worker_memory: must be at least 268435456") for e in errors))
+        limits = settings('\n[limits]\ndkim_workers = 4\ndkim_worker_memory = 536870912\n').limits
+        self.assertEqual((limits.dkim_workers, limits.dkim_worker_memory), (4, 536870912))
+        self.assertTrue(self.errors('\n[limits]\nmax_verification_bytes = 268435456\n'))
 
 class SendingLimits(unittest.TestCase):
     MULTIPLIERS = """
@@ -240,6 +284,15 @@ example.com = 2
 
 
 class Loading(unittest.TestCase):
+    def test_hash_is_of_the_exact_bytes_parsed(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.toml")
+            raw = b"schema_version = 1\n# a comment changes the identity\n"
+            with open(path, "wb") as fh:
+                fh.write(raw)
+            self.assertEqual(load_settings(path).sha256, hashlib.sha256(raw).hexdigest())
+
     def test_missing_file_points_to_example(self):
         with self.assertRaises(ConfigError) as ctx:
             load_settings("/nonexistent/config.toml")

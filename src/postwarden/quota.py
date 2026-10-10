@@ -186,9 +186,11 @@ class QuotaStore:
     def reserve(self, reservation: Reservation, now: float, *, observe: bool) -> Verdict | None:
         """Reserve one recipient on the key and, for local mail, the local cap; both or neither.
 
-        A full key store refuses a new key. In observe mode that key stays unmeasured and the local cap still counts.
+        In enforce mode a verdict reserves nothing. In observe mode the recipient is delivered, so it is reserved and
+        the verdict only reported; a new key that does not fit a full store stays unmeasured, the local cap counts.
         """
         key = reservation.key
+        verdict = None
         with self._lock:
             window = self._window(key.text, now)
             if window is None and not observe:
@@ -198,22 +200,26 @@ class QuotaStore:
             else:
                 hour, day = window.counts(now)
                 if hour >= key.per_hour:
-                    return Verdict(PER_HOUR, window.first_refusal(PER_HOUR, now))
-                if day >= key.per_day:
-                    return Verdict(PER_DAY, window.first_refusal(PER_DAY, now))
+                    verdict = Verdict(PER_HOUR, window.first_refusal(PER_HOUR, now))
+                elif day >= key.per_day:
+                    verdict = Verdict(PER_DAY, window.first_refusal(PER_DAY, now))
+                if verdict is not None and not observe:
+                    return verdict
             if key.local:
                 hour, day = self._local.counts(now)
-                if hour >= self.limits.local_per_hour:
-                    return Verdict(LOCAL_PER_HOUR, self._local.first_refusal(LOCAL_PER_HOUR, now))
-                if day >= self.limits.local_per_day:
-                    return Verdict(LOCAL_PER_DAY, self._local.first_refusal(LOCAL_PER_DAY, now))
+                if verdict is None and hour >= self.limits.local_per_hour:
+                    verdict = Verdict(LOCAL_PER_HOUR, self._local.first_refusal(LOCAL_PER_HOUR, now))
+                elif verdict is None and day >= self.limits.local_per_day:
+                    verdict = Verdict(LOCAL_PER_DAY, self._local.first_refusal(LOCAL_PER_DAY, now))
+                if verdict is not None and not observe:
+                    return verdict
                 self._local.reserved += 1
                 reservation.local += 1
             if window is None:
-                return Verdict(KEY_STORE_FULL, self._full_warning_due(now))
+                return verdict or Verdict(KEY_STORE_FULL, self._full_warning_due(now))
             window.reserved += 1
             reservation.keyed += 1
-            return None
+            return verdict
 
     def commit(self, reservation: Reservation, now: float) -> None:
         with self._lock:

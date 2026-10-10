@@ -1,3 +1,4 @@
+import dataclasses
 import os
 import sys
 import tempfile
@@ -34,7 +35,7 @@ class RecordingLogger:
 
 def session(mode="enforce", extra=""):
     log = RecordingLogger()
-    milter.configure(settings(f'\nmode = "{mode}"\n' + extra), log)
+    milter.configure(settings(extra, mode=mode), log)
     m = milter.PolicyMilter()
     m.macros, m.replies = {}, []
     m.negotiate([0x1ff, 0x1fffff, 0, 0])
@@ -137,6 +138,24 @@ class SmtpTransactions(unittest.TestCase):
         eom = [f for _, f in log.events if f.get("stage") == "eom" and f.get("action") == "accept"][0]
         self.assertEqual((eom["reason"], eom["spf"], eom["dkim"]), ("spf_aligned", "pass", "skipped"))
         self.assertLess(float(eom["auth_elapsed"]), float(eom["elapsed"]) + 0.001)
+
+    def test_diagnostics_verify_dkim_after_an_aligned_spf_pass(self):
+        m, log = session(extra='\n[sender_authentication]\nrequire = "either"\ndkim_diagnostics = true\n')
+        connect(m)
+
+        def fake(*a, skip_dkim=None, **k):
+            outcome = SpfOutcome(AuthStatus.PASS, "example.org", "pass")
+            if skip_dkim(outcome):
+                return AuthenticationInput(outcome, dkim_skipped=True)
+            return AuthenticationInput(outcome, (DkimOutcome(AuthStatus.FAIL, "example.org"),))
+        milter.authenticator = fake
+        _, rc = message(m, "<bob@example.org>", ["<carol@example.net>"], [("From", " bob@example.org")])
+        self.assertEqual(rc, Milter.CONTINUE)
+        eom = [f for _, f in log.events if f.get("stage") == "eom" and f.get("action") == "accept"][0]
+        self.assertEqual({k: eom[k] for k in ("reason", "dkim", "dkim_summary", "dkim_diagnostics")},
+                         {"reason": "spf_aligned", "dkim": "example.org:fail",
+                          "dkim_summary": "pass:0,fail:1,permerror:0,temperror:0,neutral:0,policy:0",
+                          "dkim_diagnostics": "on"})
 
     def test_observe_mode_logs_but_continues(self):
         m, log = session(mode="observe")
@@ -341,6 +360,113 @@ class SmtpTransactions(unittest.TestCase):
         self.assertIn(("eom", "reject", "authentication"), log.actions())
 
 
+class MixedModes(unittest.TestCase):
+    """A bound or an observed rule never lets mail past a rule that enforces."""
+
+    def tearDown(self):
+        milter.authenticator = None
+
+    def test_protection_checks_recipients_over_an_observed_max_recipients(self):
+        m, log = session(extra='\n[limits]\nmode = "observe"\nmax_recipients = 1\n')
+        connect(m)
+        milter.authenticator = auth_result()
+        codes, rc = message(m, "<bob@example.org>", ["<carol@example.com>", "<all@example.com>", "<dave@example.com>"],
+                            [("From", " bob@example.org")])
+        self.assertEqual((codes, rc), ([Milter.CONTINUE, Milter.REJECT, Milter.CONTINUE], Milter.CONTINUE))
+        self.assertIn(("rcpt", "reject", "protected_recipient"), log.actions())
+        self.assertIn(("rcpt", "would_defer", "limits"), log.actions())
+
+    def test_enforced_authentication_defers_when_an_observed_bound_cut_the_message(self):
+        for extra, expected in (('\n[limits]\nmode = "observe"\nmessage_bytes = 10\n', Milter.TEMPFAIL),
+                                ('\n[limits]\nmode = "observe"\nmax_header_bytes = 5\n', Milter.TEMPFAIL),
+                                ('\n[limits]\nmode = "observe"\nmessage_bytes = 10\n'
+                                 '[sender_authentication]\nmode = "observe"\n', Milter.CONTINUE)):
+            with self.subTest(extra=extra):
+                m, log = session(extra=extra)
+                connect(m)
+                milter.authenticator = auth_result()
+                _, rc = message(m, "<bob@example.org>", ["<carol@example.com>"], [("From", " bob@example.org")])
+                self.assertEqual(rc, expected)
+                action = "defer" if expected == Milter.TEMPFAIL else "would_defer"
+                self.assertIn(("eom", action, "limits"), log.actions())
+
+    def test_open_message_bound_defers_at_mail_only_when_an_enforced_check_needs_the_message(self):
+        m, log = session(extra='\n[limits]\nmode = "observe"\nmax_open_messages = 1\n')
+        self.assertTrue(milter._open_slots.acquire(blocking=False))
+        connect(m)
+        self.assertEqual(m.envfrom("<bob@example.org>"), Milter.TEMPFAIL)
+        self.assertIn(("mail", "defer", "limits"), log.actions())
+        m.close()
+        submitted, log = session(extra='\n[limits]\nmode = "observe"\nmax_open_messages = 1\n')
+        self.assertTrue(milter._open_slots.acquire(blocking=False))
+        connect(submitted, port="587", ingress="SUBMISSION587", login="demo@example.com", cipher="256")
+        self.assertEqual(submitted.envfrom("<demo@example.com>"), Milter.CONTINUE)
+        self.assertIn(("mail", "would_defer", "limits"), log.actions())
+        submitted.close()
+
+    def test_enforced_authentication_defers_without_a_verification_slot(self):
+        m, log = session(extra='\n[limits]\nmode = "observe"\nmax_concurrent_messages = 1\n'
+                               'dns_timeout_seconds = 0.01\nauthentication_deadline_seconds = 0.05\n')
+        self.assertTrue(milter._verify_slots.acquire(blocking=False))
+        connect(m)
+        milter.authenticator = auth_result()
+        _, rc = message(m, "<bob@example.org>", ["<carol@example.com>"], [("From", " bob@example.org")])
+        self.assertEqual(rc, Milter.TEMPFAIL)
+        self.assertIn(("eom", "defer", "limits"), log.actions())
+
+    def test_limits_off_lifts_every_bound_while_authentication_enforces(self):
+        m, log = session(extra='\n[limits]\nmode = "off"\nmessage_bytes = 10\nmax_headers = 1\nmax_header_bytes = 5\n'
+                               'max_recipients = 1\nmax_open_messages = 1\nmax_concurrent_messages = 1\n')
+        self.assertEqual((milter._open_slots, milter._verify_slots), (None, None))
+        other = milter.PolicyMilter()
+        other.macros, other.replies = {}, []
+        connect(other)
+        self.assertEqual(other.envfrom("<eve@example.org>"), Milter.CONTINUE)
+        connect(m)
+        captures = []
+        verify = auth_result()
+        milter.authenticator = lambda *a, **k: (captures.append(a[3]), verify(*a, **k))[1]
+        codes, rc = message(m, "<bob@example.org>", ["<carol@example.com>", "<dave@example.com>"],
+                            [("Subject", " hi"), ("From", " bob@example.org")], body=b"hello world\r\n" * 10)
+        self.assertEqual((codes, rc), ([Milter.CONTINUE, Milter.CONTINUE], Milter.CONTINUE))
+        self.assertEqual((len(captures), captures[0].over_limit, captures[0].body_bytes), (1, None, 130))
+        self.assertIn(("eom", "accept", "authentication"), log.actions())
+        self.assertFalse([a for a in log.actions() if a[2] == "limits"])
+        other.close()
+
+    def test_observed_protection_does_not_hide_an_enforced_self_sender_on_the_same_recipient(self):
+        m, log = session(extra='\n[protection]\nmode = "observe"\n')
+        connect(m)
+        m.envfrom("<all@example.com>")
+        self.assertEqual(m.envrcpt("<all@example.com>"), Milter.REJECT)
+        self.assertIn(("rcpt", "reject", "self_sender"), log.actions())
+        m.close()
+
+    def test_observed_header_self_sender_does_not_skip_enforced_authentication(self):
+        m, log = session(extra='\n[self_sender]\nmode = "observe"\n')
+        connect(m)
+        milter.authenticator = auth_result(spf="fail", dkim=None)
+        _, rc = message(m, "<bob@example.org>", ["<carol@example.com>"], [("From", " carol@example.com")])
+        self.assertEqual(rc, Milter.REJECT)
+        self.assertIn(("eom", "reject", "authentication"), log.actions())
+
+    def test_recipient_refused_only_by_an_observed_rule_meets_the_enforced_header_check(self):
+        m, log = session(extra='\n[protection]\nmode = "observe"\n')
+        connect(m)
+        milter.authenticator = auth_result()
+        codes, rc = message(m, "<bob@example.org>", ["<all@example.com>"], [("From", " all@example.com")])
+        self.assertEqual((codes, rc), ([Milter.CONTINUE], Milter.REJECT))
+        self.assertIn(("eom", "reject", "self_sender"), log.actions())
+
+    def test_pickup_protection_still_refuses_with_an_observed_max_recipients(self):
+        m, log = session(extra='\n[limits]\nmode = "observe"\nmax_recipients = 1\n')
+        m.macros.update({"{daemon_port}": "0", "{postwarden_ingress}": "LOCAL_PICKUP"})
+        m.connect("localhost", 2, ("127.0.0.1", 0))
+        codes, rc = message(m, "root@example.com", ["user@example.com", "all@example.com"], [("From", " root@example.com")])
+        self.assertEqual((codes, rc), ([Milter.CONTINUE, Milter.CONTINUE], Milter.REJECT))
+        self.assertIn(("eom", "reject", "protected_recipient"), log.actions())
+
+
 class LocalPickup(unittest.TestCase):
     def pickup(self, extra=""):
         m, log = session(extra=extra)
@@ -353,7 +479,8 @@ class LocalPickup(unittest.TestCase):
         m.envfrom("root@example.com")
         codes = [m.envrcpt(f"user{i}@example.com") for i in range(1000)]
         self.assertEqual(set(codes), {Milter.CONTINUE})
-        self.assertEqual((len(m.state.recipients), len(m.state.deferred_rejections), m.state.overflow_rcpts), (2, 1, 998))
+        self.assertEqual((len(m.state.recipients), len(m.state.deferred_rejections), len(m.state.refused_overflow())),
+                         (2, 1, 998))
         m.header("From", " root@example.com")
         self.assertEqual(m.eom(), Milter.TEMPFAIL)
         eom = [f for _, f in log.events if f.get("stage") == "eom"][0]
@@ -415,7 +542,7 @@ class SendingLimits(unittest.TestCase):
 
     def session(self, mode="enforce", limits="enforce", extra="", capacity=100):
         log = RecordingLogger()
-        cfg = settings(f'\nmode = "{mode}"\n' + LIMITS.replace("per_hour = 2", f'mode = "{limits}"\nper_hour = 2', 1) + extra)
+        cfg = settings(LIMITS.replace("per_hour = 2", f'mode = "{limits}"\nper_hour = 2', 1) + extra, mode=mode)
         self.quota = QuotaStore(cfg.sending_limits, capacity=capacity)
         milter.configure(cfg, log, self.quota)
         m = milter.PolicyMilter()
@@ -469,15 +596,15 @@ class SendingLimits(unittest.TestCase):
         self.assertEqual((set(codes), rc, m.replies), ({Milter.CONTINUE}, Milter.CONTINUE, []))
         self.assertIn(("rcpt", "would_defer", "sending_limit"), log.actions())
         self.assertEqual(self.eom(log)["would_deferred_rcpts"], 1)
-        self.assertEqual(self.counts("demo@example.com"), (2, 2))
+        self.assertEqual(self.counts("demo@example.com"), (3, 3))
         codes, _ = message(m, "<demo@example.com>", ["<all@example.com>"], [("From", " demo@example.com")])
         self.assertEqual(codes, [Milter.REJECT])
 
-    def test_global_observe_wins_over_enforced_limits(self):
+    def test_limits_enforce_while_other_sections_observe(self):
         m, log = self.submission(mode="observe", limits="enforce")
         codes, _ = self.send(m, "demo@example.com", 3)
-        self.assertEqual((set(codes), m.replies), ({Milter.CONTINUE}, []))
-        self.assertIn(("rcpt", "would_defer", "sending_limit"), log.actions())
+        self.assertEqual(codes.count(Milter.TEMPFAIL), 1)
+        self.assertIn(("rcpt", "defer", "sending_limit"), log.actions())
 
     def test_off_counts_nothing_but_still_logs_the_key(self):
         m, log = self.submission(limits="off")
@@ -499,6 +626,31 @@ class SendingLimits(unittest.TestCase):
         self.assertEqual(rc, Milter.TEMPFAIL)
         self.assertEqual(self.counts("demo@example.com"), (0, 0))
 
+    def test_mail_without_an_open_message_slot_still_counts(self):
+        saturated = '\n[limits]\nmode = "observe"\nmax_open_messages = 1\n'
+        for route in ("submission", "pickup"):
+            with self.subTest(route=route):
+                m, log = getattr(self, route)(extra=saturated)
+                self.assertTrue(milter._open_slots.acquire(blocking=False))
+                sender = "demo@example.com" if route == "submission" else "root@example.com"
+                results = [self.send(m, sender, 1, first=n) for n in range(3)]
+                milter._open_slots.release()
+                self.assertEqual(results[0], ([Milter.CONTINUE], Milter.CONTINUE))
+                self.assertEqual(results[1], ([Milter.CONTINUE], Milter.CONTINUE))
+                self.assertEqual(results[2], ([Milter.TEMPFAIL], Milter.CONTINUE) if route == "submission"
+                                 else ([Milter.CONTINUE], Milter.TEMPFAIL))
+                self.assertEqual(self.counts(sender), (2, 2))
+                m.close()
+
+    def test_enforced_open_message_bound_counts_nothing(self):
+        m, log = self.pickup(extra="\n[limits]\nmax_open_messages = 1\n")
+        self.assertTrue(milter._open_slots.acquire(blocking=False))
+        self.addCleanup(milter._open_slots.release)
+        _, rc = self.send(m, "root@example.com", 1)
+        self.assertEqual(rc, Milter.TEMPFAIL)
+        self.assertIn(("eom", "defer", "limits"), log.actions())
+        self.assertEqual(self.counts("root@example.com"), (0, 0))
+
     def test_abort_new_mail_and_close_release_reservations(self):
         for end in ("abort", "envfrom", "close"):
             with self.subTest(end=end):
@@ -510,11 +662,21 @@ class SendingLimits(unittest.TestCase):
                 self.assertEqual(self.counts("demo@example.com"), (0, 0))
                 m.close()
 
-    def test_observe_mode_counts_what_enforcement_would_commit(self):
+    def test_delivered_mail_counts_whatever_other_rules_only_observe(self):
         m, log = self.submission(mode="observe", extra="\n[limits]\nmessage_bytes = 10\n")
         _, rc = self.send(m, "demo@example.com", 2)
         self.assertEqual(rc, Milter.CONTINUE)
-        self.assertEqual(self.counts("demo@example.com"), (0, 0))
+        self.assertEqual(self.counts("demo@example.com"), (2, 2))
+        codes, rc = self.send(m, "demo@example.com", 1)
+        self.assertEqual((codes, rc), ([Milter.TEMPFAIL], Milter.CONTINUE))
+        self.assertIn(("rcpt", "defer", "sending_limit"), log.actions())
+
+    def test_recipients_refused_only_by_an_observed_rule_count(self):
+        m, log = self.submission(extra="\n[protection]\nmode = \"observe\"\n")
+        codes, _ = message(m, "<demo@example.com>", ["<all@example.com>"], [("From", " demo@example.com")])
+        self.assertEqual(codes, [Milter.CONTINUE])
+        self.assertIn(("rcpt", "would_reject", "protected_recipient"), log.actions())
+        self.assertEqual(self.counts("demo@example.com"), (1, 1))
 
     def test_short_login_is_its_own_key(self):
         m, log = self.submission(login="Demo")
@@ -580,7 +742,7 @@ class Lifecycle(unittest.TestCase):
     def run_daemon(self, extra="", during=None):
         log = RecordingLogger()
         log.lifecycle = lambda **f: log.event("lifecycle", **f)
-        cfg = settings('\nmode = "enforce"\n[logging]\nlevel = "warning"\n' + extra)
+        cfg = settings('\n[logging]\nlevel = "warning"\n' + extra)
         previous = os.umask(0o022)
         self.addCleanup(os.umask, previous)
         with unittest.mock.patch.object(milter, "EventLogger", return_value=log), \
@@ -600,7 +762,13 @@ class Lifecycle(unittest.TestCase):
     def test_start_line_reports_mode_and_logging_level(self):
         log = self.run_daemon()
         start = self.events(log, "start")[0]
-        self.assertEqual((start["mode"], start["sending_limits"], start["logging_level"]), ("enforce", "observe", "warning"))
+        self.assertEqual({k: start[k] for k in ("protection_mode", "self_sender_mode", "sender_authentication_mode",
+                                                 "limits_mode", "sending_limits_mode", "failure_action",
+                                                 "dkim_diagnostics", "logging_level")},
+                         {"protection_mode": "enforce", "self_sender_mode": "enforce",
+                          "sender_authentication_mode": "enforce", "limits_mode": "enforce",
+                          "sending_limits_mode": "observe", "failure_action": "tempfail", "dkim_diagnostics": "off",
+                          "logging_level": "warning"})
         self.assertEqual([f.get("event") for level, f in log.events], ["start", "limit_state_empty", "stop"])
         self.assertEqual((start["limit_state"], self.events(log, "limit_state_empty")[0]["reason"]), ("missing", "missing"))
 
@@ -619,6 +787,21 @@ class Lifecycle(unittest.TestCase):
         start = self.events(log, "start")[0]
         self.assertEqual((start["limit_state"], start["limit_keys"], start["limit_state_age"]), ("loaded", 1, 0))
         self.assertEqual(milter._quota.counts("demo@example.com", milter.time.time()), (2, 2))
+
+    def test_hash_of_the_loaded_configuration_waits_for_readiness(self):
+        loaded = os.path.join(os.path.dirname(self.path), "loaded-config.sha256")
+        with open(loaded, "w") as fh:
+            fh.write("0" * 64 + "\n")
+        cfg = dataclasses.replace(settings(), sha256="ab" * 32)
+        log = RecordingLogger()
+        log.lifecycle = lambda **f: None
+        with unittest.mock.patch.object(milter.Milter, "runmilter"), \
+             unittest.mock.patch.object(milter, "EventLogger", return_value=log), \
+             unittest.mock.patch.object(milter.limitstate, "STATE_FILE", self.path):
+            milter.run_daemon(cfg, loaded)
+        self.assertFalse(os.path.exists(loaded))
+        with open(loaded + ".pending") as fh:
+            self.assertEqual(fh.read(), "ab" * 32 + "\n")
 
     def test_limits_off_neither_loads_nor_saves(self):
         log = self.run_daemon('\n[sending_limits]\nmode = "off"\n')

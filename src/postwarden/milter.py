@@ -1,6 +1,7 @@
 """PyMilter callbacks: translate Postfix metadata into policy inputs and decisions into SMTP replies."""
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
@@ -13,9 +14,9 @@ from .config import Settings
 from . import limitstate
 from .logging import EventLogger
 from .message import MessageCapture
-from .policy import (Action, ConnectionFacts, Decision, RecipientState, TransactionState, TrustClass,
-                     classify_trust, combine, evaluate_authentication, evaluate_message, evaluate_recipient,
-                     spf_decides)
+from .policy import (Action, ConnectionFacts, Decision, TransactionState, TrustClass, classify_trust, dkim_fields,
+                     effective, enforced, evaluate_authentication, evaluate_message, evaluate_recipient, mode_of,
+                     needs_message, skip_dkim)
 from .quota import KEY_STORE_FULL, LimitKey, QuotaStore, Reservation, limit_key
 
 P_HDR_LEADSPC = getattr(Milter, "P_HDR_LEADSPC", 0x100000)
@@ -23,8 +24,9 @@ SPOOL_DIR = "/var/lib/postwarden"
 
 _settings: Settings
 _log: EventLogger
-_verify_slots: threading.BoundedSemaphore
-_open_slots: threading.BoundedSemaphore
+_verify_slots: threading.BoundedSemaphore | None
+_dkim_workers: threading.BoundedSemaphore
+_open_slots: threading.BoundedSemaphore | None
 _quota: QuotaStore | None = None
 authenticator = None
 
@@ -71,11 +73,11 @@ class PolicyMilter(Milter.Base):
     def _sender_field(self) -> str:
         return "<>" if self.state.null_sender else (self.state.raw_sender or "")
 
-    def _refuse_recipient(self, decision: Decision, recipient: Mailbox | None, recorded: bool = False, **fields) -> int:
+    def _refuse_recipient(self, decision: Decision, **fields) -> int:
         """Apply a recipient decision; non-SMTP callbacks cannot refuse at RCPT, so pickup waits for EOM."""
-        if not recorded:
-            self.state.recipients.append(RecipientState(recipient, decision))
         if decision.action is not Action.ALLOW and self.trust is TrustClass.LOCAL_PICKUP:
+            if decision.reason == "max_recipients" and decision in self.state.deferred_rejections:
+                return Milter.CONTINUE
             self.state.deferred_rejections.append(decision)
             _log.info(action="pending_eom", stage="rcpt", rule=decision.rule, reason=decision.reason,
                       **fields, **self._base_fields())
@@ -97,23 +99,16 @@ class PolicyMilter(Milter.Base):
         if decision.action is Action.ALLOW:
             _log.debug(action="allow", **fields)
             return Milter.CONTINUE
+        mode = mode_of(_settings, decision)
+        if mode == "off":
+            return Milter.CONTINUE
         reply = (decision.reply or _settings.reply("temporary_failure")).with_reference(self.mid)
-        if not self._enforced(decision):
+        if mode != "enforce":
             _log.info(action=f"would_{decision.action.value}", reply=reply.render(), **fields)
             return Milter.CONTINUE
         _log.info(action=decision.action.value, reply=reply.render(), **fields)
         self.setreply(str(reply.smtp_code), reply.enhanced_code, reply.message)
         return Milter.REJECT if decision.action is Action.REJECT else Milter.TEMPFAIL
-
-    def _enforced(self, decision: Decision) -> bool:
-        if decision.rule == "sending_limit":
-            return _limits_enforced()
-        return _settings.mode == "enforce"
-
-    def _final(self, decisions: list[Decision | None]) -> Decision:
-        """An enforced refusal outranks an observed one, so observing one rule never lets another's refusal through."""
-        enforced = [d for d in decisions if d is not None and d.action is not Action.ALLOW and self._enforced(d)]
-        return combine(enforced) if enforced else combine(decisions)
 
     def _limit_fields(self) -> dict:
         if self.limit_key is None:
@@ -125,8 +120,8 @@ class PolicyMilter(Milter.Base):
         return {"limit_key": self.limit_key.text, "limit_measured": measured}
 
     def _reserve(self, decision: Decision) -> Decision:
-        """Take one sending-limit reservation for a recipient every other rule allowed."""
-        if self.reservation is None or _quota is None or decision.action is not Action.ALLOW:
+        """Take one sending-limit reservation for a recipient Postfix accepts; an enforced refusal takes none."""
+        if self.reservation is None or _quota is None or enforced(_settings, decision):
             return decision
         verdict = _quota.reserve(self.reservation, time.time(), observe=not _limits_enforced())
         if verdict is None:
@@ -142,7 +137,8 @@ class PolicyMilter(Milter.Base):
                          "local_per_day": _settings.sending_limits.local_per_day}[verdict.reason]
                 _log.warning(event="limit_reached", rule="sending_limit", reason=verdict.reason, limit=limit,
                              limit_key=key.text, **self._base_fields())
-        return Decision(Action.DEFER, "sending_limit", verdict.reason, _settings.reply("sending_limit"))
+        return effective(_settings, [decision, Decision(Action.DEFER, "sending_limit", verdict.reason,
+                                                        _settings.reply("sending_limit"))])
 
     def _refresh_facts(self) -> None:
         self.facts = ConnectionFacts(
@@ -193,44 +189,29 @@ class PolicyMilter(Milter.Base):
                                    sender=sender, null_sender=null_sender, raw_sender=raw, peer_ip=self.peer_ip)
         if self.limit_key is not None and _quota is not None:
             self.reservation = _quota.begin(self.limit_key)
-        if not _open_slots.acquire(blocking=False):
-            decision = Decision(Action.DEFER, "limits", "max_open_messages", _settings.reply("temporary_failure"))
-            if self.trust is TrustClass.LOCAL_PICKUP or not self._enforced(decision):
+        if _open_slots is not None and not _open_slots.acquire(blocking=False):
+            decision = Decision(Action.DEFER, "limits", "max_open_messages", _settings.reply("temporary_failure"),
+                                needs_message(_settings, self.facts, self.trust))
+            if self.trust is TrustClass.LOCAL_PICKUP or not enforced(_settings, decision):
                 self.state.deferred_rejections.append(decision)
             if self.trust is TrustClass.LOCAL_PICKUP:
                 return Milter.CONTINUE
             return self._apply(decision, "mail", sender=self._sender_field(), **self._limit_fields())
-        self.holds_slot = True
+        self.holds_slot = _open_slots is not None
         self.capture = MessageCapture(_settings.limits, SPOOL_DIR if os.path.isdir(SPOOL_DIR) else None, self.leadspc)
         return Milter.CONTINUE
 
     def envrcpt(self, to, *args):
-        if len(self.state.recipients) >= _settings.limits.max_recipients:
-            decision = Decision(Action.DEFER, "limits", "max_recipients", _settings.reply("temporary_failure"))
-            self.state.overflow_rcpts += 1
-            if self.trust is TrustClass.LOCAL_PICKUP:
-                if self.state.overflow_rcpts == 1:
-                    self.state.deferred_rejections.append(decision)
-                    _log.info(action="pending_eom", stage="rcpt", rule=decision.rule, reason=decision.reason,
-                              **self._base_fields())
-                return Milter.CONTINUE
-            return self._apply(decision, "rcpt", rcpt=str(to))
-        try:
-            recipient = parse_envelope(to)
-            if recipient is None:
-                raise AddressError("empty recipient")
-        except AddressError as exc:
-            decision = Decision(Action.REJECT, "invalid_recipient", "recipient_unparseable",
-                                _settings.reply("invalid_recipient"))
-            return self._refuse_recipient(decision, None, detail=str(exc))
         transport = self.getsymval("{rcpt_mailer}") or None
-        decision = evaluate_recipient(_settings, self.facts, self.trust, self.state, recipient, transport)
+        recipient, decision = evaluate_recipient(_settings, self.facts, self.trust, self.state, to, transport)
+        if recipient is None:
+            return self._refuse_recipient(decision, rcpt=str(to))
         limited = self._reserve(decision)
         if limited is not decision:
             self.state.recipients[-1].decision = limited
-            return self._refuse_recipient(limited, recipient, recorded=True, rcpt=str(recipient),
-                                          transport=transport, limit_key=self.limit_key.text)
-        return self._refuse_recipient(decision, recipient, recorded=True, rcpt=str(recipient), transport=transport)
+            return self._refuse_recipient(limited, rcpt=str(recipient), transport=transport,
+                                          limit_key=self.limit_key.text)
+        return self._refuse_recipient(decision, rcpt=str(recipient), transport=transport)
 
     def header(self, name, hval):
         if self.capture is not None:
@@ -253,39 +234,34 @@ class PolicyMilter(Milter.Base):
 
     def _eom(self) -> int:
         capture = self.capture
-        fields = dict(sender=self._sender_field(), rcpts=len(self.state.recipients) + self.state.overflow_rcpts)
+        overflow = self.state.refused_overflow()
+        fields = dict(sender=self._sender_field(), rcpts=len(self.state.recipients) + len(overflow))
         fields.update(self._limit_fields())
-        refused = [r.decision for r in self.state.recipients
-                   if r.decision is not None and r.decision.action is not Action.ALLOW]
-        refused += [Decision(Action.DEFER, "limits", "max_recipients", None)] * self.state.overflow_rcpts
+        refused = [r.decision for r in self.state.recipients if r.decision is not None
+                   and r.decision.action is not Action.ALLOW and mode_of(_settings, r.decision) != "off"] + overflow
         for action, key in ((Action.REJECT, "rejected_rcpts"), (Action.DEFER, "deferred_rcpts")):
-            sent = sum(1 for d in refused if d.action is action and self._enforced(d))
-            hypothetical = sum(1 for d in refused if d.action is action and not self._enforced(d))
+            sent = sum(1 for d in refused if d.action is action and enforced(_settings, d))
+            hypothetical = sum(1 for d in refused if d.action is action and not enforced(_settings, d))
             if sent:
                 fields[key] = sent
             if hypothetical:
                 fields[f"would_{key}"] = hypothetical
         if capture is None:
-            decisions: list[Decision | None] = list(self.state.deferred_rejections)
-            final = self._final(decisions)
-            fields["elapsed"] = f"{time.monotonic() - self.started:.3f}"
-            rc = self._apply(final, "eom", **fields)
-            if final.action is Action.ALLOW:
-                _log.info(action="accept", stage="eom", rule=final.rule, reason=final.reason, **self._base_fields(), **fields)
-            return rc
-
-        headers_complete = capture.over_limit not in ("max_headers", "max_header_bytes")
-        from_values = ([v.decode("utf-8", "surrogateescape") for v in capture.header_values(b"From")]
-                       if headers_complete else None)
-        decisions, header_from = evaluate_message(_settings, self.facts, self.trust, self.state, from_values,
-                                                  capture.over_limit,
-                                                  lambda sender_from: self._authenticate(capture, sender_from, fields))
-        if header_from is not None:
-            fields["from_domain"] = header_from.domain
-        final = self._final(decisions)
+            final = effective(_settings, list(self.state.deferred_rejections))
+        else:
+            headers_complete = capture.over_limit not in ("max_headers", "max_header_bytes")
+            from_values = ([v.decode("utf-8", "surrogateescape") for v in capture.header_values(b"From")]
+                           if headers_complete else None)
+            decisions, header_from = evaluate_message(_settings, self.facts, self.trust, self.state, from_values,
+                                                      capture.over_limit,
+                                                      lambda sender_from: self._authenticate(capture, sender_from,
+                                                                                             fields))
+            if header_from is not None:
+                fields["from_domain"] = header_from.domain
+            final = effective(_settings, decisions)
         fields["elapsed"] = f"{time.monotonic() - self.started:.3f}"
         rc = self._apply(final, "eom", **fields)
-        if self.reservation is not None and combine(decisions).action is Action.ALLOW:
+        if self.reservation is not None and not enforced(_settings, final):
             _quota.commit(self.reservation, time.time())
         if final.action is Action.ALLOW:
             _log.info(action="accept", stage="eom", rule=final.rule, reason=final.reason, **self._base_fields(), **fields)
@@ -297,22 +273,25 @@ class PolicyMilter(Milter.Base):
             from .authentication import authenticate as authenticator
         started = time.monotonic()
         deadline = started + _settings.limits.authentication_deadline_seconds
-        if not _verify_slots.acquire(timeout=_settings.limits.authentication_deadline_seconds):
+        waited = _settings.limits.authentication_deadline_seconds
+        if _verify_slots is not None and not _verify_slots.acquire(timeout=waited):
             fields["auth_elapsed"] = f"{time.monotonic() - started:.3f}"
-            return Decision(Action.DEFER, "limits", "max_concurrent_messages", _settings.reply("temporary_failure"))
+            return Decision(Action.DEFER, "limits", "max_concurrent_messages", _settings.reply("temporary_failure"),
+                            _settings.sender_authentication.mode == "enforce")
         try:
-            message = capture.message_bytes()
             result = authenticator(self.peer_ip or "", self.helo, self.state.raw_sender,
-                                   message, capture.header_values(b"DKIM-Signature"), _settings.limits, deadline=deadline,
-                                   skip_dkim=lambda spf: spf_decides(_settings, header_from.domain, spf,
-                                                                     self.state.null_sender))
+                                   capture, capture.header_values(b"DKIM-Signature"), _settings.limits,
+                                   deadline=deadline,
+                                   skip_dkim=lambda spf: skip_dkim(_settings, header_from.domain, spf,
+                                                                   self.state.null_sender),
+                                   workers=_dkim_workers)
         finally:
-            _verify_slots.release()
+            if _verify_slots is not None:
+                _verify_slots.release()
             fields["auth_elapsed"] = f"{time.monotonic() - started:.3f}"
         fields["spf"] = result.spf.result or result.spf.status.value
         fields["spf_domain"] = result.spf.domain
-        fields["dkim"] = "skipped" if result.dkim_skipped else (
-            ",".join(f"{o.domain or '-'}:{o.status.value}" for o in result.dkim) or "none")
+        fields.update(dkim_fields(_settings, result))
         return evaluate_authentication(_settings, self.trust, header_from.domain, result,
                                        null_sender=self.state.null_sender)
 
@@ -328,7 +307,7 @@ class PolicyMilter(Milter.Base):
 
 
 def _limits_enforced() -> bool:
-    return _settings.mode == "enforce" and _settings.sending_limits.mode == "enforce"
+    return _settings.sending_limits.mode == "enforce"
 
 
 def _bytes(value) -> bytes:
@@ -338,18 +317,32 @@ def _bytes(value) -> bytes:
 
 
 def configure(settings: Settings, logger: EventLogger | None = None, quota: QuotaStore | None = None) -> None:
-    global _settings, _log, _verify_slots, _open_slots, _quota
+    global _settings, _log, _verify_slots, _dkim_workers, _open_slots, _quota
     _settings = settings
     if settings.sending_limits.mode == "off":
         _quota = None
     else:
         _quota = quota if quota is not None else QuotaStore(settings.sending_limits)
     _log = logger or EventLogger(settings.logging)
-    _verify_slots = threading.BoundedSemaphore(settings.limits.max_concurrent_messages)
-    _open_slots = threading.BoundedSemaphore(settings.limits.max_open_messages)
+    bounded = settings.limits.bounded
+    _verify_slots = threading.BoundedSemaphore(settings.limits.max_concurrent_messages) if bounded else None
+    _dkim_workers = threading.BoundedSemaphore(settings.limits.dkim_workers)
+    _open_slots = threading.BoundedSemaphore(settings.limits.max_open_messages) if bounded else None
 
 
-def run_daemon(settings: Settings) -> int:
+def _stage_loaded(loaded: str, digest: str) -> None:
+    pending = loaded + ".pending"
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(loaded)
+    tmp = f"{pending}.{os.getpid()}"
+    with open(tmp, "w") as fh:
+        fh.write(digest + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, pending)
+
+
+def run_daemon(settings: Settings, loaded: str | None = None) -> int:
+    """loaded: where `wait-ready` publishes the hash of the configuration this daemon runs, once it accepts."""
     configure(settings)
     socket = settings.service.socket
     if socket.startswith("unix:"):
@@ -362,7 +355,9 @@ def run_daemon(settings: Settings) -> int:
     Milter.set_exception_policy(Milter.TEMPFAIL)
     addresses, groups = settings.protection.counts()
     state = limitstate.LoadResult("off") if _quota is None else limitstate.load(_quota, limitstate.STATE_FILE)
-    _log.lifecycle(event="start", mode=settings.mode, sending_limits=settings.sending_limits.mode,
+    _log.lifecycle(event="start", **{f"{section}_mode": mode for section, mode in settings.section_modes().items()},
+                   failure_action=settings.failure_action(),
+                   dkim_diagnostics="on" if settings.sender_authentication.dkim_diagnostics else "off",
                    logging_level=settings.logging.level, socket=socket, config=settings.source,
                    protected_addresses=addresses, protected_groups=groups, mynetworks=len(settings.trust.mynetworks),
                    recipient_delimiter=settings.trust.recipient_delimiter,
@@ -375,6 +370,8 @@ def run_daemon(settings: Settings) -> int:
         last_saved = time.time() - state.age if state.age is not None else None
         saver = limitstate.Saver(_quota, _save_failed, limitstate.STATE_FILE, last_saved=last_saved)
         saver.start()
+    if loaded is not None:
+        _stage_loaded(loaded, settings.sha256)
     try:
         Milter.runmilter(settings.logging.identifier, socket, int(settings.limits.authentication_deadline_seconds) + 40)
     finally:

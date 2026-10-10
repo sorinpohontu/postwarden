@@ -61,6 +61,25 @@ class Counts:
 
 
 @dataclass(slots=True)
+class DkimCounts:
+    """SPF-pass messages by what DKIM showed; the rate is failed over evaluated."""
+    messages: int = 0
+    unsigned: int = 0
+    skipped: int = 0
+    incomplete: int = 0
+    evaluated: int = 0
+    failed: int = 0
+    temperror: int = 0
+    neutral: int = 0
+    policy: int = 0
+
+    def as_dict(self) -> dict:
+        data = {name: getattr(self, name) for name in self.__slots__}
+        data["rate"] = round(self.failed / self.evaluated, 4) if self.evaluated else None
+        return data
+
+
+@dataclass(slots=True)
 class Tally:
     lines: int = 0
     totals: Counts = field(default_factory=Counts)
@@ -68,6 +87,8 @@ class Tally:
     senders: dict[str, dict[str | None, Counts]] = field(default_factory=dict)
     starts: list[tuple[str, str]] = field(default_factory=list)
     limits_off: bool = False
+    diagnostics: dict[str, int] = field(default_factory=lambda: {"on": 0, "off": 0, "unknown": 0})
+    dkim: dict[str, DkimCounts] = field(default_factory=lambda: {"aligned": DkimCounts(), "unaligned": DkimCounts()})
     first: str | None = None
     last: str | None = None
 
@@ -80,9 +101,47 @@ def _sender_domain(fields: dict) -> str | None:
     return sender.rpartition("@")[2].lower() or None if "@" in sender else None
 
 
+def _summary(text: str) -> dict[str, int] | None:
+    counts = {}
+    for item in text.split(","):
+        name, _, number = item.partition(":")
+        if not number.isdigit():
+            return None
+        counts[name] = int(number)
+    return counts
+
+
+def _count_dkim(result: Tally, fields: dict) -> None:
+    """One checked message: diagnostics coverage, and for an SPF pass what its DKIM signatures showed."""
+    result.diagnostics[fields.get("dkim_diagnostics") if fields.get("dkim_diagnostics") in ("on", "off") else "unknown"] += 1
+    if fields.get("spf") != "pass":
+        return
+    aligned = fields.get("spf_domain") is not None and fields.get("spf_domain") == fields.get("from_domain")
+    counts = result.dkim["aligned" if aligned else "unaligned"]
+    counts.messages += 1
+    if fields.get("dkim") == "skipped":
+        counts.skipped += 1
+        return
+    summary = _summary(fields.get("dkim_summary", ""))
+    if summary is None:
+        return
+    for name in ("temperror", "neutral", "policy"):
+        if summary.get(name):
+            setattr(counts, name, getattr(counts, name) + 1)
+    if not any(summary.values()):
+        counts.unsigned += 1
+    elif fields.get("dkim_incomplete"):
+        counts.incomplete += 1
+    elif summary.get("pass", 0) + summary.get("fail", 0) + summary.get("permerror", 0):
+        counts.evaluated += 1
+        if not any(summary.get(name) for name in ("pass", "temperror", "neutral", "policy")):
+            counts.failed += 1
+
+
 def tally(lines: Iterable[str]) -> Tally:
     result = Tally()
     seen: set[tuple[str, ...]] = set()
+    checked: set[str] = set()
     for line in lines:
         parsed = parse_line(line)
         if parsed is None:
@@ -95,6 +154,10 @@ def tally(lines: Iterable[str]) -> Tally:
             result.starts.append((stamp, fields.get("logging_level", "")))
             continue
         action, stage = fields.get("action"), fields.get("stage")
+        if stage == "eom" and "spf" in fields and fields.get("mid") not in checked:
+            if fields.get("mid"):
+                checked.add(fields["mid"])
+            _count_dkim(result, fields)
         key = fields.get("limit_key")
         domain = _sender_domain(fields) if key and key.startswith(LOGIN_PREFIX) else None
         if action in ("reject", "defer", "would_reject", "would_defer"):
@@ -133,16 +196,20 @@ def completeness(result: Tally) -> list[str]:
     if not result.starts:
         return ["no daemon start line in the period: the logging level of the earliest lines is unknown"]
     notes = []
-    unknown = [stamp for stamp, level in result.starts if not level]
-    if len(unknown) == 1:
-        notes.append(f"start at {unknown[0]} did not log its logging level: decisions may be missing after it")
-    elif unknown:
-        notes.append(f"{len(unknown)} starts between {unknown[0]} and {unknown[-1]} did not log their logging level: "
-                     "decisions may be missing after them")
     for stamp, level in result.starts:
-        if level and level not in _LEVELS[:2]:
+        if level not in _LEVELS[:2]:
             notes.append(f"logging level {level} from {stamp}: decisions below it were not logged")
     return notes
+
+
+def diagnostics_state(lines: dict[str, int]) -> str:
+    if not lines["on"] and not lines["off"]:
+        return "unknown"
+    if lines["on"] and not lines["off"] and not lines["unknown"]:
+        return "enabled"
+    if lines["off"] and not lines["on"] and not lines["unknown"]:
+        return "disabled"
+    return "partial"
 
 
 def _limits_for(limits: SendingLimitSettings, key: str, domain: str | None) -> tuple[int, int]:
@@ -208,11 +275,33 @@ def report(result: Tally, limits: SendingLimitSettings, *, source: dict, config:
         "observed": refusal_rows(True),
         "senders": ranking(result, limits, top),
         "senders_total": len(result.senders),
+        "dkim": {"diagnostics": diagnostics_state(result.diagnostics), "checked": dict(result.diagnostics),
+                 "spf_pass": {name: counts.as_dict() for name, counts in result.dkim.items()}},
     }
 
 
 def _limit(per_hour: int | None, per_day: int | None) -> str | None:
     return None if per_hour is None else f"{per_hour}/{per_day}"
+
+
+def _dkim_lines(dkim: dict) -> list[str]:
+    checked = dkim["checked"]
+    state = dkim["diagnostics"]
+    if state == "unknown":
+        return ["diagnostics unknown: no checked message in the period logged dkim_diagnostics"]
+    out = [f"diagnostics {state}" + ("" if state in ("enabled", "disabled") else
+                                     f": {checked['on']} checked message(s) on, {checked['off']} off, "
+                                     f"{checked['unknown']} unknown")]
+    rows = [[f"SPF {name}", c["messages"], c["evaluated"], c["failed"],
+             "-" if c["rate"] is None else f"{c['rate'] * 100:.1f}%", c["unsigned"], c["skipped"], c["incomplete"],
+             c["temperror"], c["neutral"], c["policy"]] for name, c in dkim["spf_pass"].items()]
+    out += box(["", "messages", "evaluated", "all failed", "rate", "unsigned", "skipped", "incomplete", "temperror",
+                "neutral", "policy"], rows)
+    if state == "enabled" and not any(c["evaluated"] for c in dkim["spf_pass"].values()):
+        out.append("no SPF-pass message had a signature evaluated to pass, fail or permerror")
+    if state != "enabled":
+        out.append("with dkim_diagnostics off, DKIM is skipped where SPF decides; the rate covers only the rest")
+    return out
 
 
 def render(data: dict, period: tuple[str | None, str | None] = (None, None)) -> list[str]:
@@ -253,6 +342,8 @@ def render(data: dict, period: tuple[str | None, str | None] = (None, None)) -> 
     rows = [[label, e["messages"], e["delivered"], *(e[key] for _, key in shown), _limit(e["per_hour"], e["per_day"])]
             for label, e in entries]
     out += box(headers, rows) if rows else ["none"]
+
+    out += ["", "DKIM after an SPF pass"] + _dkim_lines(data["dkim"])
 
     out += ["", "Counts are totals for the period; delivered means handed on to Postfix."]
     if not show_allowed:

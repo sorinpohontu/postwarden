@@ -48,6 +48,17 @@ class WaitReady(unittest.TestCase):
         threading.Thread(target=listen_later, daemon=True).start()
         self.assertEqual(self.wait(5), 0)
 
+    def test_ready_daemon_publishes_the_configuration_it_loaded(self):
+        loaded = os.path.join(self.dir, "loaded-config.sha256")
+        Path(loaded + ".pending").write_text("ab" * 32 + "\n")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        server.bind(self.sock_path)
+        server.listen(1)
+        with mock.patch("postwarden.__main__.LOADED_CONFIG", loaded):
+            self.assertEqual(self.wait(2), 0)
+        self.assertEqual((Path(loaded).read_text(), os.path.exists(loaded + ".pending")), ("ab" * 32 + "\n", False))
+
     def test_stale_socket_file_is_not_ready(self):
         stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         stale.bind(self.sock_path)
@@ -243,8 +254,9 @@ class Overview(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(self.rows(out), [
             ("postwarden", f"{__version__} on mx1"), ("Config", path), ("---", ""),
-            ("Mode", "enforce (all rules except sending limits)"),
-            ("Sending limits", "observe; 100/h, 500/day per sender; local 1000/h, 5000/day"), ("Protected", "all@*"), ("Protected", "everyone@*"),
+            ("Protection", "enforce"), ("Self-sender", "observe"), ("Sender authentication", "observe"),
+            ("Limits", "observe"), ("Sending limits", "observe; 100/h, 500/day per sender; local 1000/h, 5000/day"),
+            ("Failure action", "tempfail (auto)"), ("Protected", "all@*"), ("Protected", "everyone@*"),
             ("Protected", "all@example.com"), ("Protected", "everyone@example.com"), ("---", ""),
             ("Service", "active since Tue 2026-09-29 11:52:15 EEST"), ("---", ""),
             ("Docs", "/etc/postwarden/docs"), ("Homepage", "https://github.com/sorinpohontu/postwarden"), ("---", "")])
@@ -263,9 +275,10 @@ class Overview(unittest.TestCase):
     def test_limits_row_lists_only_keys_changed_from_their_defaults(self):
         with tempfile.TemporaryDirectory() as directory:
             path = self.write(directory, BASE_TOML + "\n[limits]\nmax_recipients = 500\nmessage_bytes = 41943040\n"
-                                                      "dns_timeout_seconds = 3\n")
+                                                      "dns_timeout_seconds = 3\ndkim_worker_memory = 268435456\n")
             status, out = self.run_bare("--config", path)
-        self.assertEqual(dict(self.rows(out))["Limits"], "max_recipients 500, dns_timeout_seconds 3")
+        self.assertEqual(dict(self.rows(out))["Limits"],
+                         "observe; max_recipients 500, dns_timeout_seconds 3, dkim_worker_memory 268435456")
 
     def test_sending_limits_show_numbers_and_multipliers_but_not_when_off(self):
         extra = ('\n[sending_limits]\nper_hour = 50\n[sending_limits.multipliers]\n'
@@ -280,11 +293,22 @@ class Overview(unittest.TestCase):
         self.assertEqual(dict(off)["Sending limits"], "off")
         self.assertNotIn("Multipliers", dict(off))
 
+    def test_drift_from_postfix_and_the_running_daemon_is_shown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write(directory, BASE_TOML)
+            with mock.patch("postwarden.postfix.read_failure_action", return_value="accept"), \
+                 mock.patch("postwarden.__main__.loaded_sha256", return_value="f" * 64):
+                status, out = self.run_bare("--config", path, which="/bin/systemctl", shown="ActiveState=active\n")
+        rows = self.rows(out)
+        self.assertIn(("Postfix", "Postfix uses failure action accept, the configuration selects tempfail: "
+                                  "run install.py configure-postfix --apply"), rows)
+        self.assertIn(("Service", f"runs an earlier {path}: run install.py configure-postfix --apply"), rows)
+
     def test_missing_config_and_systemctl_are_lines_not_errors(self):
         status, out = self.run_bare("--config", "/nonexistent/config.toml")
         rows = dict(self.rows(out))
         self.assertEqual(status, 0)
-        self.assertTrue(rows["Mode"].startswith("not read: configuration file not found"))
+        self.assertTrue(rows["Modes"].startswith("not read: configuration file not found"))
         self.assertEqual(rows["Service"], "unknown (systemctl not found)")
 
 
@@ -310,7 +334,7 @@ class RunSocketOption(unittest.TestCase):
         import types
         captured = {}
         fake = types.ModuleType("postwarden.milter")
-        fake.run_daemon = lambda settings: captured.setdefault("settings", settings) and 0
+        fake.run_daemon = lambda settings, loaded=None: captured.update(settings=settings, loaded=loaded) or 0
         tmp = tempfile.mkdtemp(dir="/tmp")
         self.addCleanup(shutil.rmtree, tmp, True)
         config = os.path.join(tmp, "config.toml")
@@ -318,17 +342,20 @@ class RunSocketOption(unittest.TestCase):
             fh.write(BASE_TOML)
         with mock.patch.dict(sys.modules, {"postwarden.milter": fake}), \
              mock.patch("postwarden.__main__._with_postfix", side_effect=lambda s, required: (s, "")), \
-             mock.patch("sys.stderr"):
+             mock.patch("os.path.isdir", return_value=True), mock.patch("sys.stderr"):
             status = main(["--config", config, "run", *extra])
+        self.loaded = captured.get("loaded")
         return status, captured.get("settings")
 
     def test_socket_override_reaches_the_daemon(self):
         status, settings = self.run_with("--socket", "unix:/tmp/pwload/policy.sock")
         self.assertEqual(settings.service.socket, "unix:/tmp/pwload/policy.sock")
+        self.assertIsNone(self.loaded)
 
     def test_default_socket_is_unchanged(self):
         status, settings = self.run_with()
         self.assertEqual(settings.service.socket, ServiceSettings().socket)
+        self.assertEqual(self.loaded, "/run/postwarden/loaded-config.sha256")
 
     def test_malformed_socket_refused(self):
         status, settings = self.run_with("--socket", "/tmp/x.sock")
@@ -344,7 +371,7 @@ class InstallerArguments(unittest.TestCase):
         spec.loader.exec_module(self.cli)
 
     def test_apply_and_dry_run_are_exclusive(self):
-        for command in (["install"], ["configure-postfix", "--phase", "observe"], ["rollback", "--deployment-id", "x"]):
+        for command in (["install"], ["configure-postfix"], ["rollback", "--deployment-id", "x"]):
             with self.subTest(command=command[0]), mock.patch.object(self.cli.deployment, "inspect") as inspect, \
                  mock.patch("sys.stderr", new=io.StringIO()) as err, self.assertRaises(SystemExit) as ctx:
                 self.cli.main(command + ["--apply", "--dry-run"])
@@ -353,7 +380,7 @@ class InstallerArguments(unittest.TestCase):
             inspect.assert_not_called()
 
     def test_config_only_for_inspect(self):
-        for command in (["install"], ["configure-postfix", "--phase", "enforce"], ["rollback", "--deployment-id", "x"]):
+        for command in (["install"], ["configure-postfix"], ["rollback", "--deployment-id", "x"]):
             with self.subTest(command=command[0]), mock.patch.object(self.cli.deployment, "inspect") as inspect, \
                  self.assertRaises(SystemExit) as ctx:
                 self.cli.main(["--config", "/tmp/other.toml"] + command)
@@ -361,7 +388,7 @@ class InstallerArguments(unittest.TestCase):
             inspect.assert_not_called()
         report = {"candidate_version": "x", "debian": {"id": "debian", "version_id": "13", "codename": "trixie"},
                   "python": "3.13", "supported": True, "packages": {}, "installed_release": None, "unit_installed": False,
-                  "daemon_active": False, "socket_present": False, "config": {"path": "/tmp/other.toml", "present": False},
+                  "active_record": None, "daemon_active": False, "socket_present": False, "config": {"path": "/tmp/other.toml", "present": False},
                   "postfix": None, "findings": []}
         with mock.patch.object(self.cli.deployment, "inspect", return_value=report) as inspect, \
              mock.patch("sys.stdout", new=io.StringIO()):

@@ -6,8 +6,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
 
-from .addresses import AddressError, Mailbox, parse_from_header
+from .addresses import AddressError, Mailbox, parse_envelope, parse_from_header
 from .config import Settings
+from .logging import MAX_FIELD
 from .replies import Reply
 
 
@@ -46,6 +47,7 @@ class Decision:
     rule: str
     reason: str
     reply: Reply | None = None
+    forced: bool = False
 
     @staticmethod
     def allow(rule: str, reason: str) -> "Decision":
@@ -156,7 +158,7 @@ def evaluate_protected_recipient(settings: Settings, facts: ConnectionFacts, sen
 
 def _self_sender_applies(settings: Settings, facts: ConnectionFacts, trust: TrustClass) -> bool:
     ss = settings.self_sender
-    if not ss.enabled or trust is TrustClass.LOCAL_PICKUP:
+    if ss.mode == "off" or trust is TrustClass.LOCAL_PICKUP:
         return False
     if facts.daemon_port != 25:
         return False
@@ -193,6 +195,8 @@ def evaluate_self_sender_header(settings: Settings, facts: ConnectionFacts, trus
 def requires_authentication(settings: Settings, trust: TrustClass) -> bool:
     """Whether SPF/DKIM must prove the sender domain for this trust class."""
     sa = settings.sender_authentication
+    if sa.mode == "off":
+        return False
     if trust in (TrustClass.LOCAL_PICKUP, TrustClass.LOCAL_SMTP):
         return not sa.allow_local
     if trust is TrustClass.MYNETWORKS:
@@ -200,12 +204,22 @@ def requires_authentication(settings: Settings, trust: TrustClass) -> bool:
     return trust is TrustClass.UNTRUSTED
 
 
-def evaluate_visible_from(settings: Settings, trust: TrustClass, from_values: list[str]) -> tuple[Mailbox | None, Decision | None]:
-    """Mail that must authenticate needs exactly one valid From mailbox; exempt mail tolerates a missing From."""
+def unchecked(settings: Settings, trust: TrustClass) -> Decision:
+    """The acceptance when sender authentication does not run: the section is off, or the trust class is exempt."""
+    if settings.sender_authentication.mode == "off":
+        return Decision.allow("none", "sender_authentication_off")
+    return Decision.allow("trust", f"exempt_{trust.value}")
+
+
+def evaluate_visible_from(settings: Settings, facts: ConnectionFacts, trust: TrustClass,
+                          from_values: list[str]) -> tuple[Mailbox | None, Decision | None]:
+    """Mail that must authenticate, or whose From the self-sender rule compares, needs exactly one valid From
+    mailbox; other mail tolerates a missing From."""
     try:
         return parse_from_header(from_values), None
     except AddressError as exc:
-        if not requires_authentication(settings, trust):
+        compared = _self_sender_applies(settings, facts, trust) and settings.self_sender.identity != "envelope"
+        if not (requires_authentication(settings, trust) or compared):
             return None, None
         return None, Decision(Action.REJECT, "invalid_from", str(exc), settings.reply("invalid_from"))
 
@@ -223,19 +237,32 @@ class SpfOutcome:
     result: str = ""
 
 
+DKIM_RESULTS = ("pass", "fail", "permerror", "temperror", "neutral", "policy")
+
+
 @dataclass(frozen=True, slots=True)
 class DkimOutcome:
     status: AuthStatus
     domain: str | None
     partial_body: bool = False
     detail: str = ""
+    result: str = ""
+
+    @property
+    def word(self) -> str:
+        """RFC 8601 result: neutral = not evaluated, policy = verified over a partial body (l=)."""
+        if self.result:
+            return self.result
+        if self.status is AuthStatus.PASS:
+            return "policy" if self.partial_body else "pass"
+        return self.status.value
 
 
 @dataclass(frozen=True, slots=True)
 class AuthenticationInput:
     spf: SpfOutcome
     dkim: tuple[DkimOutcome, ...] = ()
-    incomplete: bool = False
+    incomplete: str | None = None
     dkim_skipped: bool = False
 
 
@@ -250,6 +277,33 @@ def spf_decides(settings: Settings, from_domain: str, spf: SpfOutcome, null_send
     return spf.status is AuthStatus.FAIL or (spf.status is AuthStatus.PASS and not aligned_pass)
 
 
+def skip_dkim(settings: Settings, from_domain: str, spf: SpfOutcome, null_sender: bool = False) -> bool:
+    """DKIM is skipped where SPF settles the verdict, except after an SPF pass while diagnostics are on."""
+    if settings.sender_authentication.dkim_diagnostics and spf.status is AuthStatus.PASS:
+        return False
+    return spf_decides(settings, from_domain, spf, null_sender)
+
+
+def dkim_fields(settings: Settings, auth: AuthenticationInput) -> dict[str, str]:
+    """Log fields for the DKIM part of a check: a list cut at entry boundaries, and a summary of every signature."""
+    diagnostics = {"dkim_diagnostics": "on" if settings.sender_authentication.dkim_diagnostics else "off"}
+    if auth.dkim_skipped:
+        return {"dkim": "skipped", **diagnostics}
+    entries = [f"{o.domain or '-'}:{o.word}" for o in auth.dkim]
+    shown: list[str] = []
+    for entry in entries[:settings.limits.max_signatures]:
+        if len(",".join(shown + [entry])) > MAX_FIELD:
+            break
+        shown.append(entry)
+    fields = {"dkim": ",".join(shown) if shown else None if entries else "none"}
+    if len(shown) < len(entries):
+        fields["dkim_truncated"] = "yes"
+    fields["dkim_summary"] = ",".join(f"{r}:{sum(o.word == r for o in auth.dkim)}" for r in DKIM_RESULTS)
+    if auth.incomplete:
+        fields["dkim_incomplete"] = auth.incomplete
+    return {key: value for key, value in fields.items() if value is not None} | diagnostics
+
+
 def evaluate_authentication(settings: Settings, trust: TrustClass, from_domain: str,
                             auth: AuthenticationInput, null_sender: bool = False) -> Decision:
     """Both mechanisms must pass with exact From-domain alignment; temporary errors defer, never rescue.
@@ -257,7 +311,7 @@ def evaluate_authentication(settings: Settings, trust: TrustClass, from_domain: 
     Null-sender mail (bounces) may instead rely on an aligned DKIM pass alone."""
     rule = "authentication"
     if not requires_authentication(settings, trust):
-        return Decision.allow(rule, f"exempt_{trust.value}")
+        return unchecked(settings, trust)
 
     spf_pass = auth.spf.status is AuthStatus.PASS and auth.spf.domain == from_domain
     spf_temp = auth.spf.status is AuthStatus.TEMPERROR
@@ -272,10 +326,14 @@ def evaluate_authentication(settings: Settings, trust: TrustClass, from_domain: 
             reason = "evaluation_incomplete" if auth.incomplete else "spf_temperror" if spf_temp else "dkim_temperror"
             return Decision(Action.DEFER, rule, reason, settings.reply("temporary_failure"))
         return Decision(Action.REJECT, rule, "no_aligned_pass", settings.reply("authentication_failed"))
+    null_dkim = null_sender and settings.sender_authentication.null_sender == "dkim_aligned"
+    if not null_dkim and (auth.spf.status is AuthStatus.FAIL or (auth.spf.status is AuthStatus.PASS and not spf_pass)):
+        reason = "spf_" + (auth.spf.result or "fail") if auth.spf.status is AuthStatus.FAIL else "spf_unaligned"
+        return Decision(Action.REJECT, rule, reason, settings.reply("authentication_failed"))
     if auth.incomplete and not dkim_pass:
         return Decision(Action.DEFER, rule, "evaluation_incomplete", settings.reply("temporary_failure"))
 
-    if null_sender and settings.sender_authentication.null_sender == "dkim_aligned":
+    if null_dkim:
         if dkim_pass:
             return Decision.allow(rule, "null_sender_dkim_aligned")
         if dkim_temp:
@@ -283,9 +341,6 @@ def evaluate_authentication(settings: Settings, trust: TrustClass, from_domain: 
         reason = "dkim_absent" if not auth.dkim else "dkim_no_aligned_pass"
         return Decision(Action.REJECT, rule, reason, settings.reply("authentication_failed"))
 
-    if auth.spf.status is AuthStatus.FAIL or (auth.spf.status is AuthStatus.PASS and not spf_pass):
-        reason = "spf_" + (auth.spf.result or "fail") if auth.spf.status is AuthStatus.FAIL else "spf_unaligned"
-        return Decision(Action.REJECT, rule, reason, settings.reply("authentication_failed"))
     if not dkim_pass and not dkim_temp:
         reason = "dkim_absent" if not auth.dkim else "dkim_no_aligned_pass"
         return Decision(Action.REJECT, rule, reason, settings.reply("authentication_failed"))
@@ -293,6 +348,32 @@ def evaluate_authentication(settings: Settings, trust: TrustClass, from_domain: 
         return Decision(Action.DEFER, rule, "spf_temperror" if spf_temp else "dkim_temperror",
                         settings.reply("temporary_failure"))
     return Decision.allow(rule, "spf_and_dkim_aligned")
+
+
+def mode_of(settings: Settings, decision: Decision) -> str:
+    """A forced decision enforces whatever its section's mode: a bound that kept an enforced check from running."""
+    return "enforce" if decision.forced else settings.rule_mode(decision.rule)
+
+
+def enforced(settings: Settings, decision: Decision | None) -> bool:
+    return decision is not None and decision.action is not Action.ALLOW and mode_of(settings, decision) == "enforce"
+
+
+def combine(decisions: list[Decision | None]) -> Decision:
+    """Rejection outranks deferral outranks allowance."""
+    present = [d for d in decisions if d is not None]
+    for action in (Action.REJECT, Action.DEFER):
+        for d in present:
+            if d.action is action:
+                return d
+    return present[0] if present else Decision.allow("none", "no_rule_matched")
+
+
+def effective(settings: Settings, decisions: list[Decision | None]) -> Decision:
+    """An enforced refusal outranks an observed one, so observing one rule never lets another's refusal through."""
+    present = [d for d in decisions if d is not None and (d.action is Action.ALLOW or mode_of(settings, d) != "off")]
+    refusals = [d for d in present if enforced(settings, d)]
+    return combine(refusals) if refusals else combine(present)
 
 
 @dataclass(slots=True)
@@ -311,24 +392,51 @@ class TransactionState:
     null_sender: bool = False
     raw_sender: str | None = None
     recipients: list[RecipientState] = field(default_factory=list)
-    overflow_rcpts: int = 0
+    overflow_refused: dict[Decision, int] = field(default_factory=dict)
     deferred_rejections: list[Decision] = field(default_factory=list)
 
-    def accepted_recipients(self) -> list[Mailbox]:
-        return [r.original for r in self.recipients
-                if r.original is not None and (r.decision is None or r.decision.action is Action.ALLOW)]
+    def refused_overflow(self) -> list[Decision]:
+        """Refusals of recipients over max_recipients, counted but not kept, so refused overflow takes no memory."""
+        return [d for d, count in self.overflow_refused.items() for _ in range(count)]
+
+    def accepted_recipients(self, settings: Settings) -> list[Mailbox]:
+        """Recipients Postfix accepted: allowed, or refused only by an observed rule."""
+        return [r.original for r in self.recipients if r.original is not None and not enforced(settings, r.decision)]
 
 
-def evaluate_recipient(settings: Settings, facts: ConnectionFacts, trust: TrustClass,
-                       state: TransactionState, recipient: Mailbox, transport: str | None = None) -> Decision:
-    """RCPT-stage composition: protected first, then self-sender; an allowance never cancels a rejection."""
-    decisions = [
-        evaluate_protected_recipient(settings, facts, state.sender, recipient, transport),
-        evaluate_self_sender_envelope(settings, facts, trust, state.sender, recipient),
-    ]
-    final = combine(decisions)
+def evaluate_recipient(settings: Settings, facts: ConnectionFacts, trust: TrustClass, state: TransactionState,
+                       text: str, transport: str | None = None) -> tuple[Mailbox | None, Decision]:
+    """RCPT-stage composition: syntax, protected, then self-sender, then the max_recipients bound, which never
+    hides an enforced refusal; an allowance never cancels a rejection."""
+    overflow = settings.limits.bounded and len(state.recipients) >= settings.limits.max_recipients
+    try:
+        recipient = parse_envelope(text)
+        if recipient is None:
+            raise AddressError("empty recipient")
+    except AddressError:
+        recipient = None
+        final = Decision(Action.REJECT, "invalid_recipient", "recipient_unparseable", settings.reply("invalid_recipient"))
+    else:
+        final = effective(settings, [
+            evaluate_protected_recipient(settings, facts, state.sender, recipient, transport),
+            evaluate_self_sender_envelope(settings, facts, trust, state.sender, recipient),
+        ])
+    if overflow:
+        if not enforced(settings, final):
+            final = Decision(Action.DEFER, "limits", "max_recipients", settings.reply("temporary_failure"))
+        if enforced(settings, final):
+            state.overflow_refused[final] = state.overflow_refused.get(final, 0) + 1
+            return recipient, final
     state.recipients.append(RecipientState(recipient, final))
-    return final
+    return recipient, final
+
+
+def needs_message(settings: Settings, facts: ConnectionFacts, trust: TrustClass) -> bool:
+    """Whether an enforced From or authentication check applies, so a bound that withholds the message must defer."""
+    sa_enforced = settings.sender_authentication.mode == "enforce" and requires_authentication(settings, trust)
+    ss_enforced = (settings.self_sender.mode == "enforce" and settings.self_sender.identity != "envelope"
+                   and _self_sender_applies(settings, facts, trust))
+    return sa_enforced or ss_enforced
 
 
 def evaluate_message(settings: Settings, facts: ConnectionFacts, trust: TrustClass, state: TransactionState,
@@ -339,25 +447,18 @@ def evaluate_message(settings: Settings, facts: ConnectionFacts, trust: TrustCla
     decisions: list[Decision | None] = list(state.deferred_rejections)
     header_from = None
     if from_values is not None:
-        header_from, from_decision = evaluate_visible_from(settings, trust, from_values)
+        header_from, from_decision = evaluate_visible_from(settings, facts, trust, from_values)
         decisions.append(from_decision)
     if header_from is not None:
-        decisions.append(evaluate_self_sender_header(settings, facts, trust, header_from, state.accepted_recipients()))
+        decisions.append(evaluate_self_sender_header(settings, facts, trust, header_from,
+                                                     state.accepted_recipients(settings)))
     if over_limit:
-        decisions.append(Decision(Action.DEFER, "limits", over_limit, settings.reply("temporary_failure")))
+        forced = needs_message(settings, facts, trust) if from_values is None else (
+            settings.sender_authentication.mode == "enforce" and requires_authentication(settings, trust))
+        decisions.append(Decision(Action.DEFER, "limits", over_limit, settings.reply("temporary_failure"), forced))
     elif (requires_authentication(settings, trust) and header_from is not None
-          and not any(d is not None and d.action is Action.REJECT for d in decisions)):
+          and not any(enforced(settings, d) and d.action is Action.REJECT for d in decisions)):
         decisions.append(authenticate(header_from))
     if not any(d is not None for d in decisions):
-        decisions.append(Decision.allow("trust", f"exempt_{trust.value}"))
+        decisions.append(unchecked(settings, trust))
     return decisions, header_from
-
-
-def combine(decisions: list[Decision | None]) -> Decision:
-    """Rejection outranks deferral outranks allowance."""
-    present = [d for d in decisions if d is not None]
-    for action in (Action.REJECT, Action.DEFER):
-        for d in present:
-            if d.action is action:
-                return d
-    return present[0] if present else Decision.allow("none", "no_rule_matched")

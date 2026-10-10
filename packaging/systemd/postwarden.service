@@ -17,6 +17,8 @@ RestartSec=2s
 UMask=0007
 StateDirectory=postwarden
 StateDirectoryMode=0700
+RuntimeDirectory=postwarden
+RuntimeDirectoryMode=0755
 ReadWritePaths=/var/spool/postfix/postwarden
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -28,6 +30,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LimitNOFILE=4096
+MemoryHigh=3G
 
 [Install]
 WantedBy=multi-user.target

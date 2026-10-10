@@ -163,6 +163,23 @@ class Reservations(unittest.TestCase):
         self.assertEqual(quota.counts("a", T0), (50, 50))
 
 
+class ObserveCountsDeliveries(unittest.TestCase):
+    def test_observed_recipients_over_the_limit_are_still_counted(self):
+        quota = store()
+        self.assertEqual(send(quota, key("a"), 5, T0, observe=True), [PER_HOUR, PER_HOUR])
+        self.assertEqual(quota.counts("a", T0), (5, 5))
+        self.assertEqual(send(quota, key("a"), 1, T0, observe=False), [PER_HOUR])
+        self.assertEqual(quota.counts("a", T0), (5, 5))
+
+    def test_observed_local_mail_counts_on_key_and_local_cap(self):
+        quota = store(LocalCap.CAP, capacity=10)
+        self.assertEqual(send(quota, key("a@example.com", local=True), 5, T0, observe=True),
+                         [PER_HOUR, PER_HOUR])
+        self.assertEqual((quota.counts("a@example.com", T0), quota.local_counts(T0)), ((5, 5), (5, 5)))
+        self.assertEqual(send(quota, key("b@example.com", local=True), 1, T0, observe=True), [LOCAL_PER_HOUR])
+        self.assertEqual(quota.local_counts(T0), (6, 6))
+
+
 class LocalCap(unittest.TestCase):
     CAP = '\n[sending_limits]\nlocal_per_hour = 4\nlocal_per_day = 6\n'
 

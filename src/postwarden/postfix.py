@@ -91,6 +91,37 @@ def with_postfix(settings: Settings, mynetworks: tuple[Network, ...] | None = No
         settings.trust, mynetworks=mynetworks, recipient_delimiter=recipient_delimiter))
 
 
+POSTWARDEN_SOCKET = "unix:postwarden/policy.sock"
+
+
+def failure_action_in(smtpd_milters: str, milter_default_action: str) -> str | None:
+    """The default_action Postfix applies when postwarden is unreachable, or None when postwarden is not in the chain."""
+    if POSTWARDEN_SOCKET not in smtpd_milters:
+        return None
+    entry = re.search(r"\{[^{}]*" + re.escape(POSTWARDEN_SOCKET) + r"[^{}]*\}", smtpd_milters)
+    action = re.search(r"default_action\s*=\s*(\w+)", entry.group()) if entry else None
+    return action.group(1) if action else milter_default_action
+
+
+def read_failure_action() -> str | None:
+    try:
+        result = subprocess.run(["postconf", "-xh", "smtpd_milters", "milter_default_action"],
+                                check=True, text=True, capture_output=True, timeout=30)
+    except FileNotFoundError:
+        raise PostfixError("postconf not found") from None
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise PostfixError(f"postconf failed: {getattr(exc, 'stderr', '') or exc}") from None
+    milters, _, default = result.stdout.rstrip("\n").partition("\n")
+    return failure_action_in(milters, default.strip())
+
+
+def failure_action_warning(actual: str | None, selected: str) -> str | None:
+    if actual is None or actual == selected:
+        return None
+    return (f"Postfix uses failure action {actual}, the configuration selects {selected}: "
+            "run install.py configure-postfix --apply")
+
+
 RATE_PARAMS = ("smtpd_client_recipient_rate_limit", "smtpd_client_message_rate_limit")
 SUBMISSION_SERVICES = ("submission/inet", "submissions/inet", "smtps/inet")
 SMTP_SERVICES = ("smtp/inet", "smtpd/pass") + SUBMISSION_SERVICES

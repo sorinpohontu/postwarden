@@ -33,6 +33,17 @@ class Evaluation(unittest.TestCase):
     def setUp(self):
         self.s = settings()
 
+    def test_mixed_modes_match_the_daemon(self):
+        s = settings('\n[protection]\nmode = "observe"\n')
+        message = b"From: all@example.com\nTo: all@example.com\n\nhello\n"
+        outcome = simulate(s, facts(recipients=("all@example.com",), spf="pass", dkim="pass"), message)
+        self.assertEqual(rcpt_results(outcome), [("all@example.com", "reject", "protected_recipient",
+                                                  "ingress_smtp25")])
+        self.assertEqual((outcome.final.rule, outcome.final.reason), ("self_sender", "header_from_matches_recipient"))
+        lines = render(s, facts(recipients=("all@example.com",)), outcome, None)
+        self.assertTrue(any("would_reject  protected_recipient" in line for line in lines))
+        self.assertTrue(any(line.strip().startswith("reject  self_sender") for line in lines))
+
     def test_mixed_recipients_on_submission(self):
         outcome = simulate(self.s, facts(ingress="587", login="demo@example.com", sender="demo@example.com",
                                          recipients=("carol@example.net", "all@example.com")), MESSAGE)
@@ -41,6 +52,33 @@ class Evaluation(unittest.TestCase):
                                                  ("all@example.com", "reject", "protected_recipient", "login_not_authorized")])
         self.assertEqual((outcome.final.action.value, outcome.final.rule), ("allow", "trust"))
         self.assertEqual(outcome.exit_code, 1)
+
+    def test_message_not_reached_when_every_recipient_is_refused(self):
+        s = settings('\n[self_sender]\nmode = "enforce"\n')
+        message = b"From: carol@example.com\nTo: carol@example.com\n\nhello\n"
+        live = mock.Mock(side_effect=AssertionError("no lookup for a message Postfix never receives"))
+        outcome = simulate(s, facts(sender="carol@example.com"), message, live=live)
+        self.assertEqual(rcpt_results(outcome), [("carol@example.com", "reject", "self_sender",
+                                                  "envelope_matches_recipient")])
+        self.assertTrue(outcome.unreached)
+        self.assertIsNone(outcome.final)
+        self.assertEqual(outcome.exit_code, 1)
+        self.assertTrue(any("not reached" in line for line in render(s, facts(sender="carol@example.com"), outcome,
+                                                                      "m.eml")))
+        observed = simulate(settings('\n[self_sender]\nmode = "observe"\n'),
+                            facts(sender="carol@example.com", spf="pass", dkim="pass"), message)
+        self.assertFalse(observed.unreached)
+        self.assertIsNotNone(observed.final)
+
+    def test_acceptance_without_authentication_names_its_cause(self):
+        off = settings('\n[sender_authentication]\nmode = "off"\n')
+        cases = [(off, "198.51.100.7", ("none", "sender_authentication_off")),
+                 (off, "203.0.113.5", ("none", "sender_authentication_off")),
+                 (self.s, "203.0.113.5", ("trust", "exempt_mynetworks"))]
+        for s, peer, expected in cases:
+            outcome = simulate(s, facts(peer=peer, spf="fail", dkim="none"), MESSAGE)
+            self.assertEqual((outcome.final.action.value, outcome.final.rule, outcome.final.reason),
+                             ("allow",) + expected, (s.sender_authentication.mode, peer))
 
     def test_forced_results_decide_authentication(self):
         cases = {("pass", "pass"): ("allow", "spf_and_dkim_aligned"), ("pass", "none"): ("reject", "dkim_absent"),
@@ -60,10 +98,11 @@ class Evaluation(unittest.TestCase):
         results = {}
         for name, peer in (("same host", "127.0.0.1"), ("mynetworks", "203.0.113.9"), ("external", "198.51.100.7")):
             outcome = simulate(self.s, facts(peer=peer, sender="carol@example.com", spf="pass", dkim="pass"), message)
-            results[name] = (outcome.trust.value, outcome.recipients[0][1].action.value, outcome.final.action.value)
+            final = outcome.final.action.value if outcome.final else "not reached"
+            results[name] = (outcome.trust.value, outcome.recipients[0][1].action.value, final)
         self.assertEqual(results, {"same host": ("local_smtp", "allow", "allow"),
                                    "mynetworks": ("mynetworks", "allow", "allow"),
-                                   "external": ("untrusted", "reject", "allow")})
+                                   "external": ("untrusted", "reject", "not reached")})
 
     def test_local_pickup_applies_refusals_at_end_of_message(self):
         outcome = simulate(self.s, facts(ingress="local", peer=None, sender="www-data@example.com",
@@ -90,7 +129,7 @@ class Evaluation(unittest.TestCase):
     def test_live_dns_is_used_for_what_is_not_forced(self):
         calls = []
 
-        def live(peer, helo, sender, message, signatures, limits, deadline=None, skip_dkim=None):
+        def live(peer, helo, sender, message, signatures, limits, deadline=None, skip_dkim=None, workers=None):
             calls.append((peer, sender, skip_dkim(SpfOutcome(AuthStatus.FAIL, None, "fail"))))
             return AuthenticationInput(SpfOutcome(AuthStatus.PASS, "example.org", "pass"),
                                        (DkimOutcome(AuthStatus.TEMPERROR, "example.org"),))
@@ -102,6 +141,22 @@ class Evaluation(unittest.TestCase):
         self.assertEqual(outcome.authentication, "spf=pass (forced), dkim=example.org:temperror (DNS)")
         outcome = simulate(self.s, facts(dkim="pass"), MESSAGE, live=live)
         self.assertEqual(outcome.final.reason, "spf_and_dkim_aligned")
+
+    def test_large_message_is_verified_by_a_worker_as_in_the_daemon(self):
+        from postwarden import authentication
+        message = (b"DKIM-Signature: v=1; a=rsa-sha256; d=example.org; s=sel; h=from; bh=AA==; b=AA==\n"
+                   b"From: bob@example.org\nTo: carol@example.com\n\n" + b"x" * 300000)
+        worker = [sys.executable, "-c", "import json, sys\njson.loads(sys.stdin.read())\nprint(json.dumps({'memory': True}))"]
+        aligned = SpfOutcome(AuthStatus.PASS, "example.org", "pass")
+        with mock.patch.object(authentication, "WORKER_COMMAND", worker), \
+                mock.patch.object(authentication, "spf_check", return_value=aligned):
+            outcome = simulate(self.s, facts(), message)
+        self.assertEqual((outcome.final.action.value, outcome.final.reason), ("defer", "evaluation_incomplete"))
+
+    def test_limits_off_keeps_the_whole_message(self):
+        s = settings('\n[limits]\nmode = "off"\nmessage_bytes = 10\nmax_headers = 1\n')
+        final = simulate(s, facts(spf="pass", dkim="pass"), MESSAGE).final
+        self.assertEqual((final.action.value, final.reason), ("allow", "spf_and_dkim_aligned"))
 
     def test_header_limit_defers(self):
         s = settings("\n[limits]\nmax_headers = 1\n")
@@ -190,7 +245,8 @@ class Command(unittest.TestCase):
         self.assertEqual((rows["Config"], rows["Sending limits"], rows["Daemon"]),
                          (self.config, "observe; 100/h, 500/day per sender; local 1000/h, 5000/day",
                           "not affected; nothing is sent"))
-        self.assertEqual(rows["Mode"], "enforce (all rules except sending limits)")
+        self.assertEqual((rows["Protection"], rows["Sender authentication"], rows["Failure action"]),
+                         ("enforce", "observe", "tempfail (auto)"))
         self.assertTrue(out.splitlines()[1].startswith("| postwarden "))
 
     def test_usage_errors(self):

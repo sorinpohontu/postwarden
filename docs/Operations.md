@@ -10,8 +10,8 @@ Day-to-day commands, the log format, and what to do when something goes wrong.
 | `systemctl status postwarden`                     | service state                                                                          |
 | `postwarden check-config`                         | validates `/etc/postwarden/config.toml` and shows what it read from Postfix            |
 | `postwarden show-config`                          | prints the settings in effect                                                          |
-| `systemctl restart postwarden`                    | applies configuration changes                                                          |
-| `postwarden wait-ready`                           | exits 0 once the socket accepts connections (default timeout 15 s)                     |
+| `install.py configure-postfix --apply`            | applies configuration changes                                                          |
+| `postwarden wait-ready`                           | exits 0 once the socket accepts connections (default timeout 15 s); run by the unit, it also publishes the hash of the loaded configuration |
 | `postwarden lookup <ref>`                         | prints the log lines for a reply reference                                             |
 | `postwarden simulate …`                           | shows what postwarden would decide for given facts and a message file; nothing is sent |
 | `postwarden stats`                                | totals, refusals and top senders for the last 24 hours, counted from the log           |
@@ -21,11 +21,13 @@ Day-to-day commands, the log format, and what to do when something goes wrong.
 
 1. Edit `/etc/postwarden/config.toml`.
 2. Run `postwarden check-config`.
-3. Run `systemctl restart postwarden`.
+3. Run `python3 /etc/postwarden/scripts/install.py configure-postfix --apply`.
 
-Always check before restarting. The restart stops the running daemon first and validates the file only when starting, so a broken file leaves postwarden **stopped**, and Postfix applies the failure action described in [When postwarden is down](#when-postwarden-is-down).
+Step 3 restarts postwarden when the file changed since it started, sets Postfix's failure action to match the configuration, and records the change for [rollback](#rollback). Run again, it reports nothing to change. `postwarden`, `check-config` and `install.py inspect` warn while the running daemon or Postfix does not match the file.
 
-`systemctl restart` returns once the new daemon accepts connections. Messages that arrive during the restart itself (usually a few seconds, mostly spent stopping) also get the failure action: in observe mode they pass unchecked, in enforce mode they get `451` and the sender retries. Restart during quiet periods when practical.
+Always check first. A restart stops the running daemon first and validates the file only when starting, so a broken file leaves postwarden **stopped**, and Postfix applies the failure action described in [When postwarden is down](#when-postwarden-is-down); `configure-postfix` then restores the previous configuration. A plain `systemctl restart postwarden` also loads the file, but records nothing; the next `configure-postfix --apply` records it without restarting again.
+
+The restart returns once the new daemon accepts connections. Messages that arrive during the restart itself (usually a few seconds, mostly spent stopping) also get the failure action: with `accept` they pass unchecked, with `tempfail` they get `451` and the sender retries. Restart during quiet periods when practical.
 
 ## Logs
 
@@ -66,9 +68,15 @@ Message bodies, passwords and raw headers are never logged; only envelope addres
 | `limit`                                        | the limit that was reached (`event=limit_reached`)                                                                                                                   |
 | `from_domain`                                  | domain of the visible `From` address                                                                                                                                 |
 | `spf`, `spf_domain`                            | SPF result and the domain it was evaluated for                                                                                                                       |
-| `dkim`                                         | DKIM results as `domain:result,...`; `skipped` when SPF already decided; `none` without signatures                                                                   |
+| `dkim`                                         | DKIM results as `domain:result,...` (results below); `skipped` when SPF already decided; `none` without signatures. Cut between entries when it gets long             |
+| `dkim_truncated`                               | `yes` when `dkim` lists fewer signatures than the message has                                                                                                        |
+| `dkim_summary`                                 | count of every signature by result, `pass:N,fail:N,permerror:N,temperror:N,neutral:N,policy:N`; not cut                                                               |
+| `dkim_incomplete`                              | `limit` (more than `max_signatures`), `deadline` (time budget, or no free DKIM process in time) or `memory` (the check exceeded `dkim_worker_memory`): the remaining signatures were not checked |
+| `dkim_diagnostics`                             | `on` or `off`: whether DKIM is also checked after an SPF pass (`eom` lines where SPF/DKIM ran, and the start line)                                                   |
 | `elapsed`                                      | seconds from MAIL FROM to the decision, including receiving the message                                                                                              |
 | `auth_elapsed`                                 | seconds spent on SPF/DKIM, including waiting for a free slot; only when they ran                                                                                     |
+
+DKIM results per signature: `pass`; `fail` (does not verify); `permerror` (missing or broken key, malformed signature); `temperror` (DNS failure or timeout); `neutral` (not checked: signature limit or time budget); `policy` (verifies, but covers only part of the body with `l=`, so it does not count).
 
 ### Actions
 
@@ -93,7 +101,8 @@ The **start line** gives the mode, the sending-limits mode, the log level, the s
 | `authentication`      | `spf_and_dkim_aligned`; `spf_<result>` (such as `spf_softfail`), `spf_unaligned`, `dkim_absent`, `dkim_no_aligned_pass`; `spf_temperror`, `dkim_temperror`, `evaluation_incomplete` (defer); `null_sender_dkim_aligned`; with `require = "either"`: `spf_aligned`, `dkim_aligned`, `no_aligned_pass`; `exempt_<trust class>` |
 | `limits`              | `message_bytes`, `max_headers`, `max_header_bytes`, `max_recipients`, `max_concurrent_messages`, `max_open_messages` (all defer)                                                                                                                                                                                             |
 | `sending_limit`       | `per_hour`, `per_day`, `local_per_hour`, `local_per_day`, `key_store_full` (all defer)                                                                                                                                                                                                                                       |
-| `trust`               | `exempt_<trust class>`: no rule refused the message and its trust class exempted it from the remaining checks (`accept` only)                                                                                                                                                                                                |
+| `trust`               | `exempt_<trust class>`: no rule refused the message and its trust class exempted it from sender authentication (`accept` only)                                                                                                                                                                                               |
+| `none`                | `sender_authentication_off`: no rule refused the message and `[sender_authentication]` is `off` (`accept` only); `no_rule_matched`: a recipient no rule matched (`RCPT`, `debug`)                                                                                                                                            |
 
 ### Log level
 
@@ -110,7 +119,7 @@ postwarden --config /tmp/candidate.toml simulate message.eml --ingress 587 --pee
 
 | Option            | Meaning                                                                                                                           |
 | ----------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `MESSAGE.eml`     | optional message file. Without it only the RCPT stage runs, and the end of message shows as not evaluated                         |
+| `MESSAGE.eml`     | optional message file. Without it only the RCPT stage runs, and the end of message shows as not evaluated; when every recipient is refused over SMTP it shows as not reached, as in Postfix |
 | `--ingress`       | `25`, `587`, `465` or `local` (sendmail)                                                                                          |
 | `--from`, `--to`  | envelope sender (`<>` for a bounce) and recipients; repeat `--to`                                                                 |
 | `--login`         | SASL login, for 587/465                                                                                                           |
@@ -124,9 +133,10 @@ postwarden --config /tmp/candidate.toml simulate message.eml --ingress 587 --pee
 The output has three parts:
 
 1. **The same box as `postwarden`**: version and host, the configuration file, then its settings:
-   - `Mode`: the global mode, which covers all rules except sending limits;
-   - `Sending limits`: their own mode, with the per-sender and local limits;
-   - `Multipliers`, each with its resulting limits, and `Limits`, the `[limits]` keys changed from their defaults (both only when present);
+   - `Protection`, `Self-sender`, `Sender authentication`: each section's mode;
+   - `Limits`: its mode, followed by the `[limits]` keys changed from their defaults;
+   - `Sending limits`: their mode, with the per-sender and local limits, and `Multipliers`, each with its resulting limits (only when present);
+   - `Failure action`: what Postfix does while postwarden is down, marked `(auto)` when derived from the modes;
    - `Protected`: the protected addresses and groups.
 
    Lists stop at five rows and point to `show-config`.
@@ -164,12 +174,12 @@ journalctl -t postwarden -p warning | grep limit_reached
 Counts are kept in `/var/lib/postwarden/limits.json` (owner `postwarden`, mode `0600`), written every minute and when the daemon stops, and read at start, so restarts and reboots keep the windows. Downtime still ages them. A crash loses at most the last minute of counts.
 
 - A missing, damaged or incompatible file is never fatal: postwarden starts with empty windows and logs `event=limit_state_empty` with the reason. On a first start, `reason=missing` is expected.
-- A failed save logs `event=limit_state_save_failed` with `snapshot_age=`, the age in seconds of the last good snapshot, and is retried a minute later; mail keeps flowing.
+- A failed save logs `event=limit_state_save_failed` with `snapshot_age=`, the age in seconds of the last good snapshot (absent when none was saved or loaded since the start), and is retried a minute later; mail keeps flowing.
 - To reset all counts, stop postwarden, delete the file and start it again.
 
 ### Common situations
 
-- **A legitimate sender needs more:** add a multiplier in `[sending_limits.multipliers]`, run `postwarden check-config`, then `systemctl restart postwarden`. `postwarden stats` shows who reaches how many recipients.
+- **A legitimate sender needs more:** add a multiplier in `[sending_limits.multipliers]`, run `postwarden check-config`, then `install.py configure-postfix --apply`. `postwarden stats` shows who reaches how many recipients.
 - **A compromised account:** change its password; the limit only slows it down.
 - **Local mail over a limit:** see below.
 
@@ -205,6 +215,7 @@ The report is a set of tables:
 
 - **The first box** names the postwarden version and host, the configuration file used for the limits column, the source, the period its lines cover (first to last timestamp), and whether the period may be incomplete: no daemon start line in the period, or a `logging_level` above `info`, which does not log decisions.
 - **Totals, refusals sent, observe mode and senders** follow, as described below. The limits column shows `per_hour/per_day`.
+- **DKIM after an SPF pass** shows, for SPF passes aligned with `From` and for the others, how many messages had DKIM signatures evaluated and how many of those had **all** evaluated signatures fail (`fail` or `permerror`), as a rate. Unsigned, skipped and incomplete messages are counted apart and are not in the rate; so are messages with `temperror`, `neutral` or `policy` signatures, which never count as failures. The rate comes from `dkim_summary`, so it is exact even when the `dkim` list was cut. `diagnostics` says whether the checked messages had [`dkim_diagnostics`](Configuration.md#sender_authentication) `enabled`, `disabled` or a mix (`partial`, with counts); `unknown` when none logged it. With diagnostics off, DKIM is skipped wherever SPF decides, so the rate covers only messages where the decision needed DKIM.
 - **What carries nothing is left out:** `recipients allowed` when it equals `recipients delivered` (no observe-mode refusals), the observe-mode table when it is empty, and sender columns that are 0 for every sender.
 
 | Measure              | Meaning                                                                                                                                                                                                              |
@@ -232,15 +243,16 @@ Sender counts are totals for the period, not peaks: they do not show how close a
 | `senders`                    | top senders: `limit_key`, `messages`, `delivered`, `allowed`, `unmeasured`, `limit_deferred`, `limit_would_defer`, `per_hour`, `per_day` |
 | `senders[].by_sender_domain` | logins without a domain: the same counts per `sender_domain`; `per_hour`/`per_day` of the login are `null` when the domains differ       |
 | `senders_total`              | number of limit keys in the period                                                                                                       |
+| `dkim`                       | `diagnostics` (`enabled`, `disabled`, `partial`, `unknown`), `checked` (messages by `on`/`off`/`unknown`), and `spf_pass.aligned`/`spf_pass.unaligned` with `messages`, `unsigned`, `skipped`, `incomplete`, `evaluated`, `failed`, `temperror`, `neutral`, `policy` and `rate` (`failed`/`evaluated`, `null` when nothing was evaluated) |
 
 ## When postwarden is down
 
-Postfix applies the milter's `default_action`:
+Postfix applies the milter's `default_action`, set from [`[postfix] failure_action`](Configuration.md#postfix) by `configure-postfix`:
 
-| Mode    | `default_action` | Effect                                                   |
-| ------- | ---------------- | -------------------------------------------------------- |
-| observe | `accept`         | mail flows unchecked                                     |
-| enforce | `tempfail`       | clients get `451 4.7.1` and retry later; nothing is lost |
+| `default_action` | When (with `"auto"`)          | Effect                                                   |
+| ---------------- | ----------------------------- | -------------------------------------------------------- |
+| `tempfail`       | any section enforces          | clients get `451 4.7.1` and retry later; nothing is lost |
+| `accept`         | every section observes or off | mail flows unchecked                                     |
 
 Restore service with `systemctl restart postwarden`; the socket is recreated on start.
 
@@ -250,8 +262,9 @@ Deferrals with `rule=limits` mean a configured bound was reached. Senders retry,
 
 - `max_concurrent_messages`: a message waits for a free SPF/DKIM slot within the authentication deadline, then is deferred.
 - `max_open_messages`: new messages are deferred while that many are being received.
+- `dkim_workers`, `dkim_worker_memory`: a signed message over 256 KiB waits for a free DKIM process within the deadline; a check that runs out of time or memory is stopped (`dkim_incomplete=deadline` or `memory`), and the message is deferred (`evaluation_incomplete`) where the decision needs DKIM.
 
-If either fires under normal load, raise it (or the deadline) after checking memory: each check holds one message in memory. See [Configuration](Configuration.md#limits).
+If one fires under normal load, raise it (or the deadline) after checking memory: each DKIM check holds its message in memory, several times over while it runs. The unit sets `MemoryHigh=3G`: above it the kernel reclaims memory from postwarden first and slows it down, without stopping it. See [Configuration](Configuration.md#limits).
 
 ## Updates
 
@@ -271,10 +284,11 @@ python3 scripts/install.py rollback --deployment-id <id> --dry-run
 python3 scripts/install.py rollback --deployment-id <id> --apply
 ```
 
-- **Order:** undo the newest deployment first. `configure-postfix` deployments restore `main.cf`, `master.cf` and `config.toml` and reload Postfix; `install` deployments restore the application, unit and launcher.
+- **`configure-postfix` deployments:** only the active one (the newest, shown by `install.py inspect`) can be rolled back. It restores `main.cf`, `master.cf` and `config.toml` as they were recorded before it, reloads Postfix and restarts postwarden as needed, and records the result as a new deployment, so the next rollback goes one step further back. The first deployment goes back to the state before postwarden was attached.
+- **`install` deployments:** restore the application, unit and launcher; undo the newest first, after detaching Postfix.
 - **Changed files:** rollback refuses when a file it would restore was changed after the deployment (content, permissions or owner, for example an edit or `chmod` of `config.toml`). It lists them; `--force` overwrites them. Restored files keep their original permissions.
-- **First installation:** rolling it back stops and disables the service and removes the unit and launcher it created. `config.toml`, the application and the backups stay. It is refused while any part of Postfix still uses postwarden, and names where; roll back the `configure-postfix` deployments first.
-- **Safety checks:** the installer handles regular files only and refuses if `config.toml`, the unit, the launcher, `main.cf` or `master.cf` is a symlink. It also refuses if a file changes while the command runs; each `--apply` makes its own plan and does not reuse an earlier dry run. If `configure-postfix` fails part-way, it restores the previous files itself and says so.
+- **First installation:** rolling it back stops and disables the service and removes the unit and launcher it created. `config.toml`, the application and the backups stay. It is refused while any part of Postfix still uses postwarden, and names where; roll back the `configure-postfix` deployments until Postfix is detached first.
+- **Safety checks:** the installer handles regular files only and refuses if `config.toml`, the unit, the launcher, `main.cf` or `master.cf` is a symlink. It also refuses if a file changes while the command runs; each `--apply` makes its own plan and does not reuse an earlier dry run. If `configure-postfix` or a rollback fails part-way, it restores the previous state itself, says so and records nothing; the files it started from stay under `before/` in that run's directory.
 - **Layout:** `configure-postfix` edits `master.cf` through `postconf`, which rewrites the file in its own layout, so comment lines between services may move. The dry run shows the diff.
 
 Each backup directory contains a `manifest.json` describing what it holds.

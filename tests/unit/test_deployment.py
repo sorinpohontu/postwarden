@@ -67,36 +67,54 @@ class RepeatedApplication(unittest.TestCase):
         self.assertFalse(self.already(["-M", "postwarden-cleanup/unix=postwarden-cleanup unix n - y - 0 cleanup"]))
 
 
-class EnforcementWithLegacyFilters(unittest.TestCase):
-    REPORT = {"postfix": {"content_filters": {"smtpd/pass": "filter-external", "smtp/inet": None,
-                                              "submission/inet": "filter-local"}}}
-    CLEAN = {"postfix": {"content_filters": {"smtpd/pass": None, "submission/inet": None}}}
+def config_report(protection="enforce", authentication="enforce", addresses=1, failure="tempfail", digest="c" * 64):
+    modes = {"protection": protection, "self_sender": "observe", "sender_authentication": authentication,
+             "limits": "observe", "sending_limits": "observe"}
+    return {"valid": True, "present": True, "sha256": digest, "modes": modes, "failure_action": failure,
+            "protected_addresses": addresses, "protected_groups": 0}
 
-    def test_enforce_refused_while_filters_reinject(self):
-        self.assertEqual(deployment.enforcement_blockers("enforce", self.REPORT, False, False),
-                         ["smtpd/pass", "submission/inet"])
+
+class EnforcementWithLegacyFilters(unittest.TestCase):
+    FILTERS = {"content_filters": {"smtpd/pass": "filter-external", "smtp/inet": None, "submission/inet": "filter-local"}}
+    REPORT = {"postfix": FILTERS, "config": config_report()}
+    CLEAN = {"postfix": {"content_filters": {"smtpd/pass": None, "submission/inet": None}}, "config": config_report()}
+
+    def test_enforced_protection_refused_while_filters_reinject(self):
+        self.assertEqual(deployment.enforcement_blockers(self.REPORT, False, False), ["smtpd/pass", "submission/inet"])
 
     def test_cutover_or_explicit_override_allowed(self):
-        self.assertEqual(deployment.enforcement_blockers("enforce", self.REPORT, True, False), [])
-        self.assertEqual(deployment.enforcement_blockers("enforce", self.REPORT, False, True), [])
+        self.assertEqual(deployment.enforcement_blockers(self.REPORT, True, False), [])
+        self.assertEqual(deployment.enforcement_blockers(self.REPORT, False, True), [])
 
-    def test_observe_and_clean_hosts_unaffected(self):
-        self.assertEqual(deployment.enforcement_blockers("observe", self.REPORT, False, False), [])
-        self.assertEqual(deployment.enforcement_blockers("enforce", self.CLEAN, False, False), [])
+    def test_observed_or_empty_protection_and_clean_hosts_unaffected(self):
+        for config in (config_report(protection="observe"), config_report(addresses=0)):
+            self.assertEqual(deployment.enforcement_blockers({"postfix": self.FILTERS, "config": config}, False, False), [])
+        self.assertEqual(deployment.enforcement_blockers(self.CLEAN, False, False), [])
+
+    def test_legacy_removal_needs_the_replacing_sections_enforced(self):
+        self.assertEqual(deployment.legacy_removal_blockers(config_report()), [])
+        self.assertEqual(deployment.legacy_removal_blockers(config_report(authentication="observe")), [
+            "[sender_authentication] mode is observe; enforce it before removing the policyd-spf call"])
+        report = {**self.CLEAN, "daemon_active": True, "socket_present": True, "findings": [],
+                  "config": config_report(protection="observe")}
+        with mock.patch.object(deployment, "stage_postfix") as stage, self.assertRaises(DeploymentError) as ctx:
+            deployment.configure_postfix(report, apply=True, log=lambda m: None, remove_legacy=True)
+        stage.assert_not_called()
+        self.assertIn("[protection] mode is observe; enforce it before removing the pipe content filters", str(ctx.exception))
 
     def test_macro_finding_goes_on_to_the_repair(self):
-        report = {**self.CLEAN, "daemon_active": True, "socket_present": True, "config": {"valid": True, "mode": "observe"},
+        report = {**self.CLEAN, "daemon_active": True, "socket_present": True, "config": config_report(failure="accept"),
                   "findings": [deployment.MACRO_FINDING + "milter_mail_macros lacks {auth_authen}; run configure-postfix to repair",
                                deployment.CHAIN_FINDING + "smtpd_milters; run configure-postfix to repair"]}
         with mock.patch.object(deployment, "stage_postfix", return_value=(Path("/nonexistent"), [], "")) as stage, \
              mock.patch.object(deployment, "snapshot", return_value={}):
-            deployment.configure_postfix("observe", report, apply=False, log=lambda m: None)
-        stage.assert_called_once()
+            deployment.configure_postfix(report, apply=False, log=lambda m: None)
+        stage.assert_called_once_with("accept", False)
 
     def test_configure_refuses_before_touching_anything(self):
         report = {**self.REPORT, "daemon_active": True, "socket_present": True}
         with mock.patch.object(deployment, "stage_postfix") as stage, self.assertRaises(DeploymentError) as ctx:
-            deployment.configure_postfix("enforce", report, apply=True, log=lambda m: None)
+            deployment.configure_postfix(report, apply=True, log=lambda m: None)
         stage.assert_not_called()
         self.assertIn("--remove-legacy", str(ctx.exception))
 
@@ -197,7 +215,7 @@ cleanup   unix  n       -       n       -       0       cleanup
         self.addCleanup(__import__("shutil").rmtree, staging)
         (staging / "main.cf").write_text(main)
         (staging / "master.cf").write_text(self.MASTER)
-        deployment.render_postfix("enforce", staging, remove_legacy=False)
+        deployment.render_postfix("tempfail", staging, remove_legacy=False)
         return staging
 
     def test_every_chain_gets_postwarden_and_keeps_others(self):
@@ -251,7 +269,7 @@ cleanup   unix  n       -       n       -       0       cleanup
         self.assertIn("smtps/inet/milter_rcpt_macros lacks {rcpt_mailer}", before)
         self.assertTrue(any(g.startswith("postwarden-cleanup/unix/milter_mail_macros") for g in before))
         self.assertTrue(any(g.startswith("submission/inet/milter_connect_macros") for g in before))
-        deployment.render_postfix("enforce", staging, remove_legacy=False)
+        deployment.render_postfix("tempfail", staging, remove_legacy=False)
         sp = lambda svc, p: deployment.split_list(deployment.service_param(svc, p, staging))
         mail = sp("submission/inet", "milter_mail_macros")
         self.assertEqual(mail[0], "i")
@@ -259,7 +277,7 @@ cleanup   unix  n       -       n       -       0       cleanup
         self.assertEqual(sp("smtps/inet", "milter_rcpt_macros"), ["i", "{rcpt_mailer}"])
         self.assertIn("{postwarden_ingress}", sp("postwarden-cleanup/unix", "milter_mail_macros"))
         self.assertEqual(deployment.macro_gaps(staging), [])
-        again = deployment.render_postfix("enforce", staging, remove_legacy=False)
+        again = deployment.render_postfix("tempfail", staging, remove_legacy=False)
         self.assertFalse([op for op in again if "macros" in op], again)
 
     def test_macro_gaps_name_the_stage(self):
@@ -275,9 +293,18 @@ cleanup   unix  n       -       n       -       0       cleanup
         staging = self.render("smtpd_milters = inet:127.0.0.1:8891\nnon_smtpd_milters = $smtpd_milters\n")
         self.assertEqual(deployment.postconf("non_smtpd_milters", staging), "$smtpd_milters")
 
+    def test_unchanged_value_of_a_detached_host_is_not_rewritten(self):
+        staging = self.render("smtpd_milters = inet:127.0.0.1:8891\n")
+        for name in ("main.cf", "master.cf"):
+            (staging / name).write_text((staging / name).read_text().replace("$postwarden_milter, ", "")
+                                        .replace("$postwarden_milter,", "").replace("$postwarden_milter", ""))
+        ops = deployment.render_postfix("tempfail", staging, remove_legacy=False)
+        self.assertFalse([op for op in ops if op.startswith("postconf -e postwarden_milter=")], ops)
+        self.assertIn("postconf -e smtpd_milters=$postwarden_milter, inet:127.0.0.1:8891", ops)
+
     def test_second_run_changes_nothing(self):
         staging = self.render("smtpd_milters = inet:127.0.0.1:8891\n")
-        self.assertEqual(deployment.render_postfix("enforce", staging, remove_legacy=False), [])
+        self.assertEqual(deployment.render_postfix("tempfail", staging, remove_legacy=False), [])
 
 
 class _Sandbox(unittest.TestCase):
@@ -345,36 +372,6 @@ class Rollback(_Sandbox):
         self.deployment_with(after=False)
         with self.assertRaises(DeploymentError):
             deployment.rollback("d1", apply=False, log=lambda m: None)
-
-
-class ActivationRecovery(_Sandbox):
-    def test_failed_reload_restores_files_and_mode(self):
-        pf = deployment.POSTFIX_DIR
-        for name in ("main.cf", "master.cf"):
-            (pf / name).write_text(f"{name} before\n")
-        config = Path(deployment.DEFAULT_CONFIG_PATH)
-        config.write_text('mode = "observe"\n')
-        staging = self.tmp / "staging"
-        staging.mkdir()
-        for name in ("main.cf", "master.cf"):
-            (staging / name).write_text(f"{name} after\n")
-
-        def run(args, **kw):
-            self.commands.append(args)
-            if args == ["postfix", "reload"] and ["postfix", "reload"] not in self.commands[:-1]:
-                raise DeploymentError("reload failed")
-            return mock.Mock(stdout="")
-        report = {"daemon_active": True, "socket_present": True, "findings": [], "config": {"valid": True, "mode": "observe"},
-                  "postfix": {"content_filters": {}, "main_cf_sha256": deployment.sha256(pf / "main.cf"),
-                              "master_cf_sha256": deployment.sha256(pf / "master.cf")}}
-        with mock.patch.object(deployment, "run", side_effect=run), \
-             mock.patch.object(deployment, "stage_postfix", return_value=(staging, ["op"], "diff")):
-            with self.assertRaises(DeploymentError) as ctx:
-                deployment.configure_postfix("enforce", report, apply=True, log=lambda m: None)
-        self.assertIn("previous state was restored", str(ctx.exception))
-        self.assertEqual((pf / "main.cf").read_text(), "main.cf before\n")
-        self.assertEqual(config.read_text(), 'mode = "observe"\n')
-        self.assertEqual(self.commands.count(["systemctl", "restart", "postwarden.service"]), 2)
 
 
 class ConfigImport(_Sandbox):
@@ -504,7 +501,7 @@ class FirstInstallRollback(_Sandbox):
                 with self.assertRaises(DeploymentError) as ctx:
                     deployment.rollback("d1", apply=True, log=lambda m: None)
                 self.assertIn(where, str(ctx.exception))
-                self.assertIn("roll back the configure-postfix deployment first", str(ctx.exception))
+                self.assertIn("detach first: roll back the configure-postfix deployments", str(ctx.exception))
         self.assertTrue(deployment.UNIT.exists() and deployment.LAUNCHER.exists())
 
     def test_detached_postfix_allows_removal(self):
@@ -536,24 +533,6 @@ class FirstInstallRollback(_Sandbox):
             with self.assertRaises(DeploymentError):
                 deployment.rollback("d1", apply=True, log=lambda m: None)
         self.assertTrue(deployment.UNIT.exists())
-
-
-class ConfigMode(_Sandbox):
-    def switch(self, text):
-        config = Path(deployment.DEFAULT_CONFIG_PATH)
-        config.write_text(text)
-        deployment.set_config_mode(config, "enforce")
-        return config.read_text()
-
-    def test_every_accepted_spelling(self):
-        import tomllib
-        for text in ('mode = "observe"\n', "mode = 'observe'\n", '"mode" = "observe"\n', "  mode='observe'  # comment\n",
-                     "", "[logging]\nlevel = \"info\"\n", '# header\n\n[protection.addresses."a@b.example"]\nmode = "x"\n'):
-            with self.subTest(text=text):
-                result = self.switch(text)
-                self.assertEqual(tomllib.loads(result)["mode"], "enforce")
-                if "[protection" in text:
-                    self.assertEqual(tomllib.loads(result)["protection"]["addresses"]["a@b.example"]["mode"], "x")
 
 
 class InstallRecheck(_Sandbox):
@@ -597,16 +576,220 @@ class NoOpRuns(_Sandbox):
         self.assertIn("nothing to change; no deployment recorded", logged)
         self.assertFalse(deployment.BACKUPS.exists() and any(deployment.BACKUPS.iterdir()))
 
-    def test_configure_postfix_with_nothing_to_do_records_no_deployment(self):
-        staging = self.tmp / "staging"
+class ActivationHistory(_Sandbox):
+    """configure-postfix and rollback against a sandboxed Postfix whose main.cf holds only its failure action."""
+
+    def setUp(self):
+        super().setUp()
+        self.config = Path(deployment.DEFAULT_CONFIG_PATH)
+        self.main = deployment.POSTFIX_DIR / "main.cf"
+        self.main.write_text("detached\n")
+        (deployment.POSTFIX_DIR / "master.cf").write_text("master\n")
+        self.config.write_text("A\n")
+        self.loaded = deployment.sha256(self.config)
+        self.fail = None
+        self.edit_while_staging = None
+        for target, replacement in (("run", self.fake_run), ("loaded_sha256", lambda: self.loaded),
+                                    ("postfix_failure_action", self.failure_action),
+                                    ("stage_postfix", self.stage)):
+            patcher = mock.patch.object(deployment, target, side_effect=replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def fake_run(self, args, **kw):
+        self.commands.append(args)
+        if self.fail and args[:2] == self.fail:
+            self.fail = None
+            raise DeploymentError(" ".join(args) + " failed")
+        if args[:2] == ["systemctl", "restart"]:
+            self.loaded = deployment.sha256(self.config)
+        return mock.Mock(stdout="", returncode=0)
+
+    def failure_action(self):
+        text = self.main.read_text().strip()
+        return None if text == "detached" else text
+
+    def stage(self, failure, remove_legacy):
+        staging = self.tmp / f"staging-{len(self.commands)}"
         staging.mkdir()
-        report = {"config": {"mode": "enforce", "valid": True}, "findings": [], "daemon_active": True, "socket_present": True}
-        logged = []
-        with mock.patch.object(deployment, "enforcement_blockers", return_value=[]), \
-             mock.patch.object(deployment, "stage_postfix", return_value=(staging, [], "")):
-            self.assertIsNone(deployment.configure_postfix("enforce", report, apply=True, log=logged.append))
-        self.assertIn("nothing to change; no deployment recorded", logged)
-        self.assertFalse(deployment.BACKUPS.exists() and any(deployment.BACKUPS.iterdir()))
+        (staging / "main.cf").write_text(f"{failure}\n")
+        (staging / "master.cf").write_text("master\n")
+        diff = "" if self.main.read_text() == f"{failure}\n" else "main.cf changes"
+        if self.edit_while_staging:
+            self.config.write_text(self.edit_while_staging)
+        return staging, ["op"] if diff else [], diff
+
+    def apply(self, config=None, failure="tempfail", edit_after_inspection=None):
+        if config is not None:
+            self.config.write_text(config)
+        self.commands.clear()
+        report = {"daemon_active": True, "socket_present": True, "findings": [], "loaded_config": self.loaded,
+                  "config": config_report(failure=failure, digest=deployment.sha256(self.config)),
+                  "postfix": {"content_filters": {}, "attached": self.failure_action() is not None,
+                              "failure_action": self.failure_action(),
+                              "main_cf_sha256": deployment.sha256(self.main),
+                              "master_cf_sha256": deployment.sha256(deployment.POSTFIX_DIR / "master.cf")}}
+        if edit_after_inspection:
+            self.config.write_text(edit_after_inspection)
+        return deployment.configure_postfix(report, apply=True, log=lambda m: None)
+
+    def rollback(self, record=None, **kw):
+        self.commands.clear()
+        return deployment.rollback(record or deployment.active_record()[0].name, apply=True, log=lambda m: None, **kw)
+
+    def state(self):
+        return self.main.read_text().strip(), self.config.read_text().strip(), self.loaded == deployment.sha256(self.config)
+
+    def manifest(self, record):
+        return self.json.loads((deployment.BACKUPS / record / "manifest.json").read_text())
+
+    def restarted(self):
+        return ["systemctl", "restart", "postwarden.service"] in self.commands
+
+    def reloaded(self):
+        return ["postfix", "reload"] in self.commands
+
+    def test_first_attachment_starts_from_a_detached_root(self):
+        first = self.apply()
+        root = self.manifest(first)["predecessor"]
+        self.assertEqual((self.manifest(root)["kind"], self.manifest(root)["predecessor"]), ("detached", None))
+        self.assertEqual(self.state(), ("tempfail", "A", True))
+        detached = self.rollback()
+        self.assertEqual(self.state(), ("detached", "A", True))
+        self.assertEqual((self.manifest(detached)["kind"], self.manifest(detached)["predecessor"]), ("detached", None))
+        again = self.apply()
+        self.assertEqual(self.manifest(again)["predecessor"], detached)
+        with self.assertRaises(DeploymentError) as ctx:
+            self.rollback(root)
+        self.assertIn("is not the active deployment", str(ctx.exception))
+
+    def test_configuration_edited_after_inspection_is_refused(self):
+        with self.assertRaises(DeploymentError) as ctx:
+            self.apply(failure="accept", edit_after_inspection="B\n")
+        self.assertIn("changed since inspection", str(ctx.exception))
+        self.assertEqual((self.commands, deployment.records()), ([], []))
+        self.config.write_text("A\n")
+        self.apply()
+        count = len(deployment.records())
+        for edit in ("after_inspection", "while_staging"):
+            with self.subTest(edit=edit):
+                self.config.write_text("A\n")
+                self.edit_while_staging = "C\n" if edit == "while_staging" else None
+                with self.assertRaises(DeploymentError) as ctx:
+                    self.apply(edit_after_inspection="C\n" if edit == "after_inspection" else None)
+                self.edit_while_staging = None
+                self.assertIn("changed since inspection", str(ctx.exception))
+                self.assertEqual((self.commands, len(deployment.records())), ([], count))
+
+    def test_record_failure_after_the_switch_restores_the_previous_state(self):
+        self.apply()
+        first = deployment.active_record()[0].name
+        copy, manifest = deployment.shutil.copy2, deployment.write_manifest
+
+        def failing_copy(src, dst, *a, **k):
+            if Path(dst).parent.parent == deployment.BACKUPS and Path(dst).parent.name != "before":
+                raise OSError("No space left on device")
+            return copy(src, dst, *a, **k)
+
+        def failing_manifest(backup, data):
+            if data["kind"] != "failed":
+                raise OSError("No space left on device")
+            return manifest(backup, data)
+
+        for target, replacement in (("shutil.copy2", failing_copy), ("write_manifest", failing_manifest)):
+            with self.subTest(failing=target):
+                self.config.write_text("B\n")
+                with mock.patch(f"postwarden.deployment.{target}", side_effect=replacement), \
+                        self.assertRaises(DeploymentError) as ctx:
+                    self.apply()
+                self.assertIn("previous state was restored", str(ctx.exception))
+                self.assertEqual((self.state(), deployment.active_record()[0].name), (("tempfail", "A", True), first))
+        self.apply("B\n")
+        second = deployment.active_record()[0].name
+        with mock.patch("postwarden.deployment.write_manifest", side_effect=failing_manifest), \
+                self.assertRaises(DeploymentError):
+            self.rollback()
+        self.assertEqual((self.state(), deployment.active_record()[0].name), (("tempfail", "B", True), second))
+
+    def test_rollback_after_rollback_restores_the_right_state(self):
+        self.apply()
+        self.apply("B\n")
+        self.rollback()
+        self.assertEqual(self.state(), ("tempfail", "A", True))
+        self.apply("C\n")
+        self.rollback()
+        self.assertEqual(self.state(), ("tempfail", "A", True))
+
+    def test_manual_restart_is_recorded_without_restart_or_reload(self):
+        self.apply()
+        self.config.write_text("B\n")
+        self.loaded = deployment.sha256(self.config)
+        record = self.apply()
+        self.assertEqual(self.manifest(record)["how"], "metadata")
+        self.assertFalse(self.restarted() or self.reloaded())
+        self.apply("C\n")
+        self.rollback()
+        self.assertEqual(self.state(), ("tempfail", "B", True))
+
+    def test_repeat_apply_records_nothing(self):
+        self.apply("B\n")
+        count = len(deployment.records())
+        self.assertIsNone(self.apply())
+        self.assertEqual((len(deployment.records()), self.commands), (count, []))
+
+    def test_postfix_drift_is_repaired_without_restart(self):
+        self.apply()
+        self.main.write_text("accept\n")
+        record = self.apply()
+        self.assertEqual((self.manifest(record)["how"], self.restarted(), self.reloaded()), ("postfix", False, True))
+        self.assertEqual(self.state(), ("tempfail", "A", True))
+        self.assertIsNone(self.apply())
+
+    def test_stricter_failure_action_switches_postfix_first(self):
+        self.apply(failure="accept")
+        self.apply("B\n", failure="tempfail")
+        self.assertLess(self.commands.index(["postfix", "reload"]), self.commands.index(["systemctl", "restart", "postwarden.service"]))
+        self.apply("C\n", failure="accept")
+        self.assertLess(self.commands.index(["systemctl", "restart", "postwarden.service"]), self.commands.index(["postfix", "reload"]))
+
+    def test_failed_restart_restores_the_active_record(self):
+        self.apply()
+        count = len(deployment.records())
+        self.fail = ["systemctl", "restart"]
+        with self.assertRaises(DeploymentError) as ctx:
+            self.apply("B\n", failure="accept")
+        self.assertIn("previous state was restored", str(ctx.exception))
+        self.assertEqual(self.state(), ("tempfail", "A", True))
+        self.assertEqual(len(deployment.records()), count)
+        failed = [p for p in deployment.BACKUPS.iterdir() if self.manifest(p.name)["kind"] == "failed"]
+        self.assertEqual((failed[0] / "before" / "config.toml").read_text(), "B\n")
+
+    def test_failed_first_attachment_restores_the_detached_files(self):
+        self.fail = ["postfix", "reload"]
+        with self.assertRaises(DeploymentError):
+            self.apply()
+        self.assertEqual(self.state(), ("detached", "A", True))
+        self.assertEqual([m["kind"] for _, m in deployment.records()], ["detached"])
+
+    def test_failed_postfix_reload_leaves_the_configuration(self):
+        self.apply()
+        self.config.write_text("B\n")
+        self.loaded = deployment.sha256(self.config)
+        self.main.write_text("accept\n")
+        self.fail = ["postfix", "reload"]
+        with self.assertRaises(DeploymentError):
+            self.apply()
+        self.assertEqual(self.state(), ("accept", "B", True))
+        self.assertFalse(self.restarted())
+
+    def test_rollback_refuses_files_changed_since_the_record(self):
+        self.apply()
+        self.apply("B\n")
+        self.config.write_text("edited\n")
+        with self.assertRaises(DeploymentError):
+            self.rollback()
+        self.rollback(force=True)
+        self.assertEqual(self.state(), ("tempfail", "A", True))
 
 
 class HeldLocalMail(unittest.TestCase):
@@ -624,7 +807,7 @@ class HeldLocalMail(unittest.TestCase):
 
     def report(self, now=1_800_000_000):
         backlog = deployment.maildrop_backlog(self.queue, now)
-        report = {"postfix": {"maildrop": backlog}}
+        report = {"postfix": {"maildrop": backlog, "failure_action": None}, "config": {"present": False}}
         with mock.patch("postwarden.postfix.read_rate_limits", side_effect=deployment_postfix_error()):
             return backlog, deployment._warnings(report, None)[1:]
 

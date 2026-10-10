@@ -2,13 +2,16 @@
 """Load and capacity tool: drives a postwarden socket with the milter protocol, as Postfix would.
 
 Messages are presented as untrusted port-25 mail, so every one takes the SPF/DKIM path. Nothing is
-queued or delivered; only the milter sees the messages. Standard library only.
+queued or delivered; only the milter sees the messages. Standard library only, except --sign-key, which
+uses Debian's python3-dkim to sign the messages.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import ipaddress
 import os
+import re
 import socket
 import statistics
 import struct
@@ -139,9 +142,14 @@ class Scenario:
     selector: str = "20230601"
     signatures: int = 1
     body_bytes: int = 65536
-    peer_prefix: str = "192.0.2."
+    peers: tuple[str, ...] = tuple(str(a) for a in ipaddress.ip_network("192.0.2.0/24").hosts())
     daemon_addr: str = "198.51.100.25"
     transport: str = "dovecot"
+    signed: tuple[str, ...] = ()
+    message_id: str = ""
+
+    def peer(self, index: int) -> str:
+        return self.peers[index % len(self.peers)]
 
 
 @dataclass
@@ -152,7 +160,51 @@ class Result:
     error: str = ""
 
 
+def peers(cidr: str) -> tuple[str, ...]:
+    network = ipaddress.ip_network(cidr, strict=False)
+    hosts = list(network.hosts()) if network.num_addresses > 2 else list(network)
+    return tuple(str(a) for a in hosts)
+
+
+SIGNATURE_KINDS = ("pass", "fail", "missing", "broken")
+
+
+def tampered(value: str) -> str:
+    """The same signature with one character of b= changed, so it no longer verifies."""
+    match = re.search(r"(?:^|;)\s*b=\s*([A-Za-z0-9+/])", value)
+    if not match:
+        raise ValueError("signature has no b= tag")
+    start = match.start(1)
+    return value[:start] + ("B" if value[start] == "A" else "A") + value[start + 1:]
+
+
+def fixed_headers(scenario: Scenario) -> list[tuple[str, str]]:
+    return [("From", f"<{scenario.sender}>"), ("To", f"<{scenario.recipient}>"), ("Subject", "postwarden load"),
+            ("Date", "Fri, 09 Oct 2026 12:00:00 +0000"), ("Message-ID", scenario.message_id)]
+
+
+def signed_headers(scenario: Scenario, key_file: str, pattern: list[str], payload: bytes) -> tuple[str, ...]:
+    """Signatures over the fixed headers and body, top to bottom in pattern order: pass verifies, fail has a changed
+    b=, missing names an unpublished selector, broken the selector `broken`."""
+    import dkim
+    key = open(key_file, "rb").read()
+    if key.lstrip().startswith(b"-----BEGIN PRIVATE KEY"):
+        raise SystemExit(f"{key_file}: PKCS#8 key; dkimpy needs the RSA form: openssl rsa -in {key_file} -traditional -out FILE")
+    message = b"".join(f"{n}: {v}\r\n".encode() for n, v in fixed_headers(scenario)) + b"\r\n" + payload
+    values = {}
+    for kind in set(pattern):
+        selector = {"missing": f"missing-{os.getpid()}", "broken": "broken"}.get(kind, scenario.selector)
+        header = dkim.sign(message, selector.encode(), scenario.dkim_domain.encode(), key,
+                           canonicalize=(b"relaxed", b"relaxed"),
+                           include_headers=[b"from", b"to", b"subject", b"date", b"message-id"])
+        value = header.decode().split(":", 1)[1].replace("\r\n", "").strip()
+        values[kind] = tampered(value) if kind == "fail" else value
+    return tuple(values[kind] for kind in pattern)
+
+
 def dkim_headers(scenario: Scenario, index: int) -> list[str]:
+    if scenario.signed:
+        return list(scenario.signed)
     headers = []
     for n in range(scenario.signatures):
         canon = ("relaxed/relaxed", "simple/simple", "relaxed/simple", "simple/relaxed")[n % 4]
@@ -170,7 +222,7 @@ def body(size: int) -> bytes:
 
 def run_message(spec: str, scenario: Scenario, index: int, timeout: float, payload: bytes) -> Result:
     started = time.monotonic()
-    peer = f"{scenario.peer_prefix}{index % 250 + 1}"
+    peer = scenario.peer(index)
     stage = "connect"
     try:
         session = Session(spec, timeout)
@@ -193,9 +245,11 @@ def run_message(spec: str, scenario: Scenario, index: int, timeout: float, paylo
             stage = "headers"
             for value in dkim_headers(scenario, index):
                 session.header("DKIM-Signature", value)
-            for name, value in (("From", f"<{scenario.sender}>"), ("To", f"<{scenario.recipient}>"),
-                                ("Subject", f"postwarden load {index}"), ("Date", time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime())),
-                                ("Message-ID", f"<load{index}.{time.time_ns()}@{scenario.sender.split('@')[1]}>")):
+            headers = fixed_headers(scenario) if scenario.signed else (
+                ("From", f"<{scenario.sender}>"), ("To", f"<{scenario.recipient}>"),
+                ("Subject", f"postwarden load {index}"), ("Date", time.strftime("%a, %d %b %Y %H:%M:%S +0000", time.gmtime())),
+                ("Message-ID", f"<load{index}.{time.time_ns()}@{scenario.sender.split('@')[1]}>"))
+            for name, value in headers:
                 reply, reply_data = session.header(name, value)
                 if reply != b"c":
                     return Result(describe_reply(reply, reply_data), stage, time.monotonic() - started)
@@ -224,7 +278,7 @@ def hold(spec: str, scenario: Scenario, count: int, timeout: float) -> dict[str,
         for index in range(count):
             session = Session(spec, timeout)
             sessions.append(session)
-            session.send(b"C", connect_data(f"hold{index}.example", f"{scenario.peer_prefix}{index % 250 + 1}", 40000),
+            session.send(b"C", connect_data(f"hold{index}.example", scenario.peer(index), 40000),
                          {"{daemon_addr}": scenario.daemon_addr, "{daemon_port}": "25", "{postwarden_ingress}": "SMTP25"})
             reply, data = session.send(b"M", f"<{scenario.sender}>\0".encode(),
                                        {"{daemon_port}": "25", "{postwarden_ingress}": "SMTP25"})
@@ -255,9 +309,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=120.0, help="seconds per socket operation")
     parser.add_argument("--slow-after", type=float, default=60.0, help="report messages slower than this (Postfix content_timeout)")
     parser.add_argument("--hold", type=int, help="instead: open this many transactions at MAIL FROM and count the replies")
+    parser.add_argument("--peer", default="192.0.2.0/24",
+                        help="client addresses to present, as a network; the SPF check uses them (default 192.0.2.0/24)")
+    parser.add_argument("--sign-key", metavar="FILE",
+                        help="sign with this private key for --dkim-domain/--selector instead of random signatures")
+    parser.add_argument("--sign-pattern", metavar="LIST",
+                        help="with --sign-key: signature kinds top to bottom, from pass, fail, missing, broken "
+                             "(default: pass, --signatures times)")
     args = parser.parse_args(argv)
+    try:
+        presented = peers(args.peer)
+    except ValueError as exc:
+        parser.error(f"--peer: {exc}")
+    pattern = args.sign_pattern.split(",") if args.sign_pattern else ["pass"] * args.signatures
+    if args.sign_pattern and not args.sign_key:
+        parser.error("--sign-pattern needs --sign-key")
+    if any(kind not in SIGNATURE_KINDS for kind in pattern):
+        parser.error(f"--sign-pattern: kinds are {', '.join(SIGNATURE_KINDS)}")
     scenario = Scenario(sender=args.sender, recipient=args.recipient, dkim_domain=args.dkim_domain, selector=args.selector,
-                        signatures=args.signatures, body_bytes=args.body_kib * 1024)
+                        signatures=len(pattern) if args.sign_key else args.signatures, body_bytes=args.body_kib * 1024,
+                        peers=presented, message_id=f"<load.{time.time_ns()}@{args.sender.split('@')[1]}>")
 
     if args.hold:
         first = hold(args.socket, scenario, args.hold, args.timeout)
@@ -267,6 +338,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     payload = body(scenario.body_bytes)
+    if args.sign_key:
+        scenario.signed = signed_headers(scenario, args.sign_key, pattern, payload)
     started = time.monotonic()
     lock, results = threading.Lock(), []
 
@@ -284,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
         key = f"{result.reply} at {result.stage}"
         counts[key] = counts.get(key, 0) + 1
     elapsed = [r.elapsed for r in results]
-    print(f"messages {len(results)}, concurrency {args.concurrency}, signatures {args.signatures}, body {args.body_kib} KiB")
+    print(f"messages {len(results)}, concurrency {args.concurrency}, signatures {scenario.signatures}, body {args.body_kib} KiB")
     print(f"wall {wall:.1f}s, {len(results) / wall:.1f} msg/s")
     print(f"latency p50 {statistics.median(elapsed):.2f}s p90 {percentile(elapsed, 0.9):.2f}s "
           f"p99 {percentile(elapsed, 0.99):.2f}s max {max(elapsed):.2f}s")

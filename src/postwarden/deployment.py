@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import Callable
 
 from . import DEFAULT_CONFIG_PATH, __version__
-from .config import ConfigError, load_settings
+from .config import ConfigError, load_settings, loaded_sha256
+from .postfix import POSTWARDEN_SOCKET as CUSTOM_MILTER, failure_action_in
 
 ROOT = Path("/etc/postwarden")
 NOT_INSTALLED = ("__pycache__", "*.pyc", "logs", "gate-env.sh", "build-release.py", "Testing.md", "Releasing.md")
@@ -36,7 +37,6 @@ LOCK = Path("/run/lock/postwarden-install.lock")
 SERVICE_USER = "postwarden"
 RUNTIME_PACKAGES = ("python3", "python3-milter", "python3-spf", "python3-dkim", "python3-dnspython")
 POSTFIX_DIR = Path("/etc/postfix")
-CUSTOM_MILTER = "unix:postwarden/policy.sock"
 MILTER_PARAM = "postwarden_milter"
 MILTER_REF = "$" + MILTER_PARAM
 REQUIRED_MACROS = {
@@ -48,7 +48,6 @@ REQUIRED_MACROS = {
 LOCAL_CLEANUP = "postwarden-cleanup"
 INGRESS = {"smtpd/pass": "SMTP25", "smtp/inet": "SMTP25", "submission/inet": "SUBMISSION587",
            "submissions/inet": "SUBMISSION465", "smtps/inet": "SUBMISSION465"}
-PHASES = ("observe", "enforce")
 MAILDROP_FILES = 100
 MAILDROP_AGE = 3600
 CHAIN_FINDING = "postwarden missing from milter chain: "
@@ -168,6 +167,11 @@ def chain_gaps(config_dir: Path | None = None) -> list[str]:
     return gaps
 
 
+def postfix_failure_action(config_dir: Path | None = None) -> str | None:
+    """default_action Postfix applies when postwarden is unreachable; None while Postfix does not use postwarden."""
+    return failure_action_in(postconf("smtpd_milters", config_dir, expand=True), postconf("milter_default_action", config_dir))
+
+
 def service_overrides(config_dir: Path | None = None) -> dict[str, str]:
     """Every master.cf `-o` override, keyed service/type/parameter."""
     args = ["postconf"] + (["-c", str(config_dir)] if config_dir else []) + ["-P"]
@@ -261,16 +265,19 @@ def inspect(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
     report["root_writable"] = [str(p) for p in writable_by_others(ROOT)]
     report["root_unmanaged"] = [p.name for p in unmanaged_entries(ROOT)]
     report["managed_symlinks"] = [str(p) for p in managed_files() if p.is_symlink()]
+    report["loaded_config"] = loaded_sha256()
+    active = active_record()
+    report["active_record"] = active[0].name if active else None
 
-    config: dict = {"path": config_path, "present": Path(config_path).exists()}
+    config: dict = {"path": config_path, "present": Path(config_path).exists(), "sha256": sha256(Path(config_path))}
     settings = None
     if config["present"]:
         try:
             settings = load_settings(config_path)
             addresses, groups = settings.protection.counts()
-            config.update(valid=True, mode=settings.mode, protected_addresses=addresses, protected_groups=groups,
-                          remote_transports=sorted(settings.protection.remote_transports),
-                          sending_limits=settings.sending_limits.mode)
+            config.update(valid=True, sha256=settings.sha256, modes=settings.section_modes(), failure_action=settings.failure_action(),
+                          protected_addresses=addresses, protected_groups=groups,
+                          remote_transports=sorted(settings.protection.remote_transports))
         except ConfigError as exc:
             config.update(valid=False, errors=exc.errors)
     report["config"] = config
@@ -288,6 +295,7 @@ def inspect(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
             "smtpd_milters": postconf("smtpd_milters"),
             "non_smtpd_milters": postconf("non_smtpd_milters"),
             "milter_default_action": postconf("milter_default_action"),
+            "failure_action": postfix_failure_action(),
             "services": {name: (name in services) for name in list(INGRESS) + ["pickup/unix", f"{LOCAL_CLEANUP}/unix", "policyd-spf/unix"]},
             "content_filters": {name: _service_option(services.get(name, ""), "content_filter") for name in INGRESS if name in services},
             "attached": CUSTOM_MILTER in postconf("smtpd_milters", expand=True),
@@ -309,9 +317,15 @@ def inspect(config_path: str = DEFAULT_CONFIG_PATH) -> dict:
 
 def _warnings(report: dict, settings) -> list[str]:
     """Operational notices that never block an installer step."""
-    from .postfix import PostfixError, describe_rate_limits, rate_limit_warnings, read_rate_limits
+    from .postfix import PostfixError, describe_rate_limits, failure_action_warning, rate_limit_warnings, read_rate_limits
     warnings = []
     postfix = report["postfix"]
+    config = report["config"]
+    if config.get("valid") and (drift := failure_action_warning(postfix["failure_action"], config["failure_action"])):
+        warnings.append(drift)
+    if report.get("daemon_active") and config["present"] and report.get("loaded_config") != config["sha256"]:
+        which = "runs an earlier" if report.get("loaded_config") else "has not reported running"
+        warnings.append(f"postwarden {which} {config['path']}: run install.py configure-postfix --apply")
     try:
         limits = read_rate_limits()
         postfix["rate_limits"] = describe_rate_limits(limits)
@@ -491,8 +505,15 @@ def deployment_lock():
 
 def new_backup(kind: str) -> Path:
     deployment_id = time.strftime("%Y%m%dT%H%M%S") + f"-{kind}"
-    path = BACKUPS / deployment_id
-    path.mkdir(parents=True, exist_ok=False)
+    BACKUPS.mkdir(parents=True, exist_ok=True)
+    path, n = BACKUPS / deployment_id, 1
+    while True:
+        try:
+            path.mkdir()
+            break
+        except FileExistsError:
+            n += 1
+            path = BACKUPS / f"{deployment_id}-{n}"
     os.chmod(BACKUPS, 0o700)
     os.chmod(path, 0o700)
     return path
@@ -521,6 +542,12 @@ def refuse_changes(recorded: dict[str, dict | None], what: str) -> None:
         raise DeploymentError(", ".join(changed) + f" changed since {what}; re-run")
 
 
+def refuse_config_change(inspected: str | None) -> None:
+    """Stop when config.toml no longer holds the bytes that were inspected and validated."""
+    if sha256(Path(DEFAULT_CONFIG_PATH)) != inspected:
+        raise DeploymentError(f"{DEFAULT_CONFIG_PATH} changed since inspection; re-run")
+
+
 def backup_file(source: Path, backup: Path) -> None:
     if source.is_symlink():
         raise DeploymentError(f"{source} is a symlink; postwarden manages regular files only")
@@ -529,7 +556,9 @@ def backup_file(source: Path, backup: Path) -> None:
 
 
 def write_manifest(backup: Path, data: dict) -> None:
-    (backup / "manifest.json").write_text(json.dumps(data, indent=2, default=str))
+    tmp = backup / "manifest.json.tmp"
+    tmp.write_text(json.dumps(data, indent=2, default=str))
+    os.replace(tmp, backup / "manifest.json")
 
 
 def file_state(path: Path) -> dict | None:
@@ -746,12 +775,19 @@ def without_policy_call(restrictions: str, service_name: str) -> str:
     return restrictions if cleaned == restrictions else cleaned.rstrip(" \t\n,")
 
 
+def unused_value(name: str, config_dir: Path | None = None) -> str | None:
+    """A main.cf value Postfix does not use yet, such as postwarden_milter while detached: postconf only names it in a warning."""
+    args = ["postconf"] + (["-c", str(config_dir)] if config_dir else []) + ["-h", name]
+    match = re.search(rf"unused parameter: {re.escape(name)}=(.*)$", run(args, check=False).stderr, re.MULTILINE)
+    return match.group(1).strip() if match else None
+
+
 def _already_set(op: list[str], staging: Path, services: dict[str, str]) -> bool:
     """True when a postconf -e/-P operation would write the value that is already there; rewriting master.cf moves comments."""
     flag, spec = op
     if flag == "-e":
         name, value = spec.split("=", 1)
-        return postconf(name, staging) == value
+        return value in (postconf(name, staging), unused_value(name, staging))
     if flag == "-P":
         key, value = spec.split("=", 1)
         service, _, param = key.rpartition("/")
@@ -760,11 +796,10 @@ def _already_set(op: list[str], staging: Path, services: dict[str, str]) -> bool
     return False
 
 
-def render_postfix(phase: str, staging: Path, remove_legacy: bool) -> list[str]:
+def render_postfix(failure: str, staging: Path, remove_legacy: bool) -> list[str]:
     """Apply the integration to a staged copy of /etc/postfix and return the postconf operations performed."""
-    if phase not in PHASES:
-        raise DeploymentError(f"unknown phase {phase}")
-    failure = "accept" if phase == "observe" else "tempfail"
+    if failure not in ("accept", "tempfail"):
+        raise DeploymentError(f"unknown failure action {failure}")
     ops: list[list[str]] = []
     ops.append(["-e", "milter_protocol=6"])
     ops.append(["-e", f"{MILTER_PARAM}={{ {CUSTOM_MILTER}, default_action={failure}, content_timeout=60s }}"])
@@ -802,7 +837,7 @@ def render_postfix(phase: str, staging: Path, remove_legacy: bool) -> list[str]:
     else:
         ops.append(["-P", service_defaults(f"{LOCAL_CLEANUP}/unix", "LOCAL_PICKUP")])
     ops.append(["-P", f"pickup/unix/cleanup_service_name={LOCAL_CLEANUP}"])
-    if phase == "enforce" and remove_legacy:
+    if remove_legacy:
         for service in INGRESS:
             if service in services and _service_option(services[service], "content_filter"):
                 ops.append(["-PX", f"{service}/content_filter"])
@@ -824,7 +859,7 @@ def render_postfix(phase: str, staging: Path, remove_legacy: bool) -> list[str]:
     return performed
 
 
-def stage_postfix(phase: str, remove_legacy: bool) -> tuple[Path, list[str], str]:
+def stage_postfix(failure: str, remove_legacy: bool) -> tuple[Path, list[str], str]:
     staging = Path(tempfile.mkdtemp(prefix="postwarden-stage."))
     for name in ("main.cf", "master.cf"):
         shutil.copy2(POSTFIX_DIR / name, staging / name)
@@ -835,7 +870,7 @@ def stage_postfix(phase: str, remove_legacy: bool) -> tuple[Path, list[str], str
         shutil.copytree(POSTFIX_DIR / "postfix-files.d", staging / "postfix-files.d")
     if (POSTFIX_DIR / "dynamicmaps.cf.d").is_dir():
         shutil.copytree(POSTFIX_DIR / "dynamicmaps.cf.d", staging / "dynamicmaps.cf.d")
-    ops = render_postfix(phase, staging, remove_legacy)
+    ops = render_postfix(failure, staging, remove_legacy)
     diff = ""
     for name in ("main.cf", "master.cf"):
         result = run(["diff", "-u", "--label", f"a/{name}", "--label", f"b/{name}", str(POSTFIX_DIR / name), str(staging / name)], check=False)
@@ -843,44 +878,159 @@ def stage_postfix(phase: str, remove_legacy: bool) -> tuple[Path, list[str], str
     return staging, ops, diff
 
 
-def set_config_mode(path: Path, mode: str) -> bool:
-    """Set the top-level `mode` key, in any TOML spelling, adding it when absent; the result must parse to `mode`."""
-    text = path.read_text()
-    header = re.search(r"^[ \t]*\[", text, flags=re.M)
-    top, rest = (text[:header.start()], text[header.start():]) if header else (text, "")
-    key = r"""^([ \t]*(?:mode|"mode"|'mode')[ \t]*=[ \t]*)(?:"[^"\n]*"|'[^'\n]*')"""
-    new_top, count = re.subn(key, rf'\g<1>"{mode}"', top, count=1, flags=re.M)
-    if count == 0:
-        new_top = f'mode = "{mode}"\n' + top
-    new_text = new_top + rest
-    if new_text == text:
-        return False
-    try:
-        if tomllib.loads(new_text).get("mode") != mode:
-            raise DeploymentError(f"{path}: could not set mode = \"{mode}\"; edit the file by hand")
-    except tomllib.TOMLDecodeError as exc:
-        raise DeploymentError(f"{path}: {exc}") from None
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".config.toml.")
-    with os.fdopen(fd, "w") as fh:
-        fh.write(new_text)
-    shutil.copymode(path, tmp)
-    shutil.chown(tmp, "root", SERVICE_USER)
-    os.replace(tmp, path)
-    return True
+def protection_enforced(config: dict) -> bool:
+    return config["modes"]["protection"] == "enforce" and config["protected_addresses"] + config["protected_groups"] > 0
 
 
-def enforcement_blockers(phase: str, report: dict, remove_legacy: bool, keep_legacy: bool) -> list[str]:
+def legacy_removal_blockers(config: dict) -> list[str]:
+    """Sections that must enforce before the legacy components they replace can go."""
+    replaced = {"protection": "the pipe content filters", "sender_authentication": "the policyd-spf call"}
+    return [f"[{section}] mode is {config['modes'][section]}; enforce it before removing {what}"
+            for section, what in replaced.items() if config["modes"][section] != "enforce"]
+
+
+def enforcement_blockers(report: dict, remove_legacy: bool, keep_legacy: bool) -> list[str]:
     """SMTP services whose content_filter would reinject mail through pickup, where protected recipients are refused."""
-    if phase != "enforce" or remove_legacy or keep_legacy:
+    if not protection_enforced(report["config"]) or remove_legacy or keep_legacy:
         return []
     return sorted(name for name, target in report["postfix"]["content_filters"].items() if target)
 
 
-def configure_postfix(phase: str, report: dict, apply: bool, log: Callable[[str], None], remove_legacy: bool = False,
+RECORD_KINDS = ("activation", "detached")
+
+
+def record_sources() -> dict[str, Path]:
+    return {"main.cf": POSTFIX_DIR / "main.cf", "master.cf": POSTFIX_DIR / "master.cf",
+            "config.toml": Path(DEFAULT_CONFIG_PATH)}
+
+
+def records() -> list[tuple[Path, dict]]:
+    """Activation records, oldest first; the last one is the active state."""
+    found = []
+    if BACKUPS.is_dir():
+        for path in BACKUPS.iterdir():
+            with contextlib.suppress(OSError, ValueError):
+                manifest = json.loads((path / "manifest.json").read_text())
+                if manifest.get("kind") in RECORD_KINDS:
+                    found.append((path, manifest))
+    return sorted(found, key=lambda record: record[1]["sequence"])
+
+
+def active_record() -> tuple[Path, dict] | None:
+    found = records()
+    return found[-1] if found else None
+
+
+def save_before(attempt: Path) -> None:
+    """The files as they were before this run: what a failed run restores, and an attempted configuration kept."""
+    before = attempt / "before"
+    before.mkdir()
+    for name, source in record_sources().items():
+        shutil.copy2(source, before / name)
+
+
+def write_record(path: Path, kind: str, how: str, predecessor: str | None, restored_from: str | None = None) -> None:
+    """Copy the current files into path; the manifest, written last, makes it a record."""
+    found = records()
+    sources = record_sources()
+    for name, source in sources.items():
+        shutil.copy2(source, path / name)
+    write_manifest(path, {"kind": kind, "how": how, "sequence": found[-1][1]["sequence"] + 1 if found else 1,
+                          "predecessor": predecessor, "restored_from": restored_from, "version": __version__,
+                          "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                          "config_sha256": sha256(sources["config.toml"]), "failure_action": postfix_failure_action(),
+                          "files": {str(source): file_state(source) for source in sources.values()}})
+
+
+def mark_failed(attempt: Path, error: Exception, log: Callable[[str], None]) -> None:
+    try:
+        write_manifest(attempt, {"kind": "failed", "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "error": str(error)})
+    except OSError as exc:
+        log(f"! could not mark {attempt.name} as failed: {exc}")
+    log(f"the files this run started from are kept in {attempt / 'before'}")
+
+
+def install_config(source: Path) -> None:
+    atomic_copy(source, Path(DEFAULT_CONFIG_PATH), 0o640, ("root", SERVICE_USER))
+
+
+def restart_daemon(expected: str | None) -> None:
+    """Restart postwarden and wait until it reports running the expected configuration."""
+    run(["systemctl", "restart", "postwarden.service"])
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if loaded_sha256() == expected:
+            return
+        time.sleep(0.2)
+    status = run(["systemctl", "status", "postwarden.service", "--no-pager"], check=False).stdout
+    raise DeploymentError(f"postwarden did not report running {DEFAULT_CONFIG_PATH} after the restart:\n" + status)
+
+
+def switch(attempt: Path, postfix_source: Path | None, config_source: Path | None, restart: bool, postfix_first: bool,
+           recovery_config: Path, log: Callable[[str], None], expected: str | None, finalize: Callable[[], None]) -> None:
+    """Bring Postfix and the daemon to the new state in a safe order, then record it with `finalize`; if any of it
+    fails, undo the steps taken, newest first. `expected` is the configuration identity the daemon must run."""
+    done: list[str] = []
+    config = Path(DEFAULT_CONFIG_PATH)
+
+    def postfix() -> None:
+        done.append("postfix")
+        for name in ("main.cf", "master.cf"):
+            atomic_copy(postfix_source / name, POSTFIX_DIR / name, 0o644)
+        run(["postfix", "check"])
+        run(["postfix", "reload"])
+        log("Postfix reloaded")
+
+    def daemon() -> None:
+        done.append("daemon")
+        if config_source is not None:
+            install_config(config_source)
+            log(f"restored {config}")
+        if restart:
+            restart_daemon(expected)
+            log(f"postwarden restarted with {config}")
+
+    def record() -> None:
+        if sha256(config) != expected:
+            raise DeploymentError(f"{config} changed during the activation")
+        finalize()
+
+    steps = ([postfix] if postfix_source and postfix_first else []) + ([daemon] if restart or config_source else []) \
+        + ([postfix] if postfix_source and not postfix_first else [])
+    try:
+        for step in steps:
+            step()
+        record()
+    except Exception as exc:
+        log(f"! activation failed: {exc}; restoring the previous state")
+        try:
+            for what in reversed(done):
+                if what == "postfix":
+                    for name in ("main.cf", "master.cf"):
+                        atomic_copy(attempt / "before" / name, POSTFIX_DIR / name, 0o644)
+                    run(["postfix", "check"])
+                    run(["postfix", "reload"])
+                    log("restored main.cf/master.cf and reloaded Postfix")
+                else:
+                    install_config(recovery_config)
+                    restart_daemon(sha256(config))
+                    log(f"restored {config} and restarted postwarden")
+        except Exception as recovery:
+            raise DeploymentError(f"activation failed ({exc}) and recovery failed ({recovery}); "
+                                  f"restore by hand from {attempt / 'before'}") from None
+        raise DeploymentError(f"activation failed and the previous state was restored: {exc}") from None
+
+
+def configure_postfix(report: dict, apply: bool, log: Callable[[str], None], remove_legacy: bool = False,
                       keep_legacy: bool = False) -> str | None:
     if remove_legacy and keep_legacy:
         raise DeploymentError("--remove-legacy and --keep-legacy are mutually exclusive")
-    blockers = enforcement_blockers(phase, report, remove_legacy, keep_legacy)
+    config = report["config"]
+    if not config.get("valid"):
+        raise DeploymentError("configuration is invalid; fix it before attaching to Postfix")
+    if remove_legacy and (refused := legacy_removal_blockers(config)):
+        raise DeploymentError("--remove-legacy refused: " + "; ".join(refused))
+    blockers = enforcement_blockers(report, remove_legacy, keep_legacy)
     if blockers:
         raise DeploymentError(
             "content_filter still set on " + ", ".join(blockers) + ": mail reinjected by the filter reaches the milter "
@@ -893,25 +1043,29 @@ def configure_postfix(phase: str, report: dict, apply: bool, log: Callable[[str]
         if not (service_active("postwarden.service") and (SOCKET_DIR / "policy.sock").exists()):
             raise DeploymentError("daemon is not running with its socket present; run install --apply first")
         report["daemon_active"] = report["socket_present"] = True
-    config = report["config"]
-    if not config.get("valid"):
-        raise DeploymentError("configuration is invalid; fix it before attaching to Postfix")
     blocking = [f for f in report["findings"] if not f.startswith((CHAIN_FINDING, MACRO_FINDING))]
     if blocking:
         raise DeploymentError("unresolved findings from inspect:\n  " + "\n  ".join(blocking))
     refuse_symlinks()
     planned = snapshot([Path(DEFAULT_CONFIG_PATH)])
-    staging, ops, diff = stage_postfix(phase, remove_legacy)
+    failure = config["failure_action"]
+    restart = report.get("loaded_config") != config["sha256"]
+    staging, ops, diff = stage_postfix(failure, remove_legacy)
     try:
-        log(f"daemon mode: {config['mode']} -> {phase}")
+        log("modes: " + ", ".join(f"{section} {mode}" for section, mode in config["modes"].items())
+            + f"; failure action {failure}")
         for op in ops:
             log(op)
         log(diff if diff else "(no Postfix changes)")
         if "master.cf" in diff:
             log("note: postconf rewrites master.cf in its own layout; comment lines may move (see the diff above)")
+        log(f"postwarden restarts to load {DEFAULT_CONFIG_PATH}" if restart else f"postwarden already runs {DEFAULT_CONFIG_PATH}")
         if not apply:
             return None
-        if not diff and config["mode"] == phase:
+        refuse_config_change(config["sha256"])
+        active = active_record()
+        if not diff and not restart and active and active[1]["kind"] == "activation" \
+                and active[1]["config_sha256"] == config["sha256"]:
             log("nothing to change; no deployment recorded")
             return None
         with deployment_lock():
@@ -920,57 +1074,34 @@ def configure_postfix(phase: str, report: dict, apply: bool, log: Callable[[str]
                 raise DeploymentError("main.cf/master.cf changed since inspection; re-run")
             refuse_symlinks()
             refuse_changes(planned, "inspection")
-            backup = new_backup(f"postfix-{phase}")
-            managed = [POSTFIX_DIR / "main.cf", POSTFIX_DIR / "master.cf", Path(DEFAULT_CONFIG_PATH)]
-            for path in managed:
-                backup_file(path, backup)
-            write_manifest(backup, {"kind": f"postfix-{phase}", "ops": ops, "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                                    "previous_mode": config["mode"], "before": {str(p): file_state(p) for p in managed}})
-            run(["postfix", "-c", str(staging), "check"])
-            progress: set[str] = set()
+            refuse_config_change(config["sha256"])
+            active = active_record()
+            if not diff and not restart:
+                record = new_backup("activation")
+                write_record(record, "activation", "metadata", active[0].name if active else None)
+                log(f"recorded {DEFAULT_CONFIG_PATH} as postwarden runs it; no restart, no reload")
+                return record.name
+            if active is None and not report["postfix"]["attached"]:
+                root = new_backup("detached")
+                write_record(root, "detached", "root", None)
+                log(f"recorded the state before attachment as {root.name}")
+                active = active_record()
+            if diff:
+                run(["postfix", "-c", str(staging), "check"])
+            attempt = new_backup("activation")
+            save_before(attempt)
+            recovery = active[0] / "config.toml" if active else attempt / "before" / "config.toml"
+            stricter = report["postfix"].get("failure_action") == "accept" and failure == "tempfail"
+            predecessor = active[0].name if active else None
             try:
-                if set_config_mode(Path(DEFAULT_CONFIG_PATH), phase):
-                    progress.add("config")
-                    log(f"set mode = \"{phase}\" in {DEFAULT_CONFIG_PATH}; restarting daemon")
-                    run(["systemctl", "restart", "postwarden.service"])
-                    time.sleep(1)
-                    if not service_active("postwarden.service"):
-                        raise DeploymentError("daemon failed to restart with the new mode")
-                if diff:
-                    progress.add("postfix")
-                    for name in ("main.cf", "master.cf"):
-                        atomic_copy(staging / name, POSTFIX_DIR / name, 0o644)
-                    run(["postfix", "check"])
-                    run(["postfix", "reload"])
-                    log(f"Postfix reloaded; backup {backup.name}")
-                else:
-                    log(f"Postfix unchanged, not reloaded; backup {backup.name}")
-            except Exception as exc:
-                log(f"! activation failed: {exc}; restoring the previous state from {backup.name}")
-                try:
-                    restore_activation(backup, progress, log)
-                except Exception as recovery:
-                    raise DeploymentError(f"activation failed ({exc}) and recovery failed ({recovery}); "
-                                          f"restore by hand from {backup}") from None
-                raise DeploymentError(f"activation failed and the previous state was restored: {exc}") from None
-            record_after(backup, managed)
-            return backup.name
+                switch(attempt, staging if diff else None, None, restart, stricter, recovery, log, config["sha256"],
+                       lambda: write_record(attempt, "activation", "apply" if restart else "postfix", predecessor))
+            except DeploymentError as exc:
+                mark_failed(attempt, exc, log)
+                raise
+            return attempt.name
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-
-
-def restore_activation(backup: Path, progress: set[str], log: Callable[[str], None]) -> None:
-    """Undo a partly applied configure-postfix: Postfix files first, then the daemon mode."""
-    if "postfix" in progress:
-        for name in ("main.cf", "master.cf"):
-            atomic_copy(backup / name, POSTFIX_DIR / name, 0o644)
-        run(["postfix", "check"])
-        run(["postfix", "reload"])
-        log("restored main.cf/master.cf and reloaded Postfix")
-    if "config" in progress:
-        atomic_copy(backup / "config.toml", Path(DEFAULT_CONFIG_PATH), 0o640, ("root", SERVICE_USER))
-        run(["systemctl", "restart", "postwarden.service"])
-        log("restored the previous mode and restarted postwarden")
 
 
 # -- rollback -----------------------------------------------------------------------
@@ -987,20 +1118,71 @@ def rollback_divergence(manifest: dict, targets: list[Path], application: bool) 
     return changed
 
 
-def rollback(deployment_id: str, apply: bool, log: Callable[[str], None], force: bool = False) -> None:
+def rollback_record(backup: Path, manifest: dict, apply: bool, log: Callable[[str], None], force: bool) -> str | None:
+    """Return to the active record's predecessor and record that state as a new activation."""
+    active = active_record()
+    if active[0] != backup:
+        raise DeploymentError(f"{backup.name} is not the active deployment; the active one is {active[0].name}")
+    if manifest["predecessor"] is None:
+        what = "the state before attachment" if manifest["kind"] == "detached" else "the first recorded state"
+        raise DeploymentError(f"{backup.name} is {what}; there is no earlier state to restore")
+    target = BACKUPS / manifest["predecessor"]
+    previous = json.loads((target / "manifest.json").read_text())
+    sources = record_sources()
+    changes = [name for name, source in sources.items() if sha256(target / name) != sha256(source)]
+    restart = loaded_sha256() != previous["config_sha256"]
+    for name in changes:
+        log(f"restore {sources[name]} from {target / name}")
+    if restart:
+        log("restart postwarden")
+    if previous["kind"] == "detached":
+        log("Postfix stops using postwarden; the daemon, unit and launcher stay")
+
+    def check() -> None:
+        refuse_symlinks()
+        diverged = [str(source) for source in sources.values() if manifest["files"].get(str(source)) != file_state(source)]
+        if diverged:
+            log("changed since the deployment: " + ", ".join(diverged))
+            if not force:
+                raise DeploymentError("files changed after the deployment; review them, then re-run with --force to overwrite")
+
+    check()
+    if not apply:
+        return None
+    with deployment_lock():
+        check()
+        attempt = new_backup(previous["kind"])
+        save_before(attempt)
+        postfix_source = target if {"main.cf", "master.cf"} & set(changes) else None
+        config_source = target / "config.toml" if "config.toml" in changes else None
+        stricter = postfix_failure_action() == "accept" and previous["failure_action"] == "tempfail"
+        try:
+            switch(attempt, postfix_source, config_source, restart, stricter, attempt / "before" / "config.toml", log,
+                   previous["config_sha256"] if config_source or restart else sha256(Path(DEFAULT_CONFIG_PATH)),
+                   lambda: write_record(attempt, previous["kind"], "rollback", previous["predecessor"],
+                                        restored_from=target.name))
+        except DeploymentError as exc:
+            mark_failed(attempt, exc, log)
+            raise
+        return attempt.name
+
+
+def rollback(deployment_id: str, apply: bool, log: Callable[[str], None], force: bool = False) -> str | None:
     backup = BACKUPS / deployment_id
     if not (backup / "manifest.json").exists():
         raise DeploymentError(f"no deployment {deployment_id} under {BACKUPS}")
     manifest = json.loads((backup / "manifest.json").read_text())
+    if manifest["kind"] in RECORD_KINDS:
+        return rollback_record(backup, manifest, apply, log, force)
+    if manifest["kind"] != "install":
+        raise DeploymentError(f"{deployment_id} is a {manifest['kind']} run, not a deployment that can be rolled back")
     before = manifest.get("before", {})
     restores: list[tuple[Path, Path]] = []
     removals: list[Path] = []
-    for name, target in (("main.cf", POSTFIX_DIR / "main.cf"), ("master.cf", POSTFIX_DIR / "master.cf"),
-                         ("config.toml", Path(DEFAULT_CONFIG_PATH)), ("postwarden.service", UNIT), ("postwarden", LAUNCHER)):
+    for name, target in (("config.toml", Path(DEFAULT_CONFIG_PATH)), ("postwarden.service", UNIT), ("postwarden", LAUNCHER)):
         if (backup / name).exists():
             restores.append((backup / name, target))
-        elif manifest["kind"] == "install" and target in (UNIT, LAUNCHER) and str(target) in before \
-                and before[str(target)] is None and target.exists():
+        elif target in (UNIT, LAUNCHER) and str(target) in before and before[str(target)] is None and target.exists():
             removals.append(target)
     archive = backup / "application.tar.gz"
     for source, target in restores:
@@ -1018,7 +1200,7 @@ def rollback(deployment_id: str, apply: bool, log: Callable[[str], None], force:
         refuse_symlinks()
         if removals and shutil.which("postconf") and (used := postfix_references()):
             raise DeploymentError("Postfix still uses postwarden in " + ", ".join(used)
-                                  + "; roll back the configure-postfix deployment first")
+                                  + "; detach first: roll back the configure-postfix deployments")
         diverged = rollback_divergence(manifest, targets, archive.exists())
         if diverged:
             log("changed since the deployment: " + ", ".join(diverged))
@@ -1027,7 +1209,7 @@ def rollback(deployment_id: str, apply: bool, log: Callable[[str], None], force:
 
     check()
     if not apply:
-        return
+        return None
     default_modes = {str(LAUNCHER): (0o755, 0, 0), str(DEFAULT_CONFIG_PATH): (0o640, 0, None)}
     with deployment_lock():
         check()
@@ -1049,10 +1231,8 @@ def rollback(deployment_id: str, apply: bool, log: Callable[[str], None], force:
                 elif target.exists():
                     target.unlink()
             shutil.unpack_archive(str(archive), str(ROOT))
-        if manifest["kind"].startswith("postfix"):
-            run(["postfix", "check"])
-            run(["postfix", "reload"])
         run(["systemctl", "daemon-reload"])
         if UNIT.exists():
             run(["systemctl", "restart", "postwarden.service"])
         log("rollback applied")
+    return None

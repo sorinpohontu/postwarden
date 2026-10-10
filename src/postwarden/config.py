@@ -1,19 +1,26 @@
 """TOML schema, validation and the immutable Settings tree. No runtime adapters are imported here."""
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import ipaddress
 import math
 import tomllib
 from dataclasses import dataclass, field, fields
 from typing import Any
 
-from . import DEFAULT_CONFIG_PATH
+from . import DEFAULT_CONFIG_PATH, LOADED_CONFIG
 from .addresses import AddressError, Mailbox, parse_mailbox
 from .replies import DEFAULT_REPLIES, Reply, validate_reply
 
 SUPPORTED_SCHEMA_VERSIONS = (1,)
-MODES = ("observe", "enforce")
-LIMIT_MODES = ("observe", "enforce", "off")
+MODES = ("observe", "enforce", "off")
+FAILURE_ACTIONS = ("auto", "accept", "tempfail")
+SECTIONS = ("protection", "self_sender", "sender_authentication", "limits", "sending_limits")
+RULE_SECTIONS = {
+    "protected_recipient": "protection", "invalid_recipient": "protection", "self_sender": "self_sender",
+    "authentication": "sender_authentication", "limits": "limits", "sending_limit": "sending_limits",
+}
 NULL_SENDER_KEY = "<>"
 LOGIN_PREFIX = "login:"
 
@@ -24,6 +31,11 @@ class ConfigError(Exception):
     def __init__(self, errors: list[str]):
         super().__init__("\n".join(errors))
         self.errors = errors
+
+
+@dataclass(frozen=True, slots=True)
+class PostfixSettings:
+    failure_action: str = "auto"
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,7 +59,7 @@ class TrustSettings:
 
 @dataclass(frozen=True, slots=True)
 class SelfSenderSettings:
-    enabled: bool = True
+    mode: str = "observe"
     identity: str = "envelope_or_header_from"
     allow_mynetworks: bool = True
     allow_senders: frozenset[str] = frozenset()
@@ -55,14 +67,17 @@ class SelfSenderSettings:
 
 @dataclass(frozen=True, slots=True)
 class SenderAuthenticationSettings:
+    mode: str = "observe"
     require: str = "both"
     allow_local: bool = True
     allow_mynetworks: bool = True
     null_sender: str = "dkim_aligned"
+    dkim_diagnostics: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class ProtectionSettings:
+    mode: str = "enforce"
     remote_transports: frozenset[str] = frozenset({"smtp", "relay"})
     addresses: dict[str, frozenset[str]] = field(default_factory=dict)
 
@@ -81,8 +96,12 @@ class ProtectionSettings:
         return False, frozenset()
 
 
+MIN_WORKER_MEMORY = 268435456
+
+
 @dataclass(frozen=True, slots=True)
 class LimitSettings:
+    mode: str = "observe"
     message_bytes: int = 41943040
     max_signatures: int = 10
     max_headers: int = 1000
@@ -91,7 +110,14 @@ class LimitSettings:
     dns_timeout_seconds: float = 5.0
     authentication_deadline_seconds: float = 20.0
     max_concurrent_messages: int = 32
+    dkim_workers: int = 2
+    dkim_worker_memory: int = 1073741824
     max_open_messages: int = 100
+
+    @property
+    def bounded(self) -> bool:
+        """With mode "off" there is no cap on size, headers, recipients or messages open and checked at once."""
+        return self.mode != "off"
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,7 +168,7 @@ class SendingLimitSettings:
 @dataclass(frozen=True, slots=True)
 class Settings:
     schema_version: int = 1
-    mode: str = "observe"
+    postfix: PostfixSettings = PostfixSettings()
     service: ServiceSettings = ServiceSettings()
     logging: LoggingSettings = LoggingSettings()
     trust: TrustSettings = TrustSettings()
@@ -153,9 +179,28 @@ class Settings:
     sending_limits: SendingLimitSettings = SendingLimitSettings()
     responses: dict[str, Reply] = field(default_factory=lambda: dict(DEFAULT_REPLIES))
     source: str = ""
+    sha256: str = ""
 
     def reply(self, name: str) -> Reply:
         return self.responses[name]
+
+    def section_modes(self) -> dict[str, str]:
+        return {section: getattr(self, section).mode for section in SECTIONS}
+
+    def rule_mode(self, rule: str) -> str:
+        """The mode governing a log rule; invalid_from takes the stronger of its two sections."""
+        if rule == "invalid_from":
+            modes = {self.self_sender.mode, self.sender_authentication.mode}
+            return next(mode for mode in ("enforce", "observe", "off") if mode in modes)
+        return getattr(self, RULE_SECTIONS[rule]).mode
+
+    def failure_action(self) -> str:
+        """Postfix's milter default_action: the configured one, or for auto tempfail while any section enforces."""
+        if self.postfix.failure_action != "auto":
+            return self.postfix.failure_action
+        enforcing = [s for s, mode in self.section_modes().items() if mode == "enforce"
+                     and (s != "protection" or self.protection.addresses)]
+        return "tempfail" if enforcing else "accept"
 
 
 class _Validator:
@@ -239,76 +284,54 @@ def parse_settings(data: dict[str, Any], source: str = "") -> Settings:
     """Validate a decoded TOML document and build Settings; raises ConfigError with every problem found."""
     v = _Validator()
     top = v.table(data, "", {
-        "schema_version": int, "mode": str, "service": dict, "logging": dict, "trust": dict,
-        "self_sender": dict, "authentication": dict, "sender_authentication": dict, "protection": dict, "protected_recipients": list,
-        "limits": dict, "sending_limits": dict, "responses": dict,
+        "schema_version": int, "postfix": dict, "logging": dict, "self_sender": dict, "sender_authentication": dict,
+        "protection": dict, "limits": dict, "sending_limits": dict, "responses": dict,
     })
 
     schema_version = top.get("schema_version", 1)
     if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
         v.error("schema_version", f"unsupported version {schema_version}; supported: {SUPPORTED_SCHEMA_VERSIONS}")
-    mode = top.get("mode", "observe")
-    v.choice(mode, "mode", MODES)
+    postfix_t = v.table(top.get("postfix", {}), "postfix", {"failure_action": str})
+    v.choice(postfix_t.get("failure_action"), "postfix.failure_action", FAILURE_ACTIONS)
+    postfix = PostfixSettings(failure_action=postfix_t.get("failure_action", PostfixSettings().failure_action))
 
-    if "service" in top:
-        v.error("service", f"removed; the milter socket is fixed at {ServiceSettings().socket}")
     service = ServiceSettings()
 
-    logging_data = top.get("logging", {})
-    if isinstance(logging_data, dict):
-        logging_data = dict(logging_data)
-        for key in ("backend", "facility", "identifier"):
-            if logging_data.pop(key, None) is not None:
-                v.error(f"logging.{key}", "removed; postwarden logs to syslog (mail facility, tag postwarden); "
-                                          "use `postwarden run --stderr` for foreground debugging")
-    logging_t = v.table(logging_data, "logging", {"level": str})
+    logging_t = v.table(top.get("logging", {}), "logging", {"level": str})
     v.choice(logging_t.get("level"), "logging.level", ("debug", "info", "warning", "error"))
     logging_s = LoggingSettings(level=logging_t.get("level", LoggingSettings().level))
 
-    if "trust" in top:
-        v.error("trust", "removed; mynetworks and recipient_delimiter are read from Postfix at start, "
-                         "same-server clients are detected automatically and the pickup marker is fixed")
     trust = TrustSettings()
 
-    if "authentication" in top:
-        v.error("authentication", "renamed to [sender_authentication]")
-    for section, key in (("self_sender", "ports"), ("sender_authentication", "allow_authenticated_ports")):
-        if isinstance(top.get(section), dict) and key in top[section]:
-            top[section] = {k: val for k, val in top[section].items() if k != key}
-            v.error(f"{section}.{key}", "removed; ports follow the Postfix services: self-sender checks apply "
-                                        "to port 25, authenticated submission is 587 and 465")
     ss_t = v.table(top.get("self_sender", {}), "self_sender", {
-        "enabled": bool, "identity": str, "allow_mynetworks": bool, "allow_senders": list})
+        "mode": str, "identity": str, "allow_mynetworks": bool, "allow_senders": list})
+    v.choice(ss_t.get("mode"), "self_sender.mode", MODES)
     v.choice(ss_t.get("identity"), "self_sender.identity", ("envelope_or_header_from", "envelope", "header_from"))
     self_sender = SelfSenderSettings(
-        enabled=ss_t.get("enabled", True),
+        mode=ss_t.get("mode", SelfSenderSettings().mode),
         identity=ss_t.get("identity", SelfSenderSettings().identity),
         allow_mynetworks=ss_t.get("allow_mynetworks", True),
         allow_senders=frozenset(m.lookup_key for m in v.mailboxes(ss_t.get("allow_senders"), "self_sender.allow_senders")),
     )
 
-    raw_auth = top.get("sender_authentication", {})
-    if isinstance(raw_auth, dict):
-        fixed = {"alignment": "SPF and DKIM must match the From domain exactly",
-                 "temporary_error": "DNS and verifier trouble always defers"}
-        for key in [k for k in raw_auth if k in fixed]:
-            v.error(f"sender_authentication.{key}", f"removed; the rule is fixed: {fixed[key]}")
-        raw_auth = {k: val for k, val in raw_auth.items() if k not in fixed}
-    auth_t = v.table(raw_auth, "sender_authentication", {
-        "require": str, "allow_local": bool, "allow_mynetworks": bool, "null_sender": str})
+    auth_t = v.table(top.get("sender_authentication", {}), "sender_authentication", {
+        "mode": str, "require": str, "allow_local": bool, "allow_mynetworks": bool, "null_sender": str,
+        "dkim_diagnostics": bool})
+    v.choice(auth_t.get("mode"), "sender_authentication.mode", MODES)
     v.choice(auth_t.get("require"), "sender_authentication.require", ("both", "either"))
     v.choice(auth_t.get("null_sender"), "sender_authentication.null_sender", ("dkim_aligned", "both"))
     sender_authentication = SenderAuthenticationSettings(
+        mode=auth_t.get("mode", SenderAuthenticationSettings().mode),
         require=auth_t.get("require", "both"),
         allow_local=auth_t.get("allow_local", True),
         allow_mynetworks=auth_t.get("allow_mynetworks", True),
         null_sender=auth_t.get("null_sender", "dkim_aligned"),
+        dkim_diagnostics=auth_t.get("dkim_diagnostics", False),
     )
 
-    if "protected_recipients" in top:
-        v.error("protected_recipients", "removed; configure protected addresses under [protection] (see docs/Configuration.md)")
     prot_t = v.table(top.get("protection", {}), "protection", {
-        "remote_transports": list, "addresses": dict})
+        "mode": str, "remote_transports": list, "addresses": dict})
+    v.choice(prot_t.get("mode"), "protection.mode", MODES)
     addresses: dict[str, frozenset[str]] = {}
     for name, item in prot_t.get("addresses", {}).items():
         path = f"protection.addresses.{name!r}"
@@ -331,17 +354,20 @@ def parse_settings(data: dict[str, Any], source: str = "") -> Settings:
         addresses[key] = frozenset(v.strings(entry.get("authorized_logins"), f"{path}.authorized_logins"))
     transports = v.strings(prot_t.get("remote_transports"), "protection.remote_transports")
     protection = ProtectionSettings(
+        mode=prot_t.get("mode", ProtectionSettings().mode),
         remote_transports=frozenset(transports) if "remote_transports" in prot_t else ProtectionSettings().remote_transports,
         addresses=addresses,
     )
 
     limits_t = v.table(top.get("limits", {}), "limits", {
-        "message_bytes": int, "max_signatures": int, "max_headers": int, "max_header_bytes": int,
+        "mode": str, "message_bytes": int, "max_signatures": int, "max_headers": int, "max_header_bytes": int,
         "max_recipients": int, "dns_timeout_seconds": (int, float),
         "authentication_deadline_seconds": (int, float), "max_concurrent_messages": int,
-        "max_open_messages": int})
+        "dkim_workers": int, "dkim_worker_memory": int, "max_open_messages": int})
+    v.choice(limits_t.get("mode"), "limits.mode", MODES)
     d = LimitSettings()
     limits = LimitSettings(
+        mode=limits_t.get("mode", d.mode),
         message_bytes=v.positive(limits_t.get("message_bytes"), "limits.message_bytes", d.message_bytes, integer=True),
         max_signatures=v.positive(limits_t.get("max_signatures"), "limits.max_signatures", d.max_signatures, integer=True),
         max_headers=v.positive(limits_t.get("max_headers"), "limits.max_headers", d.max_headers, integer=True),
@@ -350,10 +376,14 @@ def parse_settings(data: dict[str, Any], source: str = "") -> Settings:
         dns_timeout_seconds=v.positive(limits_t.get("dns_timeout_seconds"), "limits.dns_timeout_seconds", d.dns_timeout_seconds, integer=False),
         authentication_deadline_seconds=v.positive(limits_t.get("authentication_deadline_seconds"), "limits.authentication_deadline_seconds", d.authentication_deadline_seconds, integer=False),
         max_concurrent_messages=v.positive(limits_t.get("max_concurrent_messages"), "limits.max_concurrent_messages", d.max_concurrent_messages, integer=True),
+        dkim_workers=v.positive(limits_t.get("dkim_workers"), "limits.dkim_workers", d.dkim_workers, integer=True),
+        dkim_worker_memory=v.positive(limits_t.get("dkim_worker_memory"), "limits.dkim_worker_memory", d.dkim_worker_memory, integer=True),
         max_open_messages=v.positive(limits_t.get("max_open_messages"), "limits.max_open_messages", d.max_open_messages, integer=True),
     )
     if limits.authentication_deadline_seconds < limits.dns_timeout_seconds:
         v.error("limits.authentication_deadline_seconds", "must not be shorter than dns_timeout_seconds")
+    if limits.dkim_worker_memory < MIN_WORKER_MEMORY:
+        v.error("limits.dkim_worker_memory", f"must be at least {MIN_WORKER_MEMORY} (256 MiB): the worker needs room for Python and dkimpy")
 
     sending_limits = _sending_limits(v, top.get("sending_limits", {}))
 
@@ -372,10 +402,17 @@ def parse_settings(data: dict[str, Any], source: str = "") -> Settings:
             v.errors.extend(validate_reply(name, reply))
             responses[name] = reply
 
+    if protection.mode == "off" and protection.addresses:
+        v.error("protection.mode", "off is refused while protected addresses are listed; "
+                                   "use observe, or remove the addresses")
+    if postfix.failure_action == "accept" and protection.mode == "enforce" and protection.addresses:
+        v.error("postfix.failure_action", "accept is refused while protected addresses are enforced: "
+                                          "they would be open whenever postwarden is down")
+
     if v.errors:
         raise ConfigError(v.errors)
     return Settings(
-        schema_version=schema_version, mode=mode, service=service, logging=logging_s, trust=trust,
+        schema_version=schema_version, postfix=postfix, service=service, logging=logging_s, trust=trust,
         self_sender=self_sender, sender_authentication=sender_authentication, protection=protection,
         limits=limits, sending_limits=sending_limits, responses=responses, source=source,
     )
@@ -385,7 +422,7 @@ def _sending_limits(v: _Validator, data: Any) -> SendingLimitSettings:
     t = v.table(data, "sending_limits", {
         "mode": str, "per_hour": int, "per_day": int, "local_per_hour": int, "local_per_day": int,
         "multipliers": dict})
-    v.choice(t.get("mode"), "sending_limits.mode", LIMIT_MODES)
+    v.choice(t.get("mode"), "sending_limits.mode", MODES)
     d = SendingLimitSettings()
     numbers = {name: v.positive(t.get(name), f"sending_limits.{name}", getattr(d, name), integer=True)
                for name in ("per_hour", "per_day", "local_per_hour", "local_per_day")}
@@ -475,14 +512,27 @@ def _multiplier_key(v: _Validator, name: str, path: str) -> tuple[str | None, An
 def load_settings(path: str = DEFAULT_CONFIG_PATH) -> Settings:
     try:
         with open(path, "rb") as fh:
-            data = tomllib.load(fh)
+            raw = fh.read()
+        data = tomllib.loads(raw.decode("utf-8"))
     except FileNotFoundError:
         raise ConfigError([f"{path}: configuration file not found; copy etc/config.example.toml to {DEFAULT_CONFIG_PATH} and edit it"]) from None
     except PermissionError:
         raise ConfigError([f"{path}: permission denied"]) from None
+    except UnicodeDecodeError:
+        raise ConfigError([f"{path}: not UTF-8 text"]) from None
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError([f"{path}: TOML syntax error: {exc}"]) from None
-    return parse_settings(data, source=path)
+    return dataclasses.replace(parse_settings(data, source=path), sha256=hashlib.sha256(raw).hexdigest())
+
+
+def loaded_sha256(path: str = LOADED_CONFIG) -> str | None:
+    """SHA-256 of the configuration the running daemon loaded, once it accepts connections; None when unknown."""
+    try:
+        with open(path) as fh:
+            value = fh.read().strip()
+    except OSError:
+        return None
+    return value if len(value) == 64 else None
 
 
 def describe(settings: Settings) -> dict[str, Any]:
@@ -490,7 +540,7 @@ def describe(settings: Settings) -> dict[str, Any]:
     return {
         "source": settings.source,
         "schema_version": settings.schema_version,
-        "mode": settings.mode,
+        "postfix": {"failure_action": settings.postfix.failure_action, "effective": settings.failure_action()},
         "socket": settings.service.socket,
         "logging": {"level": settings.logging.level},
         "from_postfix": {
@@ -498,7 +548,7 @@ def describe(settings: Settings) -> dict[str, Any]:
             "recipient_delimiter": settings.trust.recipient_delimiter,
         },
         "self_sender": {
-            "enabled": settings.self_sender.enabled,
+            "mode": settings.self_sender.mode,
             "identity": settings.self_sender.identity,
             "allow_mynetworks": settings.self_sender.allow_mynetworks,
             "allow_senders": sorted(settings.self_sender.allow_senders),
@@ -506,6 +556,7 @@ def describe(settings: Settings) -> dict[str, Any]:
         "sender_authentication": {f.name: getattr(settings.sender_authentication, f.name)
                                   for f in fields(SenderAuthenticationSettings)},
         "protection": {
+            "mode": settings.protection.mode,
             "remote_transports": sorted(settings.protection.remote_transports),
             "addresses": {name: {"authorized_logins": sorted(logins)}
                           for name, logins in sorted(settings.protection.addresses.items())},

@@ -3,6 +3,7 @@ functions. Nothing is sent, delivered, counted or changed."""
 from __future__ import annotations
 
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -10,9 +11,9 @@ from typing import Callable
 from .addresses import AddressError, Mailbox, parse_envelope
 from .config import Settings
 from .message import MessageCapture
-from .policy import (Action, AuthStatus, AuthenticationInput, ConnectionFacts, Decision, DkimOutcome, RecipientState,
-                     SpfOutcome, TransactionState, TrustClass, classify_trust, combine, evaluate_authentication,
-                     evaluate_message, evaluate_recipient, spf_decides)
+from .policy import (Action, AuthStatus, AuthenticationInput, ConnectionFacts, Decision, DkimOutcome, SpfOutcome,
+                     TransactionState, TrustClass, classify_trust, effective, enforced, evaluate_authentication,
+                     evaluate_message, evaluate_recipient, skip_dkim)
 from .quota import LimitKey, limit_key
 
 INGRESS = {"25": ("SMTP25", 25), "587": ("SUBMISSION587", 587), "465": ("SUBMISSION465", 465),
@@ -43,6 +44,7 @@ class Outcome:
     final: Decision | None = None
     from_domain: str | None = None
     authentication: str | None = None
+    unreached: bool = False
 
     @property
     def exit_code(self) -> int:
@@ -105,11 +107,14 @@ def simulate(settings: Settings, facts: Facts, message: bytes | None,
     outcome = Outcome(trust, limit_key(settings.sending_limits, trust.value, login=facts.login, sender=sender,
                                        null_sender=null_sender, raw_sender=raw_sender, peer_ip=conn.peer_ip))
     for text in facts.recipients:
-        decision = _recipient(settings, conn, trust, state, text, facts.transport)
+        _, decision = evaluate_recipient(settings, conn, trust, state, text, facts.transport)
         outcome.recipients.append((text, decision))
         if decision.action is not Action.ALLOW and trust is TrustClass.LOCAL_PICKUP:
             state.deferred_rejections.append(decision)
     if message is None:
+        return outcome
+    if trust is not TrustClass.LOCAL_PICKUP and all(enforced(settings, d) for _, d in outcome.recipients):
+        outcome.unreached = True
         return outcome
 
     capture = MessageCapture(settings.limits)
@@ -132,24 +137,8 @@ def simulate(settings: Settings, facts: Facts, message: bytes | None,
     finally:
         capture.close()
     outcome.from_domain = header_from.domain if header_from else None
-    outcome.final = combine(decisions)
+    outcome.final = effective(settings, decisions)
     return outcome
-
-
-def _recipient(settings: Settings, conn: ConnectionFacts, trust: TrustClass, state: TransactionState, text: str,
-               transport: str | None) -> Decision:
-    if len(state.recipients) >= settings.limits.max_recipients:
-        state.overflow_rcpts += 1
-        return Decision(Action.DEFER, "limits", "max_recipients", settings.reply("temporary_failure"))
-    try:
-        recipient = parse_envelope(text)
-        if recipient is None:
-            raise AddressError("empty recipient")
-    except AddressError:
-        decision = Decision(Action.REJECT, "invalid_recipient", "recipient_unparseable", settings.reply("invalid_recipient"))
-        state.recipients.append(RecipientState(None, decision))
-        return decision
-    return evaluate_recipient(settings, conn, trust, state, recipient, transport)
 
 
 def _authentication(settings: Settings, facts: Facts, conn: ConnectionFacts, state: TransactionState,
@@ -162,12 +151,13 @@ def _authentication(settings: Settings, facts: Facts, conn: ConnectionFacts, sta
     forced_spf = forced_authentication(facts.spf, "none", header_from.domain).spf if facts.spf else None
     deadline = time.monotonic() + settings.limits.authentication_deadline_seconds
 
-    def skip_dkim(spf_outcome: SpfOutcome) -> bool:
-        return facts.dkim is None and spf_decides(settings, header_from.domain, spf_outcome, state.null_sender)
+    def skipped(spf_outcome: SpfOutcome) -> bool:
+        return facts.dkim is None and skip_dkim(settings, header_from.domain, spf_outcome, state.null_sender)
 
-    result = live(conn.peer_ip or "", facts.helo, state.raw_sender, capture.message_bytes(),
+    result = live(conn.peer_ip or "", facts.helo, state.raw_sender, capture,
                   capture.header_values(b"DKIM-Signature"), settings.limits, deadline=deadline,
-                  skip_dkim=lambda spf_outcome: skip_dkim(forced_spf or spf_outcome))
+                  skip_dkim=lambda spf_outcome: skipped(forced_spf or spf_outcome),
+                  workers=threading.BoundedSemaphore(1))
     spf_outcome = forced_spf or result.spf
     if facts.dkim:
         return AuthenticationInput(spf_outcome, forced_authentication("none", facts.dkim, header_from.domain).dkim)
@@ -179,8 +169,10 @@ def _describe(auth: AuthenticationInput, facts: Facts) -> str:
     if auth.dkim_skipped:
         dkim = "dkim=skipped (SPF decides)"
     else:
-        dkim = "dkim=" + (",".join(f"{o.domain or '-'}:{o.status.value}" for o in auth.dkim) or "none")
+        dkim = "dkim=" + (",".join(f"{o.domain or '-'}:{o.word}" for o in auth.dkim) or "none")
         dkim += " (forced)" if facts.dkim else " (DNS)"
+        if auth.incomplete:
+            dkim += f", incomplete ({auth.incomplete})"
     return f"{spf}, {dkim}"
 
 
@@ -188,13 +180,18 @@ def _reply(decision: Decision) -> str:
     return decision.reply.render() if decision.reply is not None else ""
 
 
+def _action(settings: Settings, decision: Decision) -> str:
+    """The action as the log names it: would_reject and would_defer for an observed rule."""
+    if decision.action is Action.ALLOW or enforced(settings, decision):
+        return decision.action.value
+    return f"would_{decision.action.value}"
+
+
 def render(settings: Settings, facts: Facts, outcome: Outcome, message_name: str | None) -> list[str]:
     conn = connection(facts)
     login = f", login {facts.login}" if facts.login else ""
     tls = "" if facts.ingress not in ("587", "465") else (", TLS" if facts.tls else ", no TLS")
     out = [f"connection: ingress {facts.ingress}, peer {conn.peer_ip}{login}{tls} -> trust {outcome.trust.value}"]
-    if settings.mode != "enforce":
-        out.append("note: observe mode: postwarden would only log the refusals below and let the mail through")
     if outcome.limit is None:
         out.append("sending limits: none (outside mail is not limited)")
     else:
@@ -208,13 +205,15 @@ def render(settings: Settings, facts: Facts, outcome: Outcome, message_name: str
     width = max(len(text) for text, _ in outcome.recipients)
     for text, decision in outcome.recipients:
         detail = "" if decision.action is Action.ALLOW else f"  {decision.rule} {decision.reason}  {_reply(decision)}"
-        out.append(f"  {text.ljust(width)}  {decision.action.value}{detail}")
+        out.append(f"  {text.ljust(width)}  {_action(settings, decision)}{detail}")
     out += ["", "End of message"]
-    if outcome.final is None:
+    if outcome.unreached:
+        out.append("  not reached: every recipient was refused, so Postfix ends the transaction before DATA")
+    elif outcome.final is None:
         out.append("  not evaluated: no message file (RCPT stage only)")
     else:
         final = outcome.final
-        out.append(f"  {final.action.value}  {final.rule} {final.reason}  {_reply(final)}".rstrip())
+        out.append(f"  {_action(settings, final)}  {final.rule} {final.reason}  {_reply(final)}".rstrip())
         if message_name:
             out.append(f"  message: {message_name}; From domain: {outcome.from_domain or 'none'}")
         if outcome.authentication:

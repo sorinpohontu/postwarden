@@ -12,7 +12,6 @@ MYNETWORKS = parse_mynetworks("127.0.0.0/8 [::1]/128 203.0.113.0/24 [2001:db8:1:
 
 BASE_TOML = """
 schema_version = 1
-mode = "enforce"
 
 [protection.addresses."all@*"]
 authorized_logins = []
@@ -38,8 +37,14 @@ def _merge(base: dict, extra: dict) -> dict:
     return merged
 
 
-def settings(extra: str = "", base: str = BASE_TOML, mynetworks=MYNETWORKS, recipient_delimiter="+") -> Settings:
-    parsed = parse_settings(_merge(tomllib.loads(base), tomllib.loads(extra)), source="<test>")
+RULE_SECTIONS = ("protection", "self_sender", "sender_authentication", "limits")
+
+
+def settings(extra: str = "", base: str = BASE_TOML, mynetworks=MYNETWORKS, recipient_delimiter="+",
+             mode: str | None = "enforce") -> Settings:
+    """`mode` sets every rule section except sending limits; a section's own mode in `extra` wins."""
+    modes = {section: {"mode": mode} for section in RULE_SECTIONS} if mode else {}
+    parsed = parse_settings(_merge(_merge(tomllib.loads(base), modes), tomllib.loads(extra)), source="<test>")
     return with_postfix(parsed, mynetworks, recipient_delimiter)
 
 

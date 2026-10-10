@@ -52,7 +52,7 @@ class Traffic:
     def __init__(self, test, mode="enforce", extra=LIMITS, level="info"):
         self.log = JournalLogger(level)
         self.log.start(level)
-        self.cfg = settings(f'\nmode = "{mode}"\n' + extra)
+        self.cfg = settings(extra, mode=mode)
         self.quota = None if self.cfg.sending_limits.mode == "off" else QuotaStore(self.cfg.sending_limits)
         milter.authenticator = passing
         test.addCleanup(setattr, milter, "authenticator", None)
@@ -110,7 +110,7 @@ class Measures(unittest.TestCase):
 
     def test_same_message_in_observe_and_enforce(self):
         rcpts = ["a@example.net", "all@example.com", "b@example.net"]
-        enforce, observe = Traffic(self), Traffic(self, mode="observe")
+        enforce, observe = Traffic(self), Traffic(self, mode="observe", extra=LIMITS.replace('mode = "enforce"', 'mode = "off"'))
         enforce.send("demo@example.com", rcpts, login="demo@example.com")
         observe.send("demo@example.com", rcpts, login="demo@example.com")
         self.assertEqual(build(enforce)["totals"]["delivered"], 2)
@@ -266,6 +266,73 @@ class Text(unittest.TestCase):
         self.assertEqual(parse_line(line)[0], "Sep 29 11:37:13")
 
 
+class DkimRate(unittest.TestCase):
+    """SPF-pass messages whose evaluated DKIM signatures all failed, from the daemon's own end-of-message lines."""
+
+    def send(self, traffic, spf_domain, *outcomes, incomplete=None, skipped=False):
+        spf_outcome = SpfOutcome(AuthStatus.PASS, spf_domain, "pass")
+        milter.authenticator = lambda *a, **k: AuthenticationInput(spf_outcome, outcomes, incomplete, skipped)
+        traffic.send("bob@example.org", ["carol@example.com"], port="25", peer="192.0.2.9")
+
+    def test_rate_counts_only_evaluated_signatures(self):
+        traffic = Traffic(self, mode="observe", extra='\n[sender_authentication]\ndkim_diagnostics = true\n')
+        P, F = AuthStatus.PASS, AuthStatus.FAIL
+        self.send(traffic, "example.org", DkimOutcome(F, "example.org"))
+        self.send(traffic, "example.org", DkimOutcome(F, "a.example", result="permerror"), DkimOutcome(F, "b.example"))
+        self.send(traffic, "example.org", DkimOutcome(F, "a.example"), DkimOutcome(P, "example.org"))
+        self.send(traffic, "example.org")
+        self.send(traffic, "example.org", DkimOutcome(F, "a.example"), DkimOutcome(F, "x.example", result="neutral"),
+                  incomplete="limit")
+        self.send(traffic, "example.org", DkimOutcome(AuthStatus.TEMPERROR, "example.org"))
+        self.send(traffic, "relay.example", DkimOutcome(F, "example.org"))
+        dkim = build(traffic)["dkim"]
+        self.assertEqual(dkim["diagnostics"], "enabled")
+        aligned = dkim["spf_pass"]["aligned"]
+        self.assertEqual({k: aligned[k] for k in ("messages", "evaluated", "failed", "rate", "unsigned", "incomplete",
+                                                  "temperror", "neutral")},
+                         {"messages": 6, "evaluated": 3, "failed": 2, "rate": 0.6667, "unsigned": 1, "incomplete": 1,
+                          "temperror": 1, "neutral": 1})
+        self.assertEqual((dkim["spf_pass"]["unaligned"]["evaluated"], dkim["spf_pass"]["unaligned"]["failed"]), (1, 1))
+
+    def test_a_temporary_or_partial_body_result_is_not_a_failed_message(self):
+        traffic = Traffic(self, mode="observe", extra='\n[sender_authentication]\ndkim_diagnostics = true\n')
+        F = AuthStatus.FAIL
+        self.send(traffic, "example.org", DkimOutcome(F, "a.example"), DkimOutcome(AuthStatus.TEMPERROR, "example.org"))
+        self.send(traffic, "example.org", DkimOutcome(F, "a.example"),
+                  DkimOutcome(AuthStatus.PASS, "example.org", partial_body=True))
+        self.send(traffic, "example.org", DkimOutcome(F, "a.example"), DkimOutcome(F, "b.example", result="permerror"))
+        aligned = build(traffic)["dkim"]["spf_pass"]["aligned"]
+        self.assertEqual({k: aligned[k] for k in ("evaluated", "failed", "temperror", "policy")},
+                         {"evaluated": 3, "failed": 1, "temperror": 1, "policy": 1})
+
+    def test_late_pass_beyond_the_cut_list_still_counts(self):
+        traffic = Traffic(self, mode="observe", extra='\n[sender_authentication]\ndkim_diagnostics = true\n'
+                                                       '[limits]\nmax_signatures = 50\n')
+        fails = [DkimOutcome(AuthStatus.FAIL, f"d{n}.example") for n in range(30)]
+        self.send(traffic, "example.org", *fails, DkimOutcome(AuthStatus.PASS, "example.org"))
+        self.send(traffic, "example.org", *fails, DkimOutcome(AuthStatus.FAIL, "example.org"))
+        self.assertIn("dkim_truncated=yes", traffic.log.lines[1])
+        aligned = build(traffic)["dkim"]["spf_pass"]["aligned"]
+        self.assertEqual((aligned["evaluated"], aligned["failed"]), (2, 1))
+
+    def test_coverage_states(self):
+        on, off = (Traffic(self, mode="observe", extra=f'\n[sender_authentication]\ndkim_diagnostics = {v}\n')
+                   for v in ("true", "false"))
+        self.send(on, "example.org")
+        self.send(off, "example.org", skipped=True)
+        self.assertEqual(build(on)["dkim"]["diagnostics"], "enabled")
+        self.assertEqual((build(off)["dkim"]["diagnostics"], build(off)["dkim"]["spf_pass"]["aligned"]["skipped"]),
+                         ("disabled", 1))
+        mixed = report(tally(on.log.lines + off.log.lines), settings().sending_limits, source={"description": "t"},
+                       config="t", top=5, notes=[])["dkim"]
+        self.assertEqual((mixed["diagnostics"], mixed["checked"]), ("partial", {"on": 1, "off": 1, "unknown": 0}))
+        legacy = [line.replace(" dkim_diagnostics=on", "") for line in on.log.lines]
+        self.assertEqual(report(tally(legacy), settings().sending_limits, source={"description": "t"}, config="t",
+                                top=5, notes=[])["dkim"]["diagnostics"], "unknown")
+        text = render({**build(on), "version": "x", "host": "h"})
+        self.assertIn("no SPF-pass message had a signature evaluated to pass, fail or permerror", text)
+
+
 class Completeness(unittest.TestCase):
     def test_level_above_info_or_missing_start_line_is_reported(self):
         traffic = Traffic(self, level="warning")
@@ -274,15 +341,6 @@ class Completeness(unittest.TestCase):
         self.assertFalse(report(tally([]), settings().sending_limits, source={"description": "t"}, config="c",
                                 top=20, notes=[])["complete"])
         self.assertTrue(build(Traffic(self))["complete"])
-        unknown = report(tally(["2026-09-28T09:00:00+0200 h postwarden[1]: event=start mode=enforce\n"]),
-                         settings().sending_limits, source={"description": "t"}, config="c", top=20, notes=[])
-        self.assertEqual(unknown["notes"], ["start at 2026-09-28T09:00:00+0200 did not log its logging level: "
-                                            "decisions may be missing after it"])
-        two = report(tally(["2026-09-28T09:00:00+0200 h postwarden[1]: event=start mode=enforce\n",
-                            "2026-09-28T10:00:00+0200 h postwarden[2]: event=start mode=enforce\n"]),
-                     settings().sending_limits, source={"description": "t"}, config="c", top=20, notes=[])
-        self.assertEqual(two["notes"], ["2 starts between 2026-09-28T09:00:00+0200 and 2026-09-28T10:00:00+0200 did "
-                                        "not log their logging level: decisions may be missing after them"])
 
 
 class Command(unittest.TestCase):

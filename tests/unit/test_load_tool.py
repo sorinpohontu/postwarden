@@ -105,3 +105,45 @@ class LoadTool(unittest.TestCase):
     def test_connect_packet_encodes_family_and_port(self):
         self.assertEqual(load.connect_data("h", "192.0.2.1", 25), b"h\x004\x00\x19192.0.2.1\x00")
         self.assertTrue(load.connect_data("h", "2001:db8::1", 25).startswith(b"h\x006"))
+
+    def test_presented_peers_cycle_through_the_network(self):
+        scenario = load.Scenario(peers=load.peers("198.51.100.16/29"))
+        self.assertEqual([scenario.peer(i) for i in (0, 5, 6)], ["198.51.100.17", "198.51.100.22", "198.51.100.17"])
+        self.assertEqual(load.peers("192.0.2.7/32"), ("192.0.2.7",))
+
+    def test_failing_signature_differs_only_in_b(self):
+        value = "v=1; a=rsa-sha256; d=example.org; s=load; bh=AAAAbh; b=AbCd\tEf=="
+        changed = load.tampered(value)
+        self.assertEqual((changed.split("b=")[0], changed.endswith("BbCd\tEf==")), (value.split("b=")[0], True))
+        self.assertEqual(changed.count("bh=AAAAbh"), 1)
+
+
+def real_dkim() -> bool:
+    try:
+        import dkim
+    except ImportError:
+        return False
+    return hasattr(dkim, "sign")
+
+
+@unittest.skipUnless(real_dkim() and shutil.which("openssl"), "needs python3-dkim and openssl")
+class Signing(unittest.TestCase):
+    def test_pattern_verifies_as_requested(self):
+        import base64
+        import subprocess
+        import dkim
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        key = os.path.join(directory, "load.private")
+        subprocess.run(["openssl", "genrsa", "-traditional", "-out", key, "1024"], check=True, capture_output=True)
+        public = base64.b64encode(subprocess.run(["openssl", "rsa", "-in", key, "-pubout", "-outform", "DER"],
+                                                 check=True, capture_output=True).stdout)
+        scenario = load.Scenario(sender="load@example.org", dkim_domain="example.org", selector="load",
+                                 message_id="<x@example.org>")
+        payload = load.body(4096)
+        values = load.signed_headers(scenario, key, ["fail", "pass"], payload)
+        message = b"".join(f"DKIM-Signature: {v}\r\n".encode() for v in values) + b"".join(
+            f"{n}: {v}\r\n".encode() for n, v in load.fixed_headers(scenario)) + b"\r\n" + payload
+        dns = lambda name, timeout=5: b"v=DKIM1; k=rsa; p=" + public if name.startswith(b"load.") else None
+        verifier = dkim.DKIM(message)
+        self.assertEqual([verifier.verify(idx=i, dnsfunc=dns) for i in (0, 1)], [False, True])

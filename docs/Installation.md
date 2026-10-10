@@ -2,15 +2,15 @@
 
 There are two equivalent ways to install postwarden: the **automated installer** (`scripts/install.py`) and the **manual steps**. Both produce the same files, permissions and services.
 
-In both, postwarden starts in **observe** mode: it logs what it would refuse and lets all mail through. Switch to **enforce** mode once the log looks right.
+In both, protected addresses are enforced from the start, and the other rules start in **observe** mode: they log what they would refuse and let the mail through. Enforce them, section by section, once the log looks right (see [Modes](Configuration.md#modes)).
 
 The steps at a glance:
 
 1. Check the requirements and download the release.
 2. Create `/etc/postwarden/config.toml` with your protected addresses.
 3. Install the daemon; Postfix is not touched yet.
-4. Attach it to Postfix in observe mode and watch the log for a while (`journalctl -t postwarden -f`, `postwarden stats`).
-5. Switch to enforce mode.
+4. Attach it to Postfix and watch the log for a while (`journalctl -t postwarden -f`, `postwarden stats`).
+5. Enforce the other rules.
 
 Every step can be undone: see [Rollback](#rollback). Upgrading later is one command: see [Upgrades](#upgrades).
 
@@ -61,23 +61,25 @@ python3 scripts/install.py install --dry-run
 python3 scripts/install.py install --apply
 ```
 
-**4. Attach to Postfix in observe mode:**
+**4. Attach to Postfix:**
 
 ```sh
-python3 scripts/install.py configure-postfix --phase observe --dry-run
-python3 scripts/install.py configure-postfix --phase observe --apply
+python3 scripts/install.py configure-postfix --dry-run
+python3 scripts/install.py configure-postfix --apply
 ```
 
-**5. Switch to enforce mode** after reviewing the log (`journalctl -t postwarden`, `postwarden stats`):
+Postfix's failure action comes from `[postfix] failure_action`: with the default `"auto"` and protected addresses enforced it is `tempfail`, so mail is delayed rather than let through unchecked while postwarden is down.
+
+If your SMTP services pass mail through content filters that reinject it with `sendmail`, this is refused while protected addresses are enforced: read [Migration](Migration.md) first. On a test host, `--keep-legacy` attaches anyway.
+
+**5. Enforce the other rules** after reviewing the log (`journalctl -t postwarden`, `postwarden stats`). Set `mode = "enforce"` in each section you are ready for, then:
 
 ```sh
-python3 scripts/install.py configure-postfix --phase enforce --dry-run
-python3 scripts/install.py configure-postfix --phase enforce --apply
+postwarden check-config
+python3 scripts/install.py configure-postfix --apply
 ```
 
-This sets `mode = "enforce"`, restarts the daemon and switches Postfix's failure action to `tempfail`, all in one step.
-
-If your SMTP services pass mail through content filters that reinject it with `sendmail`, `--phase enforce` is refused: read [Migration](Migration.md) first. On a test host, `--keep-legacy` enforces anyway.
+`configure-postfix --apply` restarts postwarden when `config.toml` changed since it started, and changes Postfix only when the failure action, the milter chain or the macros postwarden needs differ. With nothing to do it reports nothing to change.
 
 ### How the installer works
 
@@ -85,6 +87,8 @@ If your SMTP services pass mail through content filters that reinject it with `s
 - `inspect` marks problems that block installation with `!` and exits 1. Lines marked `~` are warnings that block nothing: Postfix rate limits below the sending limits, and local mail waiting in `maildrop` (100 files or more, or a file older than an hour). It also prints Postfix's rate limits and the number of files in `maildrop`.
 - `install.py --config FILE inspect` checks another configuration file. `install` and `configure-postfix` always use `/etc/postwarden/config.toml`; to install another file, use `install --import-config FILE`.
 - `--apply` needs root and takes a lock. It backs up everything it changes under `/var/backups/postwarden/<deployment-id>/` and prints the **deployment id**.
+- Each `configure-postfix --apply` that changes something records the state it activated: `config.toml`, `main.cf` and `master.cf`. The first one also records the state before postwarden was attached. When Postfix uses a newly stricter failure action (`accept` to `tempfail`) it is changed before postwarden restarts, otherwise after, so mail arriving during the switch is never let through by the new failure action before the new rules run.
+- If a step fails, `configure-postfix` restores Postfix's files and, if it restarted postwarden, the previously recorded `config.toml`, and says so. The files it started from stay in the deployment directory under `before/`.
 - Each `--apply` makes its own plan; it does not reuse an earlier dry run. It refuses if `config.toml`, `main.cf`, `master.cf` or the installed files change while it runs, and if any of them is a symlink.
 - A run that would change nothing records no deployment.
 - `configure-postfix` edits Postfix through `postconf`, which rewrites `master.cf` in its own layout, so comment lines between services may move. The dry run shows the diff.
@@ -109,7 +113,7 @@ python3 scripts/install.py rollback --deployment-id <id> --dry-run
 python3 scripts/install.py rollback --deployment-id <id> --apply
 ```
 
-Roll back in reverse order: the `configure-postfix` deployments first, then `install`. Rolling back the first `install` stops and disables the service and removes the unit and launcher, keeping `config.toml`, `/etc/postwarden` and the backups. Rollback refuses files changed since the deployment unless you pass `--force`; see [Operations](Operations.md#rollback).
+Rolling back the active `configure-postfix` deployment returns to the state recorded before it, `config.toml` included, and records that as a new deployment; `install.py inspect` prints the active one. Repeat it to go further back, down to the state before postwarden was attached. Then roll back the `install` deployments, newest first. Rolling back the first `install` stops and disables the service and removes the unit and launcher, keeping `config.toml`, `/etc/postwarden` and the backups. Rollback refuses files changed since the deployment unless you pass `--force`; see [Operations](Operations.md#rollback).
 
 ## Manual installation
 
@@ -138,7 +142,7 @@ The setgid bit on the socket directory gives the socket the group `postfix`, so 
 ### 3. Application, launcher and configuration
 
 ```sh
-tar -xzf postwarden-<version>.tar.gz -C /etc/postwarden
+tar -xzf /root/postwarden-<version>.tar.gz -C /etc/postwarden
 cd /etc/postwarden
 install -m 0755 bin/postwarden /usr/local/sbin/postwarden
 cp etc/config.example.toml /etc/postwarden/config.toml
@@ -162,7 +166,7 @@ journalctl -t postwarden -n 5
 
 postwarden is now running but not attached; Postfix behaves exactly as before.
 
-### 5. Attach to Postfix (observe mode)
+### 5. Attach to Postfix
 
 First, back up the Postfix configuration; you need it for [rollback](#8-manual-rollback):
 
@@ -188,7 +192,7 @@ prepend() { v=$(postconf -h "$1"); postconf -e "$1 = $2${v:+, $v}"; }
 add_macros() { v=$(postconf -h "$1"); n=$1; shift; for m in "$@"; do case " $v " in *" $m "*) ;; *) v="${v:+$v }$m";; esac; done; postconf -e "$n = $v"; }
 
 postconf -e 'milter_protocol = 6'
-postconf -e 'postwarden_milter = { unix:postwarden/policy.sock, default_action=accept, content_timeout=60s }'
+postconf -e 'postwarden_milter = { unix:postwarden/policy.sock, default_action=tempfail, content_timeout=60s }'
 prepend smtpd_milters '$postwarden_milter'
 [ "$(postconf -h non_smtpd_milters)" = '$smtpd_milters' ] || prepend non_smtpd_milters '$postwarden_milter'
 prepend milter_macro_defaults 'postwarden_ingress=UNCLASSIFIED'
@@ -206,7 +210,7 @@ postconf -P 'pickup/unix/cleanup_service_name = postwarden-cleanup'
 postfix check && postfix reload
 ```
 
-`postconf` warns once `unused parameter: postwarden_milter` right after defining it; the next line uses it.
+`default_action` is the failure action that `postwarden check-config` prints: `tempfail` with the example configuration, where protected addresses are enforced. Use `accept` only if `check-config` says so. `postconf` warns once `unused parameter: postwarden_milter` right after defining it; the next line uses it.
 
 If a service in `master.cf` has its own settings, they override the ones above:
 
@@ -222,18 +226,22 @@ postwarden reads the login and TLS details once, at `MAIL FROM`, so `{auth_type}
 - `python3 /etc/postwarden/scripts/install.py inspect` shows `attached=True` and no findings.
 - Send a message through each path (25, 587, 465, `sendmail`). `journalctl -t postwarden` shows one `stage=eom` line per message, with the expected `ingress=` and `trust=`.
 
-### 7. Enforce mode
+### 7. Enforce the other rules
 
-After reviewing the log, change both the daemon and Postfix:
+After reviewing the log, set `mode = "enforce"` in each section you are ready for, then:
 
 ```sh
-sed -i 's/^mode = "observe"/mode = "enforce"/' /etc/postwarden/config.toml
 postwarden check-config && systemctl restart postwarden
+```
+
+If the failure action that `check-config` prints changed (for example from `accept` to `tempfail`), set it in Postfix too:
+
+```sh
 postconf -e 'postwarden_milter = { unix:postwarden/policy.sock, default_action=tempfail, content_timeout=60s }'
 postfix check && postfix reload
 ```
 
-Both are needed: an enforcing daemon behind `default_action=accept` lets every message through unchecked whenever it is down.
+An enforcing rule behind `default_action=accept` lets every message through unchecked whenever postwarden is down.
 
 ### 8. Manual rollback
 

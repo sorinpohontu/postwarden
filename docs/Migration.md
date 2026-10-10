@@ -5,7 +5,7 @@ This guide is for servers that enforce sender and recipient policy with `content
 The migration has three phases:
 
 1. **Observe:** postwarden runs alongside the old filters and only logs.
-2. **Cutover:** enforcement is switched on and the old filters are detached, in one step.
+2. **Cutover:** postwarden's rules are enforced and the old filters are detached together.
 3. **Retire:** the old services are removed once no queued mail needs them.
 
 ## Before you start
@@ -27,7 +27,21 @@ postconf -n | grep -E 'policy|milter'
 
 ## Phase 1: observe alongside the old filters
 
-Install postwarden and attach it in observe mode, as in [Installation](Installation.md#automated-installation) steps 1–4. The legacy components are not touched, and both policies run:
+Install postwarden as in [Installation](Installation.md#automated-installation) steps 1–3. Before attaching it, set every section to observe, `[protection]` included: the old filters still guard the groups, and enforced protection would refuse authorized group mail when the filters reinject it with `sendmail`.
+
+```toml
+[protection]
+mode = "observe"
+```
+
+(`[self_sender]`, `[sender_authentication]`, `[limits]` and `[sending_limits]` start in observe mode already.) Then attach, as in step 4:
+
+```sh
+postwarden check-config
+python3 scripts/install.py configure-postfix --apply
+```
+
+With nothing enforced, Postfix's failure action is `accept`. The legacy components are not touched, and both policies run:
 
 - the pipe filters still refuse what they refuse, after postwarden has seen and logged the message;
 - the SPF policy service still refuses at `RCPT` before postwarden sees that recipient, so postwarden's view of those messages is incomplete;
@@ -37,22 +51,28 @@ Compare postwarden's `would_reject` lines with the filters' decisions for at lea
 
 ## Phase 2: cutover
 
+Set `mode = "enforce"` in `[protection]` and `[sender_authentication]`, the sections that replace the filters and the SPF policy service, and in any other section you are ready for. Then:
+
 ```sh
-python3 scripts/install.py configure-postfix --phase enforce --remove-legacy --dry-run
-python3 scripts/install.py configure-postfix --phase enforce --remove-legacy --apply
+postwarden check-config
+python3 scripts/install.py configure-postfix --remove-legacy --dry-run
+python3 scripts/install.py configure-postfix --remove-legacy --apply
 ```
 
-Enforcement and removal must happen together. `--phase enforce` without `--remove-legacy` is refused while content filters remain: reinjected copies of authorized group mail would be refused on the `sendmail` path and bounce.
+Enforcement and removal must happen together:
 
-In one step this:
+- `--remove-legacy` is refused unless `[protection]` and `[sender_authentication]` enforce in the configuration;
+- attaching with enforced protection while content filters remain is refused without `--remove-legacy`: reinjected copies of authorized group mail would be refused on the `sendmail` path and bounce.
 
-- sets `mode = "enforce"` and restarts postwarden;
+`configure-postfix --remove-legacy --apply`:
+
 - switches the milter's `default_action` to `tempfail`;
 - removes `content_filter` and `receive_override_options` from the SMTP services;
 - removes the `policyd-spf` call from `smtpd_recipient_restrictions`;
-- validates and reloads Postfix.
+- validates and reloads Postfix;
+- then restarts postwarden, which enforces the new modes.
 
-It does **not** delete the pipe or `policyd-spf` service definitions. The remaining restrictions keep their order, but `postconf` writes the list on one line, so comment lines from a multi-line layout stay behind. A `{ }`-grouped restriction list is refused; edit it by hand.
+Postfix changes first because its failure action becomes stricter; the restart follows in the same run. It does **not** delete the pipe or `policyd-spf` service definitions. The remaining restrictions keep their order, but `postconf` writes the list on one line, so comment lines from a multi-line layout stay behind. A `{ }`-grouped restriction list is refused; edit it by hand.
 
 Check right away:
 
@@ -67,9 +87,8 @@ The same change without the installer, in one sitting. List the services that ca
 
 ```sh
 cp -p /etc/postfix/main.cf /etc/postfix/master.cf /etc/postwarden/config.toml /root/    # copies for undo
-sed -i 's/^mode *=.*/mode = "enforce"/' /etc/postwarden/config.toml
-grep -q '^mode' /etc/postwarden/config.toml || sed -i '1i mode = "enforce"' /etc/postwarden/config.toml
-postwarden check-config && systemctl restart postwarden
+$EDITOR /etc/postwarden/config.toml         # mode = "enforce" in [protection] and [sender_authentication]
+postwarden check-config                     # must print failure action tempfail
 postconf -PX smtpd/pass/content_filter smtpd/pass/receive_override_options \
              submission/inet/content_filter submission/inet/receive_override_options \
              smtps/inet/content_filter smtps/inet/receive_override_options
@@ -79,6 +98,7 @@ printf '%s\n' "$r"                          # check: every other restriction sti
 postconf -e "smtpd_recipient_restrictions = $r"
 postconf -e 'postwarden_milter = { unix:postwarden/policy.sock, default_action=tempfail, content_timeout=60s }'
 postfix check && postfix reload
+systemctl restart postwarden
 ```
 
 - The restrictions edit expects a comma-separated list; edit a list separated only by spaces by hand.
@@ -105,7 +125,7 @@ postfix check && postfix reload
 apt-get remove postfix-policyd-spf-python     # keep python3-spf: postwarden needs it
 ```
 
-Keep the filter scripts and the old configuration in your backups. `rollback --deployment-id <enforce-id>` restores the `main.cf`, `master.cf` and `config.toml` from before the cutover; reinstalling the package brings back the SPF policy service if you removed it.
+Keep the filter scripts and the old configuration in your backups. `rollback --deployment-id <cutover-id>` restores `main.cf`, `master.cf` and `config.toml` from before the cutover and restarts postwarden in observe mode, provided the cutover is still the active deployment. Reinstalling the package brings back the SPF policy service if you removed it.
 
 ## What changes for users
 

@@ -29,3 +29,15 @@ class HeaderCapture(unittest.TestCase):
         c.add_header(b"B", b"2")
         c.add_body(b"x" * 1000)
         self.assertEqual(c.body_bytes, 0)
+
+    def test_large_body_is_handed_over_by_descriptor(self):
+        import os
+        from postwarden.message import SPOOL_MEMORY_LIMIT
+        c = self.capture()
+        c.add_header(b"From", b" a@example.org")
+        c.add_body(b"x" * SPOOL_MEMORY_LIMIT)
+        self.assertIsNone(c.body_fd(), "a body within the memory spool stays in this process")
+        c.add_body(b"y")
+        fd = c.body_fd()
+        self.assertIsNotNone(fd)
+        self.assertEqual(c.header_block() + os.pread(fd, c.body_bytes, 0), c.message_bytes())

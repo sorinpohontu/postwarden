@@ -1,6 +1,6 @@
 # ADR-0007: Per-sender sending limits in postwarden (planned for 1.1)
 
-- Status: Accepted
+- Status: Accepted; "global observe wins" (Own mode) superseded by ADR-0022; hypothetical observe count superseded by ADR-0027
 - Date: 2026-09-22; rewritten 2026-09-25 before implementation (state file,
   multipliers, one recipient counter)
 

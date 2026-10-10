@@ -73,6 +73,14 @@ with `d=` equal to the From domain. `sender_authentication.require` decides
 whether `both` or `either` is needed (ADR-0019). Not DMARC: no `_dmarc`
 policy is read. Avoid calling `either` "DMARC mode".
 
+### DKIM diagnostics (1.2)
+
+Verifying DKIM after an SPF `pass` even when SPF already settled the verdict,
+to measure SPF-pass mail with failing signatures. Opt-in with
+`[sender_authentication] dkim_diagnostics = true`; never changes a verdict;
+adds work only after an SPF pass; DKIM that the verdict needs runs as before (ADR-0026). Not DMARC.
+Also seen in plans as: "item A", "diagnostic DKIM" (prefer DKIM diagnostics).
+
 ### Null sender
 
 `MAIL FROM:<>` only: bounces and DSNs. An envelope sender postwarden cannot parse is an unknown sender, never a null sender (ADR-0013). SPF evaluates the HELO identity for them;
@@ -100,20 +108,57 @@ is on. None bypass protected recipients.
 
 ### Mode
 
+A section's switch, `observe` | `enforce` | `off`, set per section in
+`[protection]`, `[self_sender]`, `[sender_authentication]`, `[limits]` and
+`[sending_limits]`; no section overrides another (from 1.2, ADR-0022).
 `observe` logs the decision that would be taken and lets the message continue;
-`enforce` returns the configured SMTP reply. One global daemon setting,
-covering protected recipients, self-sender, sender authentication and the
-resource limits (`[limits]`); self-sender and sender authentication have no
-mode of their own. From 1.1 sending limits also have their own mode (`observe`, `enforce`, `off`,
-default `observe`), and a global `observe` overrides it (ADR-0007).
+`enforce` returns the configured SMTP reply; `off` skips the rule and logs
+nothing. Defaults: protection `enforce`, every other section `observe`.
+`[protection]` cannot be `off` while addresses are listed (ADR-0023).
+There is no global mode; 1.1 and earlier had one (ADR-0007).
 
-### Phase
+Which section's mode governs each `rule=` (log rule names are kept):
 
-The coupled pair of daemon mode and the milter's Postfix `default_action`:
-observation = `observe` + `accept`, enforcement = `enforce` + `tempfail`.
-Changed only through `configure-postfix --phase`, never by editing `mode`
-alone; enforce mode behind `default_action=accept` admits everything while
-the daemon is down.
+| Section                   | Rules                                   |
+| ------------------------- | --------------------------------------- |
+| `[protection]`            | `protected_recipient`, `invalid_recipient` |
+| `[self_sender]`           | `self_sender`, `invalid_from` (*)        |
+| `[sender_authentication]` | `authentication`, `invalid_from` (*)     |
+| `[limits]`                | `limits`                                 |
+| `[sending_limits]`        | `sending_limit`                          |
+
+(*) `invalid_from` enforces if either section enforces (ADR-0024).
+`rule=trust` only records an exempt accept and has no mode.
+With `[sender_authentication] mode = "off"` postwarden neither checks nor adds
+or removes `Authentication-Results`.
+
+### Failure action
+
+The milter's Postfix `default_action`, used while postwarden is down,
+restarting or timing out. Selected by `[postfix] failure_action`: `auto`
+(default) is `tempfail` when any section enforces (protection only with listed
+addresses), otherwise `accept`; `accept` is refused while protection enforces
+with listed addresses (ADR-0023, ADR-0025). Written by
+`configure-postfix --apply`; a mismatch is a warning in `inspect`,
+`check-config` and the overview. Replaces the 1.1 **Phase**
+(`configure-postfix --phase`, observation = `accept`, enforcement = `tempfail`).
+Also seen in docs as: "phase", "Postfix's behaviour when postwarden is down" (prefer Failure action).
+
+### Loaded configuration (1.2)
+
+The SHA-256 of the exact `config.toml` bytes the running daemon parsed,
+published in `/run/postwarden/loaded-config.sha256` once it accepts
+connections; missing means "differs". `configure-postfix --apply` restarts the
+daemon only when the file on disk differs from it (ADR-0025, ADR-0028).
+
+### Activation record (1.2)
+
+An immutable deployment directory written by `configure-postfix --apply` or a
+rollback: `config.toml`, `main.cf`, `master.cf` and its predecessor. The newest
+is the active one; rollback restores its predecessor and writes a new record.
+The first attachment starts from a detached record of the state before it
+(ADR-0030, ADR-0032).
+Also seen in docs as: "deployment", "configure-postfix deployment" (prefer Activation record in design text).
 
 ### Legacy components
 
@@ -142,7 +187,8 @@ the precise rule and reason that the terse public reply leaves out.
 A rolling-hour and rolling-day cap on recipients per **limit key**, enforced by the `sending_limit` rule with a temporary failure
 (ADR-0007). Protects against compromised logins and hacked scripts; not a
 per-message recipient cap (`limits.max_recipients`) and not Postfix's per-IP
-`anvil` limits.
+`anvil` limits. From 1.2 both modes count recipients actually delivered;
+another rule's observed refusal does not exempt a recipient (ADR-0027).
 
 ### Limit key
 
@@ -222,7 +268,15 @@ file. Capped by `limits.max_open_messages` (ADR-0012); not the same as
 ### Rule `trust`
 
 Not a policy rule: the end-of-message `rule` value when no rule refused the
-message and its trust class exempted it (`reason=exempt_<class>`).
+message and its trust class exempted it from sender authentication while that
+section is on (`reason=exempt_<class>`).
+
+### Rule `none`
+
+Not a policy rule: the end-of-message `rule` value when no rule decided because
+`[sender_authentication]` is `off` (`reason=sender_authentication_off`), for every
+trust class. Not a trust exemption. At `RCPT`, `rule=none reason=no_rule_matched`
+is a recipient no rule matched (logged at `debug`).
 
 ### Lifecycle event
 

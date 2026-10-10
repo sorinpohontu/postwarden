@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-10
+
+Each rule now has its own mode, so protected addresses stay closed while you still only observe the other rules. `configure-postfix --apply` becomes the one command that applies any configuration change: it restarts postwarden when needed, keeps Postfix's failure action in step, records every change and can roll it back. Large signed messages are checked in memory-limited worker processes, and optional DKIM diagnostics collect data for a later DMARC decision.
+
+**Upgrading from 1.1:** 1.2 does not read a 1.1 `config.toml`. Rewrite it from `etc/config.example.toml` (the top-level `mode` becomes a `mode` in each section), check it with `postwarden check-config`, then run `install --apply` and `configure-postfix --apply`.
+
+### Added
+
+#### DKIM diagnostics
+
+- **`[sender_authentication] dkim_diagnostics`** (default `false`). With `true`, DKIM is also checked after an SPF pass that already decided, for statistics only: decisions never change, and mail that fails SPF gets no extra DKIM work.
+- **`postwarden stats` reports DKIM after an SPF pass**: the share of messages whose checked signatures all failed (`fail` or `permerror`), split by aligned and unaligned SPF pass. Unsigned, skipped and incomplete messages, and `temperror`, `neutral` and `policy` results, are counted apart and never as failures. It also says whether diagnostics were on for the whole period (`--json`: `dkim`).
+- **New log fields** on end-of-message lines where SPF/DKIM ran: `dkim_summary=` (every signature counted by result), `dkim_truncated=yes`, `dkim_incomplete=limit|deadline|memory` and `dkim_diagnostics=on|off`, which the start line also carries.
+
+#### Memory for large signed mail
+
+- **Messages over 256 KiB are DKIM-checked in separate worker processes** with a hard memory limit. The DKIM library's memory grows with the text of the body, not only its size, so a few large signed messages at once could exhaust the server's memory.
+  - `[limits] dkim_workers` (default `2`) sets how many run at once, `dkim_worker_memory` (default `1073741824`, 1 GiB) the limit of each.
+  - A check that hits the limit, finds no free worker in time or overruns the deadline is reported as `dkim_incomplete=memory` or `deadline`; the message is deferred where the decision needs DKIM.
+  - `postwarden simulate` checks large messages the same way.
+- **The systemd unit sets `MemoryHigh=3G`**, a soft limit that slows postwarden under memory pressure without stopping it.
+
+### Changed
+
+#### Modes
+
+- **Each rule section has its own `mode`**: `enforce`, `observe` or `off` in `[protection]`, `[self_sender]`, `[sender_authentication]`, `[limits]` and `[sending_limits]`. No section overrides another.
+  - Defaults: `[protection]` enforces, so `all@` is never open; every other section observes.
+  - `[protection] mode = "off"` is refused while protected addresses are listed.
+  - `invalid_recipient` follows `[protection]`; `invalid_from` enforces when `[self_sender]` or `[sender_authentication]` enforces.
+- **An observed rule never lets mail past an enforced one.**
+  - Only an enforced refusal stops later checks. A recipient that an observed rule refuses is still accepted, compared by the self-sender rule and counted against sending limits, and sender authentication still runs.
+  - Recipients over `max_recipients` are still checked by the protected-address and self-sender rules.
+  - When a resource limit keeps an enforced check from running (a message cut at `message_bytes` or a header limit, a full `max_open_messages`, no free SPF/DKIM slot), the message is deferred even while `[limits]` observes.
+- **`[limits] mode = "off"` removes the bounds** on `message_bytes`, `max_headers`, `max_header_bytes`, `max_recipients`, `max_open_messages` and `max_concurrent_messages`: nothing is cut or deferred for them. DNS timeouts, the authentication deadline, `max_signatures` and the DKIM workers stay in force.
+- **Sending limits count the recipients actually delivered**, in both modes: a recipient that only an observed rule refuses counts, and in observe mode recipients over the limit count too.
+- **`simulate` follows the same rules**: observed refusals show as `would_reject`/`would_defer`, and when every recipient is refused over SMTP it stops at RCPT, as Postfix does.
+- **`postwarden`, `simulate`, `check-config` and `install.py inspect`** show each section's mode and the failure action.
+- **Log changes.**
+  - The start line carries `protection_mode=`, `self_sender_mode=`, `sender_authentication_mode=`, `limits_mode=`, `sending_limits_mode=` and `failure_action=` instead of `mode=` and `sending_limits=`.
+  - Mail accepted while `[sender_authentication]` is `off` logs `rule=none reason=sender_authentication_off`; `rule=trust reason=exempt_<class>` now means only an exemption while the section is on.
+
+#### Applying a configuration
+
+- **New `[postfix] failure_action`**: `auto` (default), `tempfail` or `accept`, what Postfix does with mail while postwarden is down. `auto` means `tempfail` while any section enforces. `accept` is refused while protected addresses are enforced.
+- **`configure-postfix --apply` applies any configuration change.** To change a mode or any other setting: edit `config.toml`, then run it.
+  - It restarts postwarden only when `config.toml` changed since the daemon started, and changes Postfix only when the failure action, the milter chain or the required macros differ. A repeat run changes nothing; a Postfix-only repair does not restart postwarden.
+  - A stricter failure action (`accept` to `tempfail`) reaches Postfix before postwarden restarts, otherwise after.
+  - It activates exactly the file it validated, and refuses if `config.toml` is edited while it runs.
+  - If any step fails, including writing the record, it restores Postfix's files and the previously recorded `config.toml`; the files it started from stay under `before/`.
+  - The daemon publishes the SHA-256 of the configuration it loaded in `/run/postwarden/loaded-config.sha256`; the unit gains `RuntimeDirectory=postwarden`.
+  - `configure-postfix` no longer edits `config.toml`; `--phase` is gone (see Removed).
+- **Every change is recorded** under `/var/backups/postwarden/` with its `config.toml`, `main.cf` and `master.cf` and the deployment before it. The first attachment also records the state before postwarden was attached. A `systemctl restart` after a hand edit is recorded by the next run, without another restart.
+- **Rollback steps back through that history.** Rolling back the active deployment restores `config.toml` together with Postfix's files and restarts postwarden as needed, and is itself recorded, so repeating it goes further back, down to the state before attachment. `install.py inspect` prints the active deployment.
+- **Drift warnings:** `postwarden`, `check-config` and `install.py inspect` warn when Postfix's failure action differs from the configuration's; `postwarden` and `inspect` also warn when the daemon has not loaded the current `config.toml`.
+- **`--remove-legacy`** needs `[protection]` and `[sender_authentication]` enforced; enforced protection is not attached while content filters remain, unless `--keep-legacy` is given.
+
+#### DKIM results
+
+- **DKIM results use the RFC 8601 words** in `dkim=`: `pass`, `fail`, `permerror` (missing or broken key or signature; was `fail`), `temperror`, `neutral` (not checked: signature limit or time budget) and `policy` (verifies over part of the body, `l=`; was `pass`). A long list is cut between entries.
+- **With `require = "both"`, a definitive SPF failure rejects even when the DKIM check was incomplete** (`spf_<result>` or `spf_unaligned` instead of `evaluation_incomplete`).
+
+### Fixed
+
+#### Sending limits
+
+- Mail accepted while every `max_open_messages` slot was in use (with `[limits]` observing) did not count against the sender's limits.
+
+#### Overview
+
+- The `Limits` row of `postwarden` and `simulate` showed large values in exponent form (`2.68435e+08`); it now shows the exact number.
+
+### Removed
+
+#### Modes
+
+- **The top-level `mode` key, `configure-postfix --phase` and `[self_sender] enabled`** (use `mode = "off"`). Configurations that still use them are refused as unknown keys.
+
+#### Compatibility
+
+- **Hints for keys of earlier releases** (`[service]`, `[trust]`, `[authentication]`, `[[protected_recipients]]`, `logging.backend`/`facility`/`identifier`, the port lists, `sender_authentication.alignment`/`temporary_error`): they are reported as unknown keys like any other.
+- **`postwarden stats`** no longer notes start lines without `logging_level=` (written by 1.0.x).
+
 ## [1.1.0] - 2026-09-29
 
 Sending limits slow down a stolen password or a hacked script; `postwarden stats` shows who sends how much, and `postwarden simulate` tries a decision without sending anything. Upgrading keeps your configuration, and the new limits start in observe mode, so nothing is refused until you enforce them.

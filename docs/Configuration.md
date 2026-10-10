@@ -3,12 +3,12 @@
 All settings are in one file, `/etc/postwarden/config.toml` (owner `root`, group `postwarden`, mode `0640`). The commented example `etc/config.example.toml` lists every setting with its default.
 
 ```sh
-postwarden check-config          # reports every problem at once
-postwarden show-config           # prints the settings in effect
-systemctl restart postwarden     # applies changes
+postwarden check-config                              # reports every problem at once
+postwarden show-config                               # prints the settings in effect
+python3 scripts/install.py configure-postfix --apply # applies changes
 ```
 
-Unknown keys, wrong types and inconsistent values are errors. Run `check-config` before restarting: a restart with a broken file leaves postwarden stopped (see [Operations](Operations.md#changing-the-configuration)).
+Unknown keys, wrong types and inconsistent values are errors. `configure-postfix --apply` restarts postwarden when the file changed, sets Postfix's failure action to match, and records the change so that it can be rolled back (see [Operations](Operations.md#changing-the-configuration)).
 
 ## Common tasks
 
@@ -19,20 +19,54 @@ Unknown keys, wrong types and inconsistent values are errors. Run `check-config`
 | accept forwarded or unsigned outside mail           | set `require = "either"` in [`[sender_authentication]`](#sender_authentication)                    |
 | let a trusted script or address send as a recipient | add it to `allow_senders` in [`[self_sender]`](#self_sender)                                       |
 | give a busy sender more than 100 recipients an hour | add a [multiplier](#sending_limitsmultipliers), for example `"newsletter@example.com" = 10`        |
+| start refusing what a rule only logs                | set `mode = "enforce"` in its section (see [Modes](#modes)), after checking `postwarden stats`     |
 | start refusing senders over their limit             | set `mode = "enforce"` in [`[sending_limits]`](#sending_limits), after checking `postwarden stats` |
 | reword a reply                                      | add a [`[responses.<rule>]`](#responsesrule) section                                               |
 | see more detail in the log                          | set `level = "debug"` in [`[logging]`](#logging)                                                   |
 
-After every change: `postwarden check-config`, then `systemctl restart postwarden`.
+After every change: `postwarden check-config`, then `python3 scripts/install.py configure-postfix --apply`.
+
+## Modes
+
+Each rule section has its own `mode`; no section overrides another.
+
+| Mode      | Effect                                                                                   |
+| --------- | ---------------------------------------------------------------------------------------- |
+| `enforce` | the reply is sent: the recipient or message is refused or deferred                       |
+| `observe` | only logged, as `would_reject` or `would_defer` with the reply that would be sent        |
+| `off`     | the rule is skipped and nothing is logged                                                |
+
+| Section                   | Default   | Governs the log rules                         |
+| ------------------------- | --------- | --------------------------------------------- |
+| `[protection]`            | `enforce` | `protected_recipient`, `invalid_recipient`    |
+| `[self_sender]`           | `observe` | `self_sender`, `invalid_from`¹                |
+| `[sender_authentication]` | `observe` | `authentication`, `invalid_from`¹             |
+| `[limits]`                | `observe` | `limits`                                      |
+| `[sending_limits]`        | `observe` | `sending_limit`                               |
+
+¹ `invalid_from` (an unreadable `From` header) enforces when either of its sections enforces, and is skipped when both are `off`.
+
+- `[protection] mode = "off"` is refused while protected addresses are listed; use `observe` to try out a new list.
+- When an observed and an enforced rule both refuse a message, the enforced refusal is sent.
+- An observed refusal never stops another rule: a recipient that only an observed rule refuses is still accepted, counted against sending limits and compared by the self-sender rule, and sender authentication still runs.
+
+## `[postfix]`
+
+| Key              | Default  | Meaning                                                                       |
+| ---------------- | -------- | ----------------------------------------------------------------------------- |
+| `failure_action` | `"auto"` | what Postfix does with mail while postwarden is down, restarting or too slow |
+
+- `"auto"`: `tempfail` (4xx, the sender retries) while any section enforces, otherwise `accept`. `[protection]` counts only when addresses are listed.
+- `"tempfail"`: always delay mail until postwarden answers.
+- `"accept"`: let mail through unchecked. Refused while protected addresses are enforced, because they would be open whenever postwarden is down.
+
+`install.py configure-postfix --apply` writes the selected action to Postfix (`default_action` in `postwarden_milter`). `check-config`, `postwarden` and `install.py inspect` warn while Postfix uses a different one.
 
 ## Top level
 
-| Key              | Default     | Meaning                                                                                      |
-| ---------------- | ----------- | -------------------------------------------------------------------------------------------- |
-| `schema_version` | `1`         | optional; must be `1` when present                                                           |
-| `mode`           | `"observe"` | `"observe"` logs what would be refused and lets mail continue; `"enforce"` sends the replies |
-
-Change `mode` with `python3 scripts/install.py configure-postfix --phase observe|enforce`, which also switches Postfix's failure action to match.
+| Key              | Default | Meaning                            |
+| ---------------- | ------- | ---------------------------------- |
+| `schema_version` | `1`     | optional; must be `1` when present |
 
 These are fixed, not configurable:
 
@@ -78,7 +112,7 @@ Refuses mail on port 25 whose sender equals a recipient.
 
 | Key                | Default                     | Meaning                                                     |
 | ------------------ | --------------------------- | ----------------------------------------------------------- |
-| `enabled`          | `true`                      | turns the rule on or off                                    |
+| `mode`             | `"observe"`                 | `enforce`, `observe` or `off` (see [Modes](#modes))         |
 | `identity`         | `"envelope_or_header_from"` | what is compared: also `"envelope"` or `"header_from"`      |
 | `allow_mynetworks` | `true`                      | exempts `mynetworks` and same-server (`local_smtp`) clients |
 | `allow_senders`    | `[]`                        | addresses exempt from this rule only (case-insensitive)     |
@@ -89,7 +123,7 @@ Refuses mail on port 25 whose sender equals a recipient.
 
 ## `[sender_authentication]`
 
-Checks that outside mail really comes from the domain in its visible `From` address. It is always on. Local mail, `mynetworks` clients and logged-in users (587/465) are exempt.
+Checks that outside mail really comes from the domain in its visible `From` address. Local mail, `mynetworks` clients and logged-in users (587/465) are exempt.
 
 Two independent mechanisms are checked:
 
@@ -106,10 +140,12 @@ Rules that always apply:
 
 | Key                | Default          | Meaning                                                                                                                                                     |
 | ------------------ | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`             | `"observe"`      | `enforce`, `observe` or `off` (see [Modes](#modes)); `off` skips SPF and DKIM entirely                                                                      |
 | `require`          | `"both"`         | `"both"`: SPF **and** DKIM must pass and align. `"either"`: one of them is enough                                                                           |
 | `allow_local`      | `true`           | `false`: local `sendmail` and same-server SMTP mail are checked like outside mail                                                                           |
 | `allow_mynetworks` | `true`           | `false`: `mynetworks` clients are checked like outside mail; other rules still trust them                                                                   |
 | `null_sender`      | `"dkim_aligned"` | bounces (`MAIL FROM:<>`) with `require = "both"`: `"dkim_aligned"` needs only an aligned DKIM pass, `"both"` applies the full rule. Ignored with `"either"` |
+| `dkim_diagnostics` | `false`          | `true`: also check DKIM after any SPF pass, even when SPF already decided, so `postwarden stats` can report how often signatures fail. Never changes a decision |
 
 **Choosing `require`.** `"both"` is the stricter default. It refuses unsigned mail, and forwarded mail, because the forwarding server is not in the original domain's SPF record. `"either"` accepts both, at the cost of trusting a single mechanism.
 
@@ -118,6 +154,8 @@ Rules that always apply:
 - with `"both"`, a definitive SPF failure (anything but `pass` or `temperror`, or a pass for another domain) rejects at once;
 - with `"either"`, an aligned SPF pass accepts at once;
 - an SPF `temperror` never decides.
+
+**DKIM diagnostics.** With `dkim_diagnostics = true`, DKIM is also checked after an SPF `pass` that already decided (an aligned pass with `"either"`, a pass for another domain with `"both"`). The decision stays the one SPF made; the extra results only go to the log and to `postwarden stats` ([Statistics](Operations.md#statistics)). Mail that fails SPF is not checked further unless the decision needs DKIM. Each check costs DNS lookups and a verification slot, so expect more `auth_elapsed` on signed mail. Verification hashes the whole body: large signed messages arriving together can use the whole `authentication_deadline_seconds`; their signatures are then logged `neutral` with `dkim_incomplete=deadline`, and the decision is unchanged.
 
 ### Decisions with `require = "both"`
 
@@ -139,7 +177,7 @@ Rules that always apply:
 | no aligned pass               | temperror, no aligned pass    | defer (`dkim_temperror`)   |
 | no aligned pass, no temperror | no aligned pass, no temperror | reject (`no_aligned_pass`) |
 
-Up to `limits.max_signatures` signatures are checked; one good signature is not cancelled by bad ones. If the time budget or the signature limit stops the check before a deciding pass, the message is deferred (`evaluation_incomplete`).
+Up to `limits.max_signatures` signatures are checked; one good signature is not cancelled by bad ones. If the time budget or the signature limit stops the check before a deciding pass, and SPF has not already decided, the message is deferred (`evaluation_incomplete`).
 
 ## `[protection]`
 
@@ -161,6 +199,7 @@ authorized_logins = []
 
 | Key                                       | Default             | Meaning                                                                                                          |
 | ----------------------------------------- | ------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `mode`                                    | `"enforce"`         | `enforce` or `observe`; `off` only with no addresses listed (see [Modes](#modes))                                |
 | `addresses."<address>".authorized_logins` | `[]`                | logins, exactly as Postfix reports them (`{auth_authen}`), that may send to the address. An empty list closes it |
 | `remote_transports`                       | `["smtp", "relay"]` | Postfix transports that deliver to other servers; see below. Usually left out                                    |
 
@@ -204,6 +243,7 @@ The group `all@*` must protect `all@` on the domains this server hosts, but not 
 
 | Key                               | Default    | Meaning                                                                                                 |
 | --------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------- |
+| `mode`                            | `"observe"` | `enforce`, `observe` or `off` (see [Modes](#modes))                                                    |
 | `message_bytes`                   | `41943040` | larger messages are deferred                                                                            |
 | `max_signatures`                  | `10`       | DKIM signatures checked per message                                                                     |
 | `max_headers`                     | `1000`     | header fields per message                                                                               |
@@ -212,12 +252,19 @@ The group `all@*` must protect `all@` on the domains this server hosts, but not 
 | `dns_timeout_seconds`             | `5`        | per DNS query                                                                                           |
 | `authentication_deadline_seconds` | `20`       | total SPF and DKIM time per message; at least `dns_timeout_seconds` (see below)                         |
 | `max_concurrent_messages`         | `32`       | SPF/DKIM checks running at once; others wait within the deadline, then are deferred                     |
+| `dkim_workers`                    | `2`        | processes verifying DKIM of messages over 256 KiB at once; others wait within the deadline              |
+| `dkim_worker_memory`              | `1073741824` | hard memory limit of each such process; at least 268435456 (see below)                                  |
 | `max_open_messages`               | `100`      | messages being received at once; above it `MAIL FROM` is deferred (local `sendmail`: at end of message) |
 
-Every limit defers, so senders retry and nothing is lost.
+Every limit defers, so senders retry and nothing is lost. In `observe` mode an exceeded limit is only logged (`would_defer`), with one exception: a limit never lets mail skip a rule that enforces.
 
-- **Authentication deadline.** Results that arrive after it are discarded and the message is deferred; a DKIM check already running is not interrupted. Keep Postfix's `content_timeout` (60 s in `postwarden_milter`) above it.
-- **Spool use** stays below `max_open_messages` × `message_bytes`.
+- Recipients over `max_recipients` are still checked by the protected-address and self-sender rules.
+- When a limit keeps an enforced check from running, the message is deferred anyway (`rule=limits` with `action=defer`): `message_bytes`, `max_headers` or `max_header_bytes` cut the message before an enforced SPF/DKIM or `From` check, `max_open_messages` is full while such a check applies to the mail, or no SPF/DKIM slot (`max_concurrent_messages`) frees up within the deadline while sender authentication enforces.
+- **`mode = "off"`** removes these bounds: no cap on `message_bytes`, `max_headers`, `max_header_bytes`, `max_recipients`, `max_open_messages` or `max_concurrent_messages`, so nothing is deferred for them. Spool and memory then grow with the mail received; Postfix's `message_size_limit`, `smtpd_recipient_limit` and process limits still apply. DNS timeouts, the authentication deadline, `max_signatures` and the DKIM processes (`dkim_workers`, `dkim_worker_memory`) stay in force.
+
+- **Authentication deadline.** Results that arrive after it are discarded and the message is deferred; a DKIM check already running inside postwarden is not interrupted, while one in a separate process (messages over 256 KiB) is stopped. Keep Postfix's `content_timeout` (60 s in `postwarden_milter`) above it.
+- **Spool use** stays below `max_open_messages` × `message_bytes` (not bounded with `mode = "off"`).
+- **Memory for DKIM.** The DKIM library's memory grows with the text of the body, not only its size: a body dense in spaces or short lines can need dozens of times its size. Messages over 256 KiB are therefore verified in separate processes, at most `dkim_workers` at once, each stopped by the system at `dkim_worker_memory`; smaller ones are checked inside postwarden. Verification memory stays near `dkim_workers` × `dkim_worker_memory` (2 GiB by default) whatever the mail contains. A message whose check exceeds the limit is not DKIM-checked (`dkim_incomplete=memory`), and one that finds no free process or overruns the deadline is stopped (`dkim_incomplete=deadline`): it is deferred where the decision needs DKIM, and keeps the SPF decision where DKIM is only diagnostic. Base64 attachments, the usual large mail, need little.
 - **Large mail.** Postfix's own `message_size_limit` (about 10 MB by default) usually refuses it before postwarden sees it.
 
 ## `[sending_limits]`
@@ -232,7 +279,7 @@ Caps how many recipients each sender may reach per rolling hour and rolling day,
 | `local_per_hour` | `1000`      | all local mail together in the last hour                                                            |
 | `local_per_day`  | `5000`      | all local mail together in the last 24 hours; not lower than `local_per_hour`                       |
 
-Sending limits have their own `mode`, so you can enforce the other rules while limits are only observed. The top-level `mode = "observe"` still wins: in observe mode nothing is deferred for any rule.
+Sending limits follow only their own `mode`, like every other section. In both modes they count the recipients actually delivered: a recipient that another rule only observes is counted, and in `observe` mode recipients over the limit are counted too, so the counts show the real load.
 
 What each message counts against, its **limit key**:
 

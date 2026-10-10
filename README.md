@@ -9,9 +9,9 @@ postwarden is a mail filter (milter) for Postfix. While a message is still being
 
 Mail that arrives over SMTP is refused with an SMTP error before Postfix takes responsibility for it, so the sender finds out at once. Mail submitted with local `sendmail` is checked after submission: if it is refused, it bounces to the sender; if a sending limit holds it back, Postfix keeps it and retries until the limit allows it.
 
-**Status: 1.1.0.** Adds sending limits, `postwarden stats` and `postwarden simulate` to 1.0. See the [changelog](CHANGELOG.md) for each release and the [roadmap](#roadmap) for what comes next.
+**Status: 1.2.0.** Each rule now has its own mode, so protected addresses stay closed while you still only observe the others; `configure-postfix --apply` applies, records and can roll back every configuration change; large signed messages are checked within a fixed memory limit. 1.2 does not read a 1.1 `config.toml`: see [Upgrading from 1.1](#upgrading-from-11). See the [changelog](CHANGELOG.md) for each release and the [roadmap](#roadmap) for what comes next.
 
-Tested on Debian 12 (Postfix 3.7) and Debian 13 (Postfix 3.10), on customised servers and on a stock installation: automated and manual installation, observe and enforce modes, rollback, migration from pipe-based content filters, DNS failure, load, and alias, forwarder and BCC delivery. A release is published only after its archive has passed these tests on both Debian versions.
+Tested on Debian 12 (Postfix 3.7) and Debian 13 (Postfix 3.10), on customised servers and on a stock installation: automated and manual installation, observe and enforce modes, rollback, migration from pipe-based content filters, DNS failure, load and memory under large signed mail, and alias, forwarder and BCC delivery. A release is published only after its archive has passed these tests on both Debian versions.
 
 ## What it checks
 
@@ -47,6 +47,7 @@ By default **both** must pass. With `require = "either"` in `[sender_authenticat
 - DNS or verifier trouble on its own defers mail (`451`) instead of rejecting it; a definitive failure of the other check still rejects.
 - DMARC policies are not looked up.
 - Bounces (`MAIL FROM:<>`) pass on a matching DKIM signature alone, because their SPF identity is the sending host's name; `null_sender = "both"` applies the full rule.
+- With `dkim_diagnostics = true`, DKIM is also checked after an SPF pass that already decided, without changing the decision; `postwarden stats` then reports how often such mail carries only failing signatures.
 
 Local mail, `mynetworks` clients and logged-in users on 587/465 are exempt from sender authentication. These exemptions never open a protected address.
 
@@ -67,17 +68,24 @@ The defaults are 100 recipients per hour and 500 per day per sender, and 1000 pe
 "marketing@example.com" = 10    # one account
 ```
 
-Sending limits have their own mode and start in observe mode, even when everything else is enforced. They only log `would_defer` until you set `[sending_limits] mode = "enforce"`; `postwarden stats` shows who would have been held back.
+Sending limits start in observe mode: they only log `would_defer` until you set `[sending_limits] mode = "enforce"`; `postwarden stats` shows who would have been held back.
 
-### Observe and enforce modes
+### Modes
 
-In **observe** mode postwarden only logs what it would do, and every message continues. In **enforce** mode it sends its replies. Start in observe mode: the default rule refuses unsigned mail and forwarded mail that fails SPF, so review the log before enforcing.
+Each rule section has its own `mode`: protected addresses (`[protection]`), self-sent mail (`[self_sender]`), SPF and DKIM (`[sender_authentication]`), resource limits (`[limits]`) and sending limits (`[sending_limits]`).
+
+- **enforce**: postwarden sends its replies.
+- **observe**: it only logs what it would do (`would_reject`, `would_defer`), and the message continues.
+- **off**: the rule is skipped. For `[limits]`, this lifts the size, header, recipient and concurrency caps; DNS timeouts and the DKIM worker limits stay.
+
+Protected addresses are enforced from the start, so `all@` is never open; everything else starts in observe mode. An observed rule never lets mail past an enforced one. Review the log before enforcing sender authentication: it refuses unsigned mail and forwarded mail that fails SPF. While any section enforces, Postfix delays mail (`tempfail`) when postwarden is down instead of letting it through unchecked.
 
 ## Requirements
 
 - Debian 12 or 13, Postfix 3.7 or newer, systemd.
 - Debian's own packages `python3 python3-milter python3-spf python3-dkim python3-dnspython` (Python 3.11 or 3.13). Nothing is installed with pip.
 - An outgoing DKIM signer such as OpenDKIM, if you sign mail; postwarden only verifies.
+- Memory: postwarden itself needs little. Signed messages over 256 KiB are verified in separate worker processes, by default at most 2 at once with 1 GiB each (`[limits] dkim_workers`, `dkim_worker_memory`); the systemd unit sets a soft limit of 3 GB.
 
 No hosting control panel or mailbox database is needed.
 
@@ -86,24 +94,39 @@ No hosting control panel or mailbox database is needed.
 Download `postwarden-<version>.tar.gz` and its `.sha256` from the project's [releases](https://github.com/sorinpohontu/postwarden/releases), then, as root:
 
 ```sh
-sha256sum -c postwarden-1.1.0.tar.gz.sha256
-mkdir /root/postwarden-1.1.0 && tar -xzf postwarden-1.1.0.tar.gz -C /root/postwarden-1.1.0
-cd /root/postwarden-1.1.0
+sha256sum -c postwarden-1.2.0.tar.gz.sha256
+mkdir /root/postwarden-1.2.0 && tar -xzf postwarden-1.2.0.tar.gz -C /root/postwarden-1.2.0
+cd /root/postwarden-1.2.0
 python3 scripts/install.py inspect                      # read-only report
 mkdir -p /etc/postwarden
 cp etc/config.example.toml /etc/postwarden/config.toml  # then list your protected addresses
 python3 scripts/install.py install --apply
-python3 scripts/install.py configure-postfix --phase observe --apply
+python3 scripts/install.py configure-postfix --apply
 ```
 
-When the log looks right, `configure-postfix --phase enforce --apply` switches postwarden and Postfix's failure action to enforcement together.
+To enforce another rule once the log looks right, set its section's `mode = "enforce"`, then run `configure-postfix --apply`: it restarts postwarden with the new file and sets Postfix's failure action to match.
 
 - Every command has a read-only form (`inspect`, `--dry-run`).
-- Every applied change is backed up under a **deployment id** and can be undone with `rollback --deployment-id <id> --apply`.
+- Every applied change is recorded under a **deployment id**. `rollback --deployment-id <id> --apply` on the active one returns to the previous state, `config.toml` and Postfix's files together; repeating it steps further back.
 - To upgrade, unpack the new release the same way and run `install --apply` again; your `config.toml` is kept.
 - If your SMTP services pass mail through reinjecting content filters, read [Migration](docs/Migration.md) first: removing them and enforcing must happen in one step, and the installer refuses otherwise.
 
 [Installation](docs/Installation.md) has the full automated path and the equivalent manual steps, including a manual upgrade.
+
+### Upgrading from 1.1
+
+1.2 does not read a 1.1 `config.toml`: postwarden refuses to start with it and `check-config` names the unknown keys. Before upgrading, write the new file from `etc/config.example.toml` of the 1.2 release, moving your protected addresses, exceptions and limits across:
+
+- the top-level `mode` becomes a `mode` in each section; `[protection]` defaults to `enforce`, the others to `observe`;
+- `[self_sender] enabled = false` becomes `mode = "off"`.
+
+Then check it, install it with the new release and apply it:
+
+```sh
+postwarden --config /root/config-1.2.toml check-config
+python3 scripts/install.py install --import-config /root/config-1.2.toml --apply
+python3 scripts/install.py configure-postfix --apply
+```
 
 ## Configuration
 
@@ -116,7 +139,7 @@ postwarden check-config    # reports every problem at once, with the values read
 postwarden show-config     # prints the settings in effect
 ```
 
-See [Configuration](docs/Configuration.md) for every key. Postfix and OpenDKIM keep their own configuration files.
+After editing the file, `python3 /etc/postwarden/scripts/install.py configure-postfix --apply` restarts postwarden with it and keeps Postfix's failure action in step. See [Configuration](docs/Configuration.md) for every key. Postfix and OpenDKIM keep their own configuration files.
 
 ## Everyday use
 
@@ -179,7 +202,7 @@ postwarden --config /tmp/candidate.toml simulate message.eml --ingress 25 --peer
 
 **Pipe content filters.** Scripts that read each message from a `content_filter` pipe and reinject it with `sendmail` can be replaced by postwarden's rules. Mail then passes Postfix once, so OpenDKIM signs it once.
 
-`configure-postfix --phase enforce --remove-legacy` detaches both in the same step that turns on enforcement; [Migration](docs/Migration.md) explains the order and the manual commands.
+`configure-postfix --remove-legacy` detaches both once `[protection]` and `[sender_authentication]` enforce; [Migration](docs/Migration.md) explains the order and the manual commands.
 
 **Weighted client scoring.** postwarden does not replace [policyd-weight](https://github.com/policyd-weight/policyd-weight), which scores clients on DNS blocklists and HELO, reverse-DNS and sender-domain checks. Postfix covers that itself: `postscreen` weighs DNS blocklist listings (`postscreen_dnsbl_sites`, `postscreen_dnsbl_threshold`) before a message reaches postwarden, and `smtpd` restrictions such as `reject_unknown_helo_hostname`, `reject_unknown_client_hostname` and `reject_unknown_sender_domain` cover the name checks. Content scoring is the job of a spam filter.
 
@@ -205,7 +228,7 @@ The tests, the server test matrix (`docs/Testing.md`) and the release procedure 
 
 ## Roadmap
 
-Planned for 1.2:
+Planned for 1.3:
 
 - an `Authentication-Results` header with the SPF and DKIM results on checked mail, replacing any forged header that claims this server;
 - with `require = "both"`, refusing a definitive SPF failure already at `MAIL FROM`, before the message body is received.

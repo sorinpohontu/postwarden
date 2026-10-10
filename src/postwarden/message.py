@@ -5,7 +5,7 @@ import tempfile
 
 from .config import LimitSettings
 
-SPOOL_MEMORY_LIMIT = 1024 * 1024
+SPOOL_MEMORY_LIMIT = 256 * 1024
 
 
 class MessageCapture:
@@ -22,7 +22,10 @@ class MessageCapture:
         if self.over_limit:
             return
         size = len(name) + len(value) + 3
-        if len(self.headers) + 1 > self.limits.max_headers:
+        if not self.limits.bounded:
+            self.headers.append((name, value))
+            self.header_bytes += size
+        elif len(self.headers) + 1 > self.limits.max_headers:
             self.over_limit = "max_headers"
         elif self.header_bytes + size > self.limits.max_header_bytes:
             self.over_limit = "max_header_bytes"
@@ -33,7 +36,7 @@ class MessageCapture:
     def add_body(self, chunk: bytes) -> None:
         if self.over_limit:
             return
-        if self.body_bytes + len(chunk) + self.header_bytes > self.limits.message_bytes:
+        if self.limits.bounded and self.body_bytes + len(chunk) + self.header_bytes > self.limits.message_bytes:
             self.over_limit = "message_bytes"
             return
         self._body.write(chunk)
@@ -43,16 +46,25 @@ class MessageCapture:
         wanted = name.lower()
         return [value for key, value in self.headers if key.lower() == wanted]
 
-    def message_bytes(self) -> bytes:
+    def header_block(self) -> bytes:
         separator = b":" if self.leading_space else b": "
         parts = []
         for name, value in self.headers:
             value = value.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
             parts.append(name + separator + value + b"\r\n")
         parts.append(b"\r\n")
-        self._body.seek(0)
-        parts.append(self._body.read())
         return b"".join(parts)
+
+    def message_bytes(self) -> bytes:
+        self._body.seek(0)
+        return self.header_block() + self._body.read()
+
+    def body_fd(self) -> int | None:
+        """The descriptor of the spooled body once it is on disk (over SPOOL_MEMORY_LIMIT), flushed; else None."""
+        if self.body_bytes <= SPOOL_MEMORY_LIMIT:
+            return None
+        self._body.flush()
+        return self._body.fileno()
 
     def close(self) -> None:
         try:

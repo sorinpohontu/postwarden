@@ -1,7 +1,7 @@
 import ipaddress
 import unittest
 
-from postwarden.postfix import (PostfixError, describe_rate_limits, parse_duration, parse_mynetworks, parse_rate_limits,
+from postwarden.postfix import (PostfixError, describe_rate_limits, failure_action_in, failure_action_warning, parse_duration, parse_mynetworks, parse_rate_limits,
                                rate_limit_warnings, with_postfix)
 
 from helpers import settings
@@ -41,6 +41,23 @@ class RecipientDelimiter(unittest.TestCase):
     def test_leading_delimiter_is_not_a_tag(self):
         s = settings('\n[protection.addresses."+all@example.com"]\nauthorized_logins = []\n', recipient_delimiter="")
         self.assertEqual(with_postfix(s, (), "+").trust.recipient_delimiter, "+")
+
+
+class FailureAction(unittest.TestCase):
+    SOCKET = "unix:postwarden/policy.sock"
+
+    def test_read_from_the_postwarden_entry(self):
+        chain = f"{{ {self.SOCKET}, default_action=accept, content_timeout=60s }}, {{ inet:127.0.0.1:8891, default_action=tempfail }}"
+        self.assertEqual(failure_action_in(chain, "tempfail"), "accept")
+
+    def test_entry_without_its_own_action_uses_postfix_default(self):
+        self.assertEqual(failure_action_in(f"{self.SOCKET}, inet:127.0.0.1:8891", "accept"), "accept")
+
+    def test_absent_postwarden_reports_nothing(self):
+        self.assertIsNone(failure_action_in("inet:127.0.0.1:8891", "tempfail"))
+        self.assertIsNone(failure_action_warning(None, "tempfail"))
+        self.assertIsNone(failure_action_warning("tempfail", "tempfail"))
+        self.assertIn("configure-postfix --apply", failure_action_warning("accept", "tempfail"))
 
 
 class RateLimits(unittest.TestCase):

@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
+import os
 import socket
 import sys
 import time
 
-from . import DEFAULT_CONFIG_PATH, HOMEPAGE, __version__
-from .config import ConfigError, LimitSettings, Settings, describe, load_settings
+from . import DEFAULT_CONFIG_PATH, HOMEPAGE, LOADED_CONFIG, __version__
+from .config import ConfigError, LimitSettings, Settings, describe, load_settings, loaded_sha256
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -87,9 +89,6 @@ def _protection_summary(settings: Settings) -> str:
     return ", ".join(parts)
 
 
-MODE_SCOPE = "all rules except sending limits"
-
-
 LISTED = 5
 
 
@@ -100,6 +99,10 @@ def _listed(label: str, items: list[str], empty: str | None, config: str) -> lis
         option = "" if config == DEFAULT_CONFIG_PATH else f"--config {config} "
         shown.append(f"... and {len(items) - len(shown)} more: postwarden {option}show-config")
     return [[label if i == 0 else "", text] for i, text in enumerate(shown or ([empty] if empty else []))]
+
+
+def _number(value: float) -> str:
+    return str(value) if isinstance(value, int) else f"{value:g}"
 
 
 def _mode_rows(settings: Settings, config: str) -> list[list[str]]:
@@ -113,11 +116,14 @@ def _mode_rows(settings: Settings, config: str) -> list[list[str]]:
             per_hour, per_day = limits.scaled(factor)
             multipliers.append(f"{key} x{factor:g} ({per_hour}/h, {per_day}/day)")
     defaults = LimitSettings()
-    changed = [f"{f.name} {getattr(settings.limits, f.name):g}" for f in dataclasses.fields(LimitSettings)
-               if getattr(settings.limits, f.name) != getattr(defaults, f.name)]
-    custom = [["Limits", ", ".join(changed)]] if changed else []
-    return [["Mode", f"{settings.mode} ({MODE_SCOPE})"], ["Sending limits", sending],
-            *_listed("Multipliers", multipliers, None, config), *custom,
+    changed = [f"{f.name} {_number(getattr(settings.limits, f.name))}" for f in dataclasses.fields(LimitSettings)
+               if f.name != "mode" and getattr(settings.limits, f.name) != getattr(defaults, f.name)]
+    limits_row = "; ".join([settings.limits.mode, *([", ".join(changed)] if changed else [])])
+    action = settings.failure_action()
+    return [["Protection", settings.protection.mode], ["Self-sender", settings.self_sender.mode],
+            ["Sender authentication", settings.sender_authentication.mode], ["Limits", limits_row],
+            ["Sending limits", sending], *_listed("Multipliers", multipliers, None, config),
+            ["Failure action", action if settings.postfix.failure_action != "auto" else f"{action} (auto)"],
             *_listed("Protected", list(settings.protection.addresses), "none", config)]
 
 
@@ -133,11 +139,15 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     if resolved is None:
         print(f"{args.config}: {note}", file=sys.stderr)
         return 1
-    print(f"{args.config}: OK (schema {settings.schema_version}, mode {settings.mode}, "
-          f"sending limits {settings.sending_limits.mode}, "
-          f"{_protection_summary(settings)}; {note})")
+    modes = ", ".join(f"{section} {mode}" for section, mode in settings.section_modes().items())
+    print(f"{args.config}: OK (schema {settings.schema_version}; {modes}; "
+          f"failure action {settings.failure_action()}; {_protection_summary(settings)}; {note})")
     if note.startswith("from Postfix"):
-        from .postfix import PostfixError, describe_rate_limits, rate_limit_warnings, read_rate_limits
+        from .postfix import (PostfixError, describe_rate_limits, failure_action_warning, rate_limit_warnings,
+                              read_failure_action, read_rate_limits)
+        with contextlib.suppress(PostfixError):
+            if drift := failure_action_warning(read_failure_action(), settings.failure_action()):
+                print(f"warning: {drift}")
         try:
             limits = read_rate_limits()
         except PostfixError as exc:
@@ -207,7 +217,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 1
         resolved = dataclasses.replace(resolved, service=dataclasses.replace(resolved.service, socket=args.socket))
     from .milter import run_daemon
-    return run_daemon(resolved)
+    publish = not args.socket and os.path.isdir(os.path.dirname(LOADED_CONFIG))
+    return run_daemon(resolved, LOADED_CONFIG if publish else None)
 
 
 def cmd_lookup(args: argparse.Namespace) -> int:
@@ -297,7 +308,7 @@ def cmd_simulate(args: argparse.Namespace) -> int:
     if args.message:
         try:
             with open(args.message, "rb") as fh:
-                message = fh.read(resolved.limits.message_bytes + 1)
+                message = fh.read(resolved.limits.message_bytes + 1 if resolved.limits.bounded else -1)
         except OSError as exc:
             print(f"{args.message}: {exc.strerror or exc}", file=sys.stderr)
             return 2
@@ -330,6 +341,11 @@ def socket_address(spec: str) -> tuple[int, object]:
     return socket.AF_INET, (host or "127.0.0.1", int(port))
 
 
+def _publish_loaded() -> None:
+    with contextlib.suppress(FileNotFoundError):
+        os.replace(LOADED_CONFIG + ".pending", LOADED_CONFIG)
+
+
 def cmd_wait_ready(args: argparse.Namespace) -> int:
     try:
         settings = load_settings(args.config)
@@ -344,6 +360,7 @@ def cmd_wait_ready(args: argparse.Namespace) -> int:
             probe.settimeout(1.0)
             try:
                 probe.connect(address)
+                _publish_loaded()
                 return 0
             except OSError:
                 pass
@@ -369,18 +386,31 @@ def _service_state() -> str:
     return f"{state} since {since}" if state == "active" and since else state
 
 
+def _drift_rows(settings: Settings) -> list[list[str]]:
+    from .postfix import PostfixError, failure_action_warning, read_failure_action
+    try:
+        drift = failure_action_warning(read_failure_action(), settings.failure_action())
+    except PostfixError:
+        return []
+    return [["Postfix", drift]] if drift else []
+
+
 def cmd_overview(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     """A bare `postwarden`: version, host, configuration, service state and the commands."""
     from .textbox import header
+    service = [["Service", _service_state()]]
     try:
         settings = load_settings(args.config)
-        rows = _mode_rows(settings, args.config)
+        rows = _mode_rows(settings, args.config) + _drift_rows(settings)
+        loaded = loaded_sha256()
+        if service[0][1].startswith("active") and loaded is not None and loaded != settings.sha256:
+            service.append(["", f"runs an earlier {args.config}: run install.py configure-postfix --apply"])
     except ConfigError as exc:
-        rows = [["Mode", "not read: " + exc.errors[0].removeprefix(f"{args.config}: ")
+        rows = [["Modes", "not read: " + exc.errors[0].removeprefix(f"{args.config}: ")
                  if len(exc.errors) == 1 and "not found" in exc.errors[0]
                  else f"not read: {len(exc.errors)} problem(s); run postwarden check-config"]]
     out = header(__version__, socket.gethostname(), args.config,
-                 [rows, [["Service", _service_state()]], [["Docs", "/etc/postwarden/docs"], ["Homepage", HOMEPAGE]]])
+                 [rows, service, [["Docs", "/etc/postwarden/docs"], ["Homepage", HOMEPAGE]]])
     out += ["", "commands"]
     commands = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))._choices_actions
     width = max(len(c.dest) for c in commands)

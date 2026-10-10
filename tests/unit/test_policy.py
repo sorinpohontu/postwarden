@@ -2,7 +2,7 @@ import unittest
 
 from postwarden.addresses import parse_mailbox
 from postwarden.policy import (Action, AuthStatus, AuthenticationInput, ConnectionFacts, DkimOutcome,
-                                   SpfOutcome, TransactionState, TrustClass, classify_trust, combine,
+                                   SpfOutcome, TransactionState, TrustClass, classify_trust, combine, dkim_fields,
                                    evaluate_authentication, evaluate_recipient, evaluate_self_sender_header,
                                    evaluate_visible_from, spf_decides)
 
@@ -16,7 +16,7 @@ BOB = M("bob@example.org")
 def rcpt(s, facts, sender, recipient, trust=None, transport=None):
     trust = trust or classify_trust(s, facts)
     state = TransactionState(sender=M(sender) if sender else None, null_sender=sender is None)
-    return evaluate_recipient(s, facts, trust, state, M(recipient), transport), state
+    return evaluate_recipient(s, facts, trust, state, f"<{recipient}>", transport)[1], state
 
 
 class Trust(unittest.TestCase):
@@ -166,11 +166,11 @@ class ProtectedRecipient(unittest.TestCase):
     def test_ordinary_recipients_unaffected_and_order_independent(self):
         state = TransactionState(sender=M("bob@example.org"))
         facts = smtp25()
-        first = evaluate_recipient(self.s, facts, TrustClass.UNTRUSTED, state, M("carol@example.com"))
-        second = evaluate_recipient(self.s, facts, TrustClass.UNTRUSTED, state, ALL)
-        third = evaluate_recipient(self.s, facts, TrustClass.UNTRUSTED, state, M("dave@example.com"))
+        first = evaluate_recipient(self.s, facts, TrustClass.UNTRUSTED, state, "<carol@example.com>")[1]
+        second = evaluate_recipient(self.s, facts, TrustClass.UNTRUSTED, state, f"<{ALL}>")[1]
+        third = evaluate_recipient(self.s, facts, TrustClass.UNTRUSTED, state, "<dave@example.com>")[1]
         self.assertEqual([d.action for d in (first, second, third)], [Action.ALLOW, Action.REJECT, Action.ALLOW])
-        self.assertEqual([str(r) for r in state.accepted_recipients()], ["carol@example.com", "dave@example.com"])
+        self.assertEqual([str(r) for r in state.accepted_recipients(self.s)], ["carol@example.com", "dave@example.com"])
 
 
 class SelfSender(unittest.TestCase):
@@ -190,7 +190,7 @@ class SelfSender(unittest.TestCase):
             self.assertIs(d.action, Action.ALLOW, facts)
 
     def test_disabled_and_allowlist(self):
-        d, _ = rcpt(settings('\n[self_sender]\nenabled = false\n'), smtp25(), "bob@example.org", "bob@example.org")
+        d, _ = rcpt(settings('\n[self_sender]\nmode = "off"\n'), smtp25(), "bob@example.org", "bob@example.org")
         self.assertIs(d.action, Action.ALLOW)
         d, _ = rcpt(settings('\n[self_sender]\nallow_senders = ["bob@example.org"]\n'), smtp25(), "bob@example.org", "bob@example.org")
         self.assertIs(d.action, Action.ALLOW)
@@ -212,7 +212,7 @@ class SelfSender(unittest.TestCase):
         d, state = rcpt(s, smtp25(), "alice@example.org", "alice@example.org")
         self.assertIs(d.action, Action.ALLOW)
         d = evaluate_self_sender_header(s, smtp25(), TrustClass.UNTRUSTED, M("bob@example.org"),
-                                        state.accepted_recipients() + [M("bob@example.org")])
+                                        state.accepted_recipients(self.s) + [M("bob@example.org")])
         self.assertIs(d.action, Action.REJECT)
 
     def test_protected_rejection_not_cancelled_by_self_sender_allowlist(self):
@@ -226,18 +226,27 @@ class VisibleFrom(unittest.TestCase):
     def test_untrusted_requires_single_valid_from(self):
         s = settings()
         for values in ([], ["a@example.com", "b@example.com"], ["a@example.com, b@example.com"], ["nonsense"]):
-            mailbox, d = evaluate_visible_from(s, TrustClass.UNTRUSTED, values)
+            mailbox, d = evaluate_visible_from(s, smtp25(), TrustClass.UNTRUSTED, values)
             self.assertIsNone(mailbox)
             self.assertIs(d.action, Action.REJECT)
             self.assertEqual(d.rule, "invalid_from")
-        mailbox, d = evaluate_visible_from(s, TrustClass.UNTRUSTED, ["Jane <jane@Example.com>"])
+        mailbox, d = evaluate_visible_from(s, smtp25(), TrustClass.UNTRUSTED, ["Jane <jane@Example.com>"])
         self.assertEqual(mailbox, M("jane@example.com"))
         self.assertIsNone(d)
 
     def test_trusted_mail_tolerates_missing_from(self):
-        mailbox, d = evaluate_visible_from(settings(), TrustClass.LOCAL_PICKUP, [])
+        mailbox, d = evaluate_visible_from(settings(), pickup(), TrustClass.LOCAL_PICKUP, [])
         self.assertIsNone(mailbox)
         self.assertIsNone(d)
+
+    def test_from_needed_by_either_section(self):
+        auth_off = settings('\n[sender_authentication]\nmode = "off"\n')
+        _, d = evaluate_visible_from(auth_off, smtp25(), TrustClass.UNTRUSTED, ["nonsense"])
+        self.assertEqual((d.rule, auth_off.rule_mode(d.rule)), ("invalid_from", "enforce"))
+        envelope_only = settings('\n[sender_authentication]\nmode = "off"\n[self_sender]\nidentity = "envelope"\n')
+        self.assertEqual(evaluate_visible_from(envelope_only, smtp25(), TrustClass.UNTRUSTED, ["nonsense"]), (None, None))
+        both_off = settings('\n[sender_authentication]\nmode = "off"\n[self_sender]\nmode = "off"\n')
+        self.assertEqual(evaluate_visible_from(both_off, smtp25(), TrustClass.UNTRUSTED, ["nonsense"]), (None, None))
 
 
 def spf(status, domain="example.net", result=""):
@@ -390,6 +399,39 @@ class EitherMechanism(unittest.TestCase):
         d = evaluate_authentication(self.s, TrustClass.MYNETWORKS, "example.net",
                                     AuthenticationInput(spf(AuthStatus.FAIL), ()))
         self.assertIs(d.action, Action.ALLOW)
+
+
+class DkimLogFields(unittest.TestCase):
+    def auth(self, *outcomes, incomplete=None):
+        return AuthenticationInput(SpfOutcome(AuthStatus.PASS, "example.org", "pass"), outcomes, incomplete)
+
+    def test_list_and_summary_of_every_signature(self):
+        auth = self.auth(DkimOutcome(AuthStatus.PASS, "example.org"), DkimOutcome(AuthStatus.FAIL, None),
+                         DkimOutcome(AuthStatus.FAIL, "example.net", result="permerror"),
+                         DkimOutcome(AuthStatus.PASS, "example.org", partial_body=True),
+                         DkimOutcome(AuthStatus.FAIL, "example.com", result="neutral"), incomplete="limit")
+        self.assertEqual(dkim_fields(settings('[sender_authentication]\ndkim_diagnostics = true\n'), auth), {
+            "dkim": "example.org:pass,-:fail,example.net:permerror,example.org:policy,example.com:neutral",
+            "dkim_summary": "pass:1,fail:1,permerror:1,temperror:0,neutral:1,policy:1",
+            "dkim_incomplete": "limit", "dkim_diagnostics": "on"})
+
+    def test_unsigned_and_skipped(self):
+        self.assertEqual(dkim_fields(settings(), self.auth()),
+                         {"dkim": "none", "dkim_summary": "pass:0,fail:0,permerror:0,temperror:0,neutral:0,policy:0",
+                          "dkim_diagnostics": "off"})
+        skipped = AuthenticationInput(SpfOutcome(AuthStatus.FAIL, None, "fail"), dkim_skipped=True)
+        self.assertEqual(dkim_fields(settings(), skipped), {"dkim": "skipped", "dkim_diagnostics": "off"})
+
+    def test_list_is_cut_between_entries_and_the_summary_counts_all(self):
+        long = "a" * 60 + "." + "b" * 60 + "." + "c" * 60 + ".example"
+        fails = [DkimOutcome(AuthStatus.FAIL, f"d{n}.example") for n in range(30)]
+        fields = dkim_fields(settings('[limits]\nmax_signatures = 50\n'), self.auth(*fails, DkimOutcome(AuthStatus.PASS, "example.org")))
+        self.assertTrue(fields["dkim"].endswith(":fail") and len(fields["dkim"]) <= 256)
+        self.assertEqual((fields["dkim_truncated"], fields["dkim_summary"].split(",")[:2]), ("yes", ["pass:1", "fail:30"]))
+        only = dkim_fields(settings(), self.auth(DkimOutcome(AuthStatus.FAIL, long + ".x" * 30, result="permerror")))
+        self.assertEqual((only.get("dkim"), only["dkim_truncated"]), (None, "yes"))
+        capped = dkim_fields(settings('[limits]\nmax_signatures = 2\n'), self.auth(*fails[:3]))
+        self.assertEqual((capped["dkim"], capped["dkim_truncated"]), ("d0.example:fail,d1.example:fail", "yes"))
 
 
 class Combination(unittest.TestCase):
