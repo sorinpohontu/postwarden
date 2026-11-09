@@ -9,7 +9,7 @@ postwarden is a mail filter (milter) for Postfix. While a message is still being
 
 Mail that arrives over SMTP is refused with an SMTP error before Postfix takes responsibility for it, so the sender finds out at once. Mail submitted with local `sendmail` is checked after submission: if it is refused, it bounces to the sender; if a sending limit holds it back, Postfix keeps it and retries until the limit allows it.
 
-**Status: 1.2.0.** Each rule now has its own mode, so protected addresses stay closed while you still only observe the others; `configure-postfix --apply` applies, records and can roll back every configuration change; large signed messages are checked within a fixed memory limit. 1.2 does not read a 1.1 `config.toml`: see [Upgrading from 1.1](#upgrading-from-11). See the [changelog](CHANGELOG.md) for each release and the [roadmap](#roadmap) for what comes next.
+**Status: 1.2.1.** 1.2.1 accepts From headers in RFC 5322 obsolete syntax that 1.2.0 refused. In 1.2, each rule has its own mode, so protected addresses stay closed while you still only observe the others; `configure-postfix --apply` applies, records and can roll back every configuration change; large signed messages are checked within a fixed memory limit. 1.2 does not read a 1.1 `config.toml`: see [Upgrading from 1.1](#upgrading-from-11). See the [changelog](CHANGELOG.md) for each release and the [roadmap](#roadmap) for what comes next.
 
 Tested on Debian 12 (Postfix 3.7) and Debian 13 (Postfix 3.10), on customised servers and on a stock installation: automated and manual installation, observe and enforce modes, rollback, migration from pipe-based content filters, DNS failure, load and memory under large signed mail, and alias, forwarder and BCC delivery. A release is published only after its archive has passed these tests on both Debian versions.
 
@@ -94,9 +94,9 @@ No hosting control panel or mailbox database is needed.
 Download `postwarden-<version>.tar.gz` and its `.sha256` from the project's [releases](https://github.com/sorinpohontu/postwarden/releases), then, as root:
 
 ```sh
-sha256sum -c postwarden-1.2.0.tar.gz.sha256
-mkdir /root/postwarden-1.2.0 && tar -xzf postwarden-1.2.0.tar.gz -C /root/postwarden-1.2.0
-cd /root/postwarden-1.2.0
+sha256sum -c postwarden-1.2.1.tar.gz.sha256
+mkdir /root/postwarden-1.2.1 && tar -xzf postwarden-1.2.1.tar.gz -C /root/postwarden-1.2.1
+cd /root/postwarden-1.2.1
 python3 scripts/install.py inspect                      # read-only report
 mkdir -p /etc/postwarden
 cp etc/config.example.toml /etc/postwarden/config.toml  # then list your protected addresses

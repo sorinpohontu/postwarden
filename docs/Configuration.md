@@ -136,7 +136,7 @@ Rules that always apply:
 - A signature that is merely present counts for nothing.
 - DNS or verifier trouble (`temperror`, timeouts) on its own defers the message instead of rejecting it. A definitive failure of the other mechanism still rejects, for example SPF `temperror` with no DKIM signature (see the tables below).
 - No DMARC policy is looked up: the domain's `_dmarc` record is not consulted.
-- The message must have exactly one valid `From` header with one address; otherwise it is refused (`invalid_from`) before any DNS lookup.
+- The message must have exactly one valid `From` header with one address; otherwise it is refused (`invalid_from`) before any DNS lookup. RFC 5322 obsolete syntax, such as unquoted periods in the display name (`Dr. A. Meier <a@example.com>`), is valid.
 
 | Key                | Default          | Meaning                                                                                                                                                     |
 | ------------------ | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |

@@ -48,6 +48,22 @@ class FromHeader(unittest.TestCase):
     def test_folded_header(self):
         self.assertEqual(parse_from_header([" Jane Doe\r\n <jane@example.com>"]), Mailbox("jane", "example.com"))
 
+    def test_obsolete_syntax_accepted(self):
+        cases = {
+            "periods in display name": "Dr. A. B. Meier <a.meier@example.com>",
+            "comment after period": "Max M. (Firma) <max@Example.com>",
+            "comment after initials": "Dr. A. B. (Firma) <max@example.com>",
+        }
+        for name, value in cases.items():
+            with self.subTest(name):
+                self.assertEqual(parse_from_header([value]).domain, "example.com")
+
+    def test_malformed_reason_names_only_real_defects(self):
+        with self.assertRaises(AddressError) as ctx:
+            parse_from_header(["Dr. A. B. <a b@example.com>"])
+        self.assertEqual(str(ctx.exception), "malformed From header: local-part is not dot-atom, quoted-string, "
+                                             "or obs-local-part; missing '.' between words")
+
     def test_missing_duplicate_multiple_malformed(self):
         cases = {
             "missing": [],

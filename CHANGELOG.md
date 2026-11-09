@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-09
+
+A fix release. The 1.2.0 `config.toml` works unchanged: run `install --apply` from the new release.
+
+### Fixed
+
+#### Visible From
+
+- **From headers in RFC 5322 obsolete syntax are accepted.** A display name with unquoted periods or a trailing comment, such as `Dr. A. B. Meier (Company) <a@example.com>`, was rejected as `invalid_from`. RFC 5322 requires receivers to accept this syntax. Missing, duplicate, malformed and multiple-mailbox From headers are still rejected.
+- **The `invalid_from` log reason lists each defect once** and leaves out obsolete-syntax notes.
+
 ## [1.2.0] - 2026-10-10
 
 Each rule now has its own mode, so protected addresses stay closed while you still only observe the other rules. `configure-postfix --apply` becomes the one command that applies any configuration change: it restarts postwarden when needed, keeps Postfix's failure action in step, records every change and can roll it back. Large signed messages are checked in memory-limited worker processes, and optional DKIM diagnostics collect data for a later DMARC decision.

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import encodings.idna
 from dataclasses import dataclass
-from email import headerregistry
+from email import errors, headerregistry
 from email.headerregistry import HeaderRegistry
 
 
@@ -94,8 +94,9 @@ def parse_from_header(values: list[str]) -> Mailbox:
         raise AddressError(f"unparseable From header: {exc}") from None
     if not isinstance(header, headerregistry.AddressHeader):
         raise AddressError("unparseable From header")
-    if header.defects:
-        raise AddressError("malformed From header: " + "; ".join(str(d) for d in header.defects))
+    defects = dict.fromkeys(str(d) for d in header.defects if not isinstance(d, errors.ObsoleteHeaderDefect))
+    if defects:
+        raise AddressError("malformed From header: " + "; ".join(defects))
     if len(header.addresses) != 1:
         raise AddressError(f"From header must contain one mailbox, found {len(header.addresses)}")
     address = header.addresses[0]
